@@ -224,7 +224,10 @@ namespace ImGui {
         void drawFFT();
         void drawVFOs();
         void drawBandPlan();
-        void processInputs();
+        void processInputs(bool fftResizePillVisible, const ImVec2& fftResizePillCenter);
+        // Pan the view by viewDelta Hz: positive moves the view up in frequency, sliding the
+        // spectrum left on screen. Callers negate as their input device requires.
+        void panView(double viewDelta, bool respectCenterFrequencyLock = false);
         void onPositionChange();
         void onResize();
         void updateWaterfallFb();

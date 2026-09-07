@@ -8,6 +8,7 @@
 #include <utils/flog.h>
 #include <gui/gui.h>
 #include <gui/style.h>
+#include <gui/tuner.h>
 #ifdef __ANDROID__
 #include <android_backend.h>
 #endif
@@ -243,6 +244,56 @@ namespace ImGui {
         }
     }
 
+    // Pan view / spectrum when dragging the frequency scale or when mouse wheeling or left / right keys
+    // and the mouse hovers over the frequency scale.
+    // viewDelta moves the view, not the trace: positive shifts the view up in frequency, which slides
+    // the spectrum left on screen. Each caller negates as its input device requires, so that the
+    // device convention ("dragging right pulls the trace right") stays visible at the call site.
+    //FIXME respectCenterFrequencyLock parameter is questionable.
+    // Maybe it shall be dropped and the lock shall be respected always?
+    void WaterFall::panView(double viewDelta, bool respectCenterFrequencyLock) {
+        // Drag handling calls this every frame while the button is held. Do not
+        // report a center-frequency change until the pointer actually moves.
+        if (viewDelta == 0.0) { return; }
+
+        if (tuner::vfoLockedToCenter()) {
+            // The VFO is synchronized with the IQ center frequency and the VFO is locked to the center of the view
+            // or as close as possible to the center of the view considering the zoom factor.
+            // See normalTuningLocked()
+            // Tune the radio while maintaining the view offset and view bandwidth.
+            //FIXME respectCenterFrequencyLock is ignored on purpose.
+            centerFreq += viewDelta;
+            centerFreqMoved = true;
+        } else {
+            viewOffset += viewDelta;
+            if (viewOffset + (viewBandwidth / 2.0) > wholeBandwidth / 2.0) {
+                double freqOffset = (viewOffset + (viewBandwidth / 2.0)) - (wholeBandwidth / 2.0);
+                viewOffset = (wholeBandwidth / 2.0) - (viewBandwidth / 2.0);
+                if (!respectCenterFrequencyLock || !centerFrequencyLocked) {
+                    centerFreq += freqOffset;
+                    centerFreqMoved = true;
+                }
+            }
+            if (viewOffset - (viewBandwidth / 2.0) < -(wholeBandwidth / 2.0)) {
+                double freqOffset = (viewOffset - (viewBandwidth / 2.0)) + (wholeBandwidth / 2.0);
+                viewOffset = (viewBandwidth / 2.0) - (wholeBandwidth / 2.0);
+                if (!respectCenterFrequencyLock || !centerFrequencyLocked) {
+                    centerFreq += freqOffset;
+                    centerFreqMoved = true;
+                }
+            }
+        }
+
+        lowerFreq = (centerFreq + viewOffset) - (viewBandwidth / 2.0);
+        upperFreq = (centerFreq + viewOffset) + (viewBandwidth / 2.0);
+
+        // updateAllVFOs() and updateWaterfallFb() do nothing with tuner::vfoLockedToCenter(), but that may change in the future.
+        if (! tuner::vfoLockedToCenter() && viewBandwidth != wholeBandwidth) {
+            updateAllVFOs();
+            if (_fullUpdate) { updateWaterfallFb(); };
+        }
+    }
+
     void WaterFall::selectFirstVFO() {
         // Only signal a change when the selection actually moved: this is called
         // on every teardown and on startup with no VFOs yet, and a spurious
@@ -253,7 +304,7 @@ namespace ImGui {
         selectedVFOChanged = true;
     }
 
-    void WaterFall::processInputs() {
+    void WaterFall::processInputs(bool fftResizePillVisible, const ImVec2& fftResizePillCenter) {
         // Pre calculate useful values
         WaterfallVFO* selVfo = NULL;
         if (selectedVFO != "") {
@@ -268,20 +319,34 @@ namespace ImGui {
                                                   ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_PressedOnClick);
 
         float splitterY = widgetPos.y + newFFTAreaHeight;
+        bool mouseInFFTResizePill = false;
+        mouseInFFTResize = false;
+        if (waterfallVisible) {
+            if (fftResizePillVisible) {
+                // A 2 dp line cannot be hit reliably with a finger, so touch
+                // style adds a visible pill that grabs immediately. This is a
+                // visual/style choice independent of the platform-wide band
+                // below: a touch-screen desktop needs the pill too.
+                mouseInFFTResizePill = fabsf(dragOrigin.x - fftResizePillCenter.x) <= style::dp(24.0f) &&
+                                       fabsf(dragOrigin.y - fftResizePillCenter.y) <= style::dp(18.0f);
+            }
+
 #ifdef __ANDROID__
-        // Touch: the divider band no longer grabs on touch-down (see
-        // fftResizePending below) and got narrower; the fat immediate target is
-        // the pill handle drawn in draw(). The band also starts at the FFT area
-        // instead of the widget edge so it stays clear of the menu splitter's
-        // handle, which reaches over the dB-scale strip.
-        float separatorHitRadius = style::dp(12.0f);
-        ImVec2 splitterPillCenter(fftAreaMin.x + (float)dataWidth * 0.75f, splitterY);
-        bool mouseInFFTResizePill = fabsf(dragOrigin.x - splitterPillCenter.x) <= style::dp(24.0f) && fabsf(dragOrigin.y - splitterPillCenter.y) <= style::dp(18.0f);
-        mouseInFFTResize = mouseInFFTResizePill || (dragOrigin.x > fftAreaMin.x && dragOrigin.x < fftAreaMax.x && dragOrigin.y >= splitterY - separatorHitRadius && dragOrigin.y <= splitterY + separatorHitRadius);
+            // Android always needs a finger-sized band, even if the optional
+            // touch styling is disabled. Start it at the FFT area so it stays
+            // clear of the menu splitter handle over the dB-scale strip.
+            float separatorHitRadius = style::dp(12.0f);
+            bool mouseInFFTResizeBand = dragOrigin.x > fftAreaMin.x && dragOrigin.x < fftAreaMax.x &&
+                                        dragOrigin.y >= splitterY - separatorHitRadius && dragOrigin.y <= splitterY + separatorHitRadius;
 #else
-        float separatorHitRadius = (2.0f * style::uiScale);
-        mouseInFFTResize = (dragOrigin.x > widgetPos.x && dragOrigin.x < widgetPos.x + widgetSize.x && dragOrigin.y >= splitterY - separatorHitRadius && dragOrigin.y <= splitterY + separatorHitRadius);
+            // Desktop keeps a precise divider target. Touch style adds the pill
+            // above instead of making this entire band steal nearby input.
+            float separatorHitRadius = style::dp(2.0f);
+            bool mouseInFFTResizeBand = dragOrigin.x > widgetPos.x && dragOrigin.x < widgetPos.x + widgetSize.x &&
+                                        dragOrigin.y >= splitterY - separatorHitRadius && dragOrigin.y <= splitterY + separatorHitRadius;
 #endif
+            mouseInFFTResize = mouseInFFTResizePill || mouseInFFTResizeBand;
+        }
         mouseInFreq = IS_IN_AREA(dragOrigin, freqAreaMin, freqAreaMax);
         mouseInFFT = IS_IN_AREA(dragOrigin, fftAreaMin, fftAreaMax);
         mouseInWaterfall = IS_IN_AREA(dragOrigin, wfMin, wfMax);
@@ -345,16 +410,18 @@ namespace ImGui {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 #ifdef __ANDROID__
-                if (mouseInFFTResizePill) {
+                if (!mouseInFFTResizePill) {
+                    // Not on the pill — hold the Android touch back until its
+                    // drag direction is known (resolved below). This remains a
+                    // platform behavior when touch styling, and therefore the
+                    // optional immediate-grab pill, is disabled.
+                    fftResizePending = true;
+                    fftResizePendingPos = mousePos;
+                }
+                else {
                     fftResizeSelect = true;
                     fftResizeGrabOffset = splitterY - mousePos.y;
                     backend::hapticTick();
-                }
-                else {
-                    // Not on the pill — hold the touch back until the finger's
-                    // drag direction is known (resolved below).
-                    fftResizePending = true;
-                    fftResizePendingPos = mousePos;
                 }
 #else
                 fftResizeSelect = true;
@@ -460,34 +527,9 @@ namespace ImGui {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             double deltax = drag.x - lastDrag;
             lastDrag = drag.x;
-            double viewDelta = deltax * (viewBandwidth / (double)dataWidth);
-
-            viewOffset -= viewDelta;
-
-            if (viewOffset + (viewBandwidth / 2.0) > wholeBandwidth / 2.0) {
-                double freqOffset = (viewOffset + (viewBandwidth / 2.0)) - (wholeBandwidth / 2.0);
-                viewOffset = (wholeBandwidth / 2.0) - (viewBandwidth / 2.0);
-                if (!centerFrequencyLocked) {
-                    centerFreq += freqOffset;
-                    centerFreqMoved = true;
-                }
-            }
-            if (viewOffset - (viewBandwidth / 2.0) < -(wholeBandwidth / 2.0)) {
-                double freqOffset = (viewOffset - (viewBandwidth / 2.0)) + (wholeBandwidth / 2.0);
-                viewOffset = (viewBandwidth / 2.0) - (wholeBandwidth / 2.0);
-                if (!centerFrequencyLocked) {
-                    centerFreq += freqOffset;
-                    centerFreqMoved = true;
-                }
-            }
-
-            lowerFreq = (centerFreq + viewOffset) - (viewBandwidth / 2.0);
-            upperFreq = (centerFreq + viewOffset) + (viewBandwidth / 2.0);
-
-            if (viewBandwidth != wholeBandwidth) {
-                updateAllVFOs();
-                if (_fullUpdate) { updateWaterfallFb(); };
-            }
+            // Negated: dragging right must pull the trace right with the pointer, i.e. move the view down.
+            double viewDelta = -deltax * (viewBandwidth / (double)dataWidth);
+            panView(viewDelta, true);
             return;
         }
 
@@ -522,56 +564,17 @@ namespace ImGui {
 
         // If the mouse wheel is moved on the frequency scale
         if (mouseWheel != 0.0f && mouseInFreq) {
-            viewOffset -= (double)mouseWheel * viewBandwidth / 20.0;
-
-            if (viewOffset + (viewBandwidth / 2.0) > wholeBandwidth / 2.0) {
-                double freqOffset = (viewOffset + (viewBandwidth / 2.0)) - (wholeBandwidth / 2.0);
-                viewOffset = (wholeBandwidth / 2.0) - (viewBandwidth / 2.0);
-                centerFreq += freqOffset;
-                centerFreqMoved = true;
-            }
-            if (viewOffset - (viewBandwidth / 2.0) < -(wholeBandwidth / 2.0)) {
-                double freqOffset = (viewOffset - (viewBandwidth / 2.0)) + (wholeBandwidth / 2.0);
-                viewOffset = (viewBandwidth / 2.0) - (wholeBandwidth / 2.0);
-                centerFreq += freqOffset;
-                centerFreqMoved = true;
-            }
-
-            lowerFreq = (centerFreq + viewOffset) - (viewBandwidth / 2.0);
-            upperFreq = (centerFreq + viewOffset) + (viewBandwidth / 2.0);
-
-            if (viewBandwidth != wholeBandwidth) {
-                updateAllVFOs();
-                if (_fullUpdate) { updateWaterfallFb(); };
-            }
+            // Negated to match dragging: scrolling up slides the trace right, i.e. moves the view down.
+            double viewDelta = -(double)mouseWheel * viewBandwidth / 20.0;
+            panView(viewDelta);
             return;
         }
 
         // If the left and right keys are pressed while hovering the freq scale, move it too
         bool leftKeyPressed = ImGui::IsKeyPressed(ImGuiKey_LeftArrow);
         if ((leftKeyPressed || ImGui::IsKeyPressed(ImGuiKey_RightArrow)) && mouseInFreq) {
-            viewOffset += leftKeyPressed ? (viewBandwidth / 20.0) : (-viewBandwidth / 20.0);
-
-            if (viewOffset + (viewBandwidth / 2.0) > wholeBandwidth / 2.0) {
-                double freqOffset = (viewOffset + (viewBandwidth / 2.0)) - (wholeBandwidth / 2.0);
-                viewOffset = (wholeBandwidth / 2.0) - (viewBandwidth / 2.0);
-                centerFreq += freqOffset;
-                centerFreqMoved = true;
-            }
-            if (viewOffset - (viewBandwidth / 2.0) < -(wholeBandwidth / 2.0)) {
-                double freqOffset = (viewOffset - (viewBandwidth / 2.0)) + (wholeBandwidth / 2.0);
-                viewOffset = (viewBandwidth / 2.0) - (wholeBandwidth / 2.0);
-                centerFreq += freqOffset;
-                centerFreqMoved = true;
-            }
-
-            lowerFreq = (centerFreq + viewOffset) - (viewBandwidth / 2.0);
-            upperFreq = (centerFreq + viewOffset) + (viewBandwidth / 2.0);
-
-            if (viewBandwidth != wholeBandwidth) {
-                updateAllVFOs();
-                if (_fullUpdate) { updateWaterfallFb(); };
-            }
+            double viewDelta = leftKeyPressed ? (viewBandwidth / 20.0) : (-viewBandwidth / 20.0);
+            panView(viewDelta);
             return;
         }
 
@@ -988,6 +991,15 @@ namespace ImGui {
             onResize();
         }
 
+        // Compute the pill's visibility and position once so drawing and input
+        // handling cannot drift apart.
+        bool fftResizePillVisible = style::touchStyle && waterfallVisible;
+        ImVec2 fftResizePillCenter;
+        if (fftResizePillVisible) {
+            fftResizePillCenter = ImVec2(fftAreaMin.x + (float)dataWidth * 0.75f,
+                                        widgetPos.y + newFFTAreaHeight);
+        }
+
         //window->DrawList->AddRectFilled(widgetPos, widgetEndPos, IM_COL32( 0, 0, 0, 255 ));
         ImU32 bg = ImGui::ColorConvertFloat4ToU32(gui::themeManager.waterfallBg);
         window->DrawList->AddRectFilled(widgetPos, widgetEndPos, bg);
@@ -1010,7 +1022,7 @@ namespace ImGui {
             args.freqToPixelRatio = (double)dataWidth / viewBandwidth;
             args.pixelToFreqRatio = viewBandwidth / (double)dataWidth;
             onInputProcess.emit(args);
-            if (!inputHandled) { processInputs(); }
+            if (!inputHandled) { processInputs(fftResizePillVisible, fftResizePillCenter); }
         }
         else {
             // These are only recomputed inside processInputs(), which just got
@@ -1036,23 +1048,20 @@ namespace ImGui {
             drawBandPlan();
         }
 
-#ifdef __ANDROID__
         // FFT/waterfall divider drag handle: the fat touch target that grabs on
         // touch-down (see processInputs). Drawn last so it sits on top of the
         // freq scale and the waterfall; the dark backing keeps it readable.
-        if (waterfallVisible) {
-            ImVec2 pillCenter(fftAreaMin.x + (float)dataWidth * 0.75f, widgetPos.y + newFFTAreaHeight);
+        if (fftResizePillVisible) {
             float halfW = style::dp(16.0f) + (fftResizeSelect ? style::dp(4.0f) : 0.0f);
             float halfH = style::dp(fftResizeSelect ? 6.0f : 4.5f);
             float pad = style::dp(2.0f);
-            window->DrawList->AddRectFilled(ImVec2(pillCenter.x - halfW - pad, pillCenter.y - halfH - pad),
-                                            ImVec2(pillCenter.x + halfW + pad, pillCenter.y + halfH + pad),
+            window->DrawList->AddRectFilled(ImVec2(fftResizePillCenter.x - halfW - pad, fftResizePillCenter.y - halfH - pad),
+                                            ImVec2(fftResizePillCenter.x + halfW + pad, fftResizePillCenter.y + halfH + pad),
                                             IM_COL32(0, 0, 0, 120), halfH + pad);
-            window->DrawList->AddRectFilled(ImVec2(pillCenter.x - halfW, pillCenter.y - halfH),
-                                            ImVec2(pillCenter.x + halfW, pillCenter.y + halfH),
+            window->DrawList->AddRectFilled(ImVec2(fftResizePillCenter.x - halfW, fftResizePillCenter.y - halfH),
+                                            ImVec2(fftResizePillCenter.x + halfW, fftResizePillCenter.y + halfH),
                                             fftResizeSelect ? ImGui::GetColorU32(ImGuiCol_SeparatorActive) : IM_COL32(210, 210, 210, 200), halfH);
         }
-#endif
 
         if (!waterfallVisible) {
             buf_mtx.unlock();

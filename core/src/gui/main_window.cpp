@@ -497,14 +497,16 @@ void MainWindow::draw() {
     // The volume slider and the level meter share the space left over after the
     // fixed elements between them (frequency display, tuning/keypad buttons, and
     // the right-edge reserve). They each take half of that pool; the volume
-    // slider is capped, and the meter absorbs whatever it leaves over. The meter
-    // is deliberately uncapped: with a cap, everything past both maxima had
-    // nowhere to go and collected in the single gap in front of the meter (~627
-    // px on a 1920 px window, against 8 px everywhere else). The frequency-keypad
-    // button is optional: it shows only when it fits without pushing either
-    // widget below its minimum.
+    // slider is capped, and the meter absorbs whatever it leaves over. The
+    // meter's *allocation* is deliberately uncapped: capping it left everything
+    // past both maxima with nowhere to go, collecting in the single gap in front
+    // of the meter (~627 px on a 1920 px window, against 8 px everywhere else).
+    // What it actually draws is capped separately, see meterDrawWidth. The
+    // frequency-keypad button is optional: it shows only when it fits without
+    // pushing either widget below its minimum.
     float volumeWidth;
     float meterWidth;
+    float meterDrawWidth;
     bool  showKeypadButton;
     {
         float itemSpacing = ImGui::GetStyle().ItemSpacing.x;
@@ -528,6 +530,14 @@ void MainWindow::draw() {
         volumeWidth = std::clamp(pool * 0.5f, volMin, volMax);
         meterWidth  = std::max(pool - volumeWidth, meterMin);
         volumeWidth = std::clamp(pool - meterWidth, volMin, volMax);
+
+        // A meter wider than this shows nothing more, it just stretches the
+        // scale, so on a large monitor draw at most 350 dp of the slot the split
+        // above handed out and let the rest stay empty on its left. The
+        // allocation itself is untouched: the volume slider keeps its even half
+        // and the surplus still ends up here rather than in a gap elsewhere in
+        // the row. meterMin wins if the labels need more than 350 dp.
+        meterDrawWidth = std::min(meterWidth, std::max(350.0f * style::uiScale, meterMin));
     }
     sigpath::sinkManager.showVolumeSlider(gui::waterfall.selectedVFO, "##_sdrpp_main_volume_", volumeWidth, btnSize.x, toolbarButtonPadding, true);
 
@@ -574,13 +584,14 @@ void MainWindow::draw() {
     // meterWidth was computed together with volumeWidth above so the two share
     // the flexible space evenly. Right-align the meter against the logo's
     // reserve, clamping so it can't overlap the tuning button on a very narrow
-    // window. With the pool accounting fixed this lands exactly one ItemSpacing
-    // after the tuning button, so the row has no oversized gap left in it.
-    float meterPos = std::max(topBarWidth - (meterWidth + meterOffset), ImGui::GetCursorPosX());
+    // window. Below the 350 dp draw cap this lands exactly one ItemSpacing after
+    // the tuning button, so the row has no oversized gap left in it; above it,
+    // the meter stays pinned to the right and the slack shows on its left.
+    float meterPos = std::max(topBarWidth - (meterDrawWidth + meterOffset), ImGui::GetCursorPosX());
 
     ImGui::SetCursorPosX(meterPos);
     centerInRow(ImGui::GetLevelMeterHeight());
-    ImGui::SetNextItemWidth(meterWidth);
+    ImGui::SetNextItemWidth(meterDrawWidth);
     if (vfo != NULL) {
         ImGui::LevelMeter(gui::waterfall.selectedVFOLevel, gui::waterfall.selectedVFOLevelMax, gui::waterfall.selectedVFOSNR);
     }
@@ -618,13 +629,13 @@ void MainWindow::draw() {
             newWidth = clampedMenuWidth;
         }
     }
-#ifdef __ANDROID__
     // Menu splitter pill: computed by the splitter handling below, drawn later
     // inside the waterfall child so that floating windows (e.g. the KiwiSDR
-    // map popup) paint over it.
+    // map popup) paint over it. Shown whenever the touch style is on, on any
+    // platform -- a 2 dp hit band cannot be grabbed with a finger, and a desktop
+    // with a touch screen has the same problem a phone does.
     bool menuPillVisible = false;
     ImVec2 menuPillCenter;
-#endif
     if (!lockWaterfallControls && showMenu) {
         float curY = ImGui::GetCursorPosY();
         bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
@@ -635,17 +646,36 @@ void MainWindow::draw() {
             newWidth = style::clampSplit(newWidth, winSize.x, 250.0f, 250.0f);
             ImGui::GetForegroundDrawList()->AddLine(ImVec2(newWidth, curY), ImVec2(newWidth, splitBottom), ImGui::GetColorU32(ImGuiCol_SeparatorActive));
         }
-#ifdef __ANDROID__
         // Touch handling. A full-length fat hit band fights with the menu
         // scrollbar sitting right against the splitter, so the fat target is a
         // visible pill handle instead: it reaches over the waterfall's dB-scale
-        // strip (which takes no input) and grabs on touch-down. Along the rest
-        // of the line a touch is only accepted once the finger's first movement
-        // runs across the splitter — a vertical start means scrolling.
+        // strip (which takes no input) and grabs on touch-down.
         ImVec2 pillCenter(newWidth + style::dp(4.0f), curY + (splitBottom - curY) * 0.75f);
         float pillHalfH = style::dp(16.0f);
-        bool inPillBox = mousePos.x >= newWidth - style::dp(2.0f) && mousePos.x <= newWidth + style::dp(30.0f) &&
+        bool inPillBox = style::touchStyle &&
+                         mousePos.x >= newWidth - style::dp(2.0f) && mousePos.x <= newWidth + style::dp(30.0f) &&
                          fabsf(mousePos.y - pillCenter.y) <= pillHalfH + style::dp(10.0f);
+        if (style::touchStyle) {
+            // The pill hit box overlaps the waterfall child window, so hover of
+            // any child of the main window counts for it.
+            if (!grabbingMenu && click && inPillBox && !ImGui::IsAnyItemActive() &&
+                ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+                grabbingMenu = true;
+                menuGrabOffset = newWidth - mousePos.x;
+#ifdef __ANDROID__
+                backend::hapticTick();
+#endif
+            }
+            menuPillVisible = true;
+            menuPillCenter = pillCenter;
+        }
+
+#ifdef __ANDROID__
+        // Along the rest of the line a touch is only accepted once the finger's
+        // first movement runs across the splitter — a vertical start means
+        // scrolling. Android only: it withholds the grab for a few frames, which
+        // a mouse user would feel as lag, so the desktop keeps its thin band and
+        // gains only the pill above.
         if (menuSplitterPending) {
             float dx = mousePos.x - menuSplitterDownPos.x;
             float dy = mousePos.y - menuSplitterDownPos.y;
@@ -661,29 +691,22 @@ void MainWindow::draw() {
                 }
             }
         }
-        else if (!grabbingMenu && click) {
-            // The pill hit box overlaps the waterfall child window, so hover of
-            // any child of the main window counts for it.
-            if (inPillBox && !ImGui::IsAnyItemActive() && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
-                grabbingMenu = true;
-                menuGrabOffset = newWidth - mousePos.x;
-                backend::hapticTick();
-            }
-            else if (isWindowHovered && fabsf(mousePos.x - (float)newWidth) <= style::dp(20.0f) && mousePos.y > curY) {
+        else if (!grabbingMenu && click && !inPillBox) {
+            if (isWindowHovered && fabsf(mousePos.x - (float)newWidth) <= style::dp(20.0f) && mousePos.y > curY) {
                 menuSplitterPending = true;
                 menuSplitterDownPos = mousePos;
             }
         }
-        menuPillVisible = true;
-        menuPillCenter = pillCenter;
 #else
         // The hit band straddles the Left Column and Waterfall children (and
         // under the touch style FindHoveredWindow() grows their hover boxes by
         // TouchExtraPadding, right over the band), so hover of any child of the
         // main window counts for it. Floating windows and popups are separate
         // top-level windows and still correctly block the splitter.
-        float separatorHitRadius = (2.0f * style::uiScale);
-        bool overSplit = fabsf(mousePos.x - (float)newWidth) <= separatorHitRadius && mousePos.y > curY;
+        float separatorHitRadius = style::dp(2.0f);
+        // inPillBox so the resize cursor also appears over the pill when the
+        // touch style is on; the grab itself was already taken above.
+        bool overSplit = inPillBox || (fabsf(mousePos.x - (float)newWidth) <= separatorHitRadius && mousePos.y > curY);
         if (grabbingMenu || (overSplit && !ImGui::IsAnyItemActive() && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (click && !grabbingMenu) {
@@ -797,7 +820,6 @@ void MainWindow::draw() {
 
     gui::waterfall.draw();
 
-#ifdef __ANDROID__
     // Menu splitter drag handle (see the splitter handling above). Drawn into
     // this child's draw list so floating windows and popups paint over it, with
     // an expanded clip rect since it straddles the child's left edge. The dark
@@ -813,7 +835,6 @@ void MainWindow::draw() {
                           grabbingMenu ? ImGui::GetColorU32(ImGuiCol_SeparatorActive) : IM_COL32(210, 210, 210, 200), halfW);
         dl->PopClipRect();
     }
-#endif
 
     ImGui::EndChild();
 
@@ -1125,15 +1146,22 @@ bool MainWindow::handleBackPress() {
     // so mutating popup state here is safe.
     ImGuiContext* g = ImGui::GetCurrentContext();
 
-    // Topmost open popup: combo dropdowns, context menus, modal dialogs.
+    // Topmost open popup: combo dropdowns, context menus, modal dialogs. The
+    // credits overlay is one of these (BeginPopupModal), so it is dismissed
+    // here; credits::show() notices its popup is gone and clears showCredits
+    // on the next frame.
     if (g && g->OpenPopupStack.Size > 0) {
         ImGui::ClosePopupToLevel(g->OpenPopupStack.Size - 1, true);
         return true;
     }
 
-    // Credits overlay (plain window, not a popup; it locks the rest of the UI).
+    // Fallback for the credits overlay, in case a second Back arrives before
+    // the frame that would have cleared the flag above. show() never runs
+    // again in that case, so its lifecycle state has to be dropped here or the
+    // next presentation opens nothing.
     if (showCredits) {
         showCredits = false;
+        credits::reset();
         return true;
     }
 
