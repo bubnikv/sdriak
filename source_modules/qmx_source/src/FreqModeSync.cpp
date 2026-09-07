@@ -48,6 +48,7 @@ int FreqModeSync::qmxModeToRadioIface(qmx::QmxMode mode) {
     case qmx::QmxMode::USB: return RADIO_IFACE_MODE_USB;
     case qmx::QmxMode::CW:  return RADIO_IFACE_MODE_CW;
     case qmx::QmxMode::CWR: return RADIO_IFACE_MODE_CWR;
+    case qmx::QmxMode::AM:  return RADIO_IFACE_MODE_AM;
     default:                return -1;
     }
 }
@@ -58,6 +59,7 @@ qmx::QmxMode FreqModeSync::radioIfaceToQmxMode(int radioMode) {
     case RADIO_IFACE_MODE_USB: return qmx::QmxMode::USB;
     case RADIO_IFACE_MODE_CW:  return qmx::QmxMode::CW;
     case RADIO_IFACE_MODE_CWR: return qmx::QmxMode::CWR;
+    case RADIO_IFACE_MODE_AM:  return qmx::QmxMode::AM;
     default:                   return qmx::QmxMode::UNKNOWN;
     }
 }

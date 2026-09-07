@@ -54,7 +54,7 @@ namespace qmx {
         USB,
         CW,
         FM, // Parsed for Kenwood MD compatibility; QMX does not use this yet.
-        AM, // Parsed for Kenwood MD compatibility; QMX does not use this yet.
+        AM,
         CWR,
         FSK, // aka DIGI
         FSKR, // aka DIGI reversed

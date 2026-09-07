@@ -74,7 +74,7 @@ namespace {
             return true;
         case '5':
         case 'A':
-            modeOut = qmx::QmxMode::AM; // Parsed for Kenwood MD compatibility; QMX does not use this yet.
+            modeOut = qmx::QmxMode::AM;
             return true;
         case '6':
         case 'D':
@@ -105,6 +105,9 @@ namespace qmx::detail {
         case qmx::QmxMode::CW:
             command = "MD3;";
             return true;
+        case qmx::QmxMode::AM:
+            command = "MD5;";
+            return true;
         case qmx::QmxMode::FSK:
             command = "MD6;";
             return true;
@@ -114,8 +117,7 @@ namespace qmx::detail {
         case qmx::QmxMode::FSKR:
             command = "MD9;";
             return true;
-        case qmx::QmxMode::FM:
-        case qmx::QmxMode::AM:
+        case qmx::QmxMode::FM: // QMX has no FM mode to switch to.
         case qmx::QmxMode::UNKNOWN:
         default:
             return false;

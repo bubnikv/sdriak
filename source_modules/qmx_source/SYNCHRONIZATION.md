@@ -22,7 +22,7 @@ iq_center = rig_freq - offset(status)
 where
 
 ```
-offset(status) = 12000                            (SSB, DIGI)
+offset(status) = 12000                            (SSB, DIGI, AM)
                = 12000 + cw_offset                (CW)
                = 12000 - cw_offset                (CW-R)
 ```
@@ -198,7 +198,17 @@ When new status arrives and `syncVfo` is on:
 | `USB` | `RADIO_IFACE_MODE_USB` |
 | `CW` | `RADIO_IFACE_MODE_CW` |
 | `CW-R` | `RADIO_IFACE_MODE_CWR` |
-| `DIGI`, `FM`, `AM` | Not mapped (ignored) |
+| `AM` | `RADIO_IFACE_MODE_AM` |
+| `DIGI`, `FM` | Not mapped (ignored) |
+
+QMX firmware implements AM, so it is a full peer of the SSB/CW modes in both
+directions: `MD5;` is sent for it, and an `MD5` / `IF` response switches the
+SDRIAK radio to AM.  `FM` is still only parsed for Kenwood MD compatibility —
+QMX has no FM mode to switch to, so `encodeModeCommand()` refuses it.
+
+In AM the QMX dial frequency is the carrier, which is also where the SDRIAK AM
+demodulator places its VFO, so AM uses the plain 12 kHz IF offset with no
+mode-specific correction.
 
 ---
 
