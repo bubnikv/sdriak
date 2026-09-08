@@ -2,6 +2,39 @@
 
 The detailed per-release history of the SDRIAK fork, including alpha and beta pre-releases. For a brief summary of the major releases only, see [changelog.md](changelog.md).
 
+## v1.4.0-beta2 - 2026-09-08
+
+This follow-up beta completes the product rename from SDR++ iak to SDRIAK, makes QMX VFO synchronization behave like a centered panadapter, and resolves several touch-input and application-icon integration issues.
+
+**Upgrade notes:** Desktop executable, installation and default configuration paths now use `sdriak`; settings in the previous beta's `sdrpp-iak` config directory are not migrated automatically. Android retains the existing `org.ok1iak.sdrpp` application ID and therefore upgrades in place with its app data intact. The SDRIAK Server protocol magic, fork ID and authentication salt also changed, so beta and beta2 clients and servers must be upgraded together; previously saved server passwords must be entered again.
+
+### Added
+
+- QMX **Sync VFO** now provides centered-panadapter behavior: the selected SDRIAK VFO is held at the QMX IF/CW offset from the IQ center and remains at the center of the waterfall independently of zoom. Frequency changes initiated by either QMX or SDRIAK update the other side without feedback loops.
+- Bidirectional QMX mode synchronization. Current QMX firmware's AM mode maps to SDRIAK AM in both directions, and CW and CW-R follow the sideband implied by the QMX CW offset.
+- Touch-friendly visible handles for the menu and FFT/waterfall splitters are now available whenever Touch-Friendly UI is enabled, including on touch-screen desktop systems.
+- Added the Wave AM application-icon pack, with authored assets for Android launcher densities, Linux hicolor PNG/SVG installation, macOS `.icns`, Windows multi-resolution `.ico`, and in-app loading, Credits and toolbar presentation.
+
+### Changed
+
+- Renamed the product from **SDR++ iak** to **SDRIAK** throughout user-visible text, modules, documentation, build options, executable/library names, packages, desktop integration and CI artifacts. Legacy `sdrpp` identifiers remain only where compatibility requires them.
+- Renamed the network source and module to **SDRIAK Server**, and changed the fork-specific protocol identity and authentication salt from their `sdrpp-iak` values to `sdriak` values.
+- Desktop default config roots, AppImage roots, install/resource/plugin directories, executable names and package names now use `sdriak`. The macOS bundle is now `SDRIAK.app`; the Android namespace and native library names were updated while its published application ID was deliberately retained.
+- Waterfall frequency-scale drag, wheel and arrow-key panning now share one tuning path. When the QMX VFO is locked to the IQ center, these interactions tune the radio while preserving the view bandwidth and VFO position.
+- Android splitter recognition continues to delay a grab until the initial drag direction is known outside the visible handle, allowing vertical menu scrolling near a divider; mouse users retain an immediate precise divider target.
+- The Credits dialog now uses the standard scrollbar width on every platform instead of the finger-sized bar previously drawn on Android. Its body drag-scrolls anywhere, so the wide bar only consumed content width.
+- The top-bar level meter is capped at a useful draw width on large displays while remaining right-aligned.
+- Expanded the fork research documentation with the M0OPK panadapter fork and updated the QMX-panadapter comparison and synchronization documentation.
+- Refreshed SDRplay API download URLs. Debian 11 Bullseye `.deb` jobs were disabled after Bullseye's LTS end of life and removal of its security packages; the Ubuntu Focal AppImage retains the same glibc 2.31 baseline for Bullseye users.
+
+### Fixed
+
+- Selecting a different VFO on the waterfall is now a selection-only gesture: the initial mouse-down or finger-down changes selection, suppresses waterfall and overlay interaction for the remainder of that press, and cannot immediately drag or retune the VFO. Interaction resumes only after release, including when release occurs outside the waterfall. Fixes [#21](https://github.com/bubnikv/sdriak/issues/21).
+- Android now reports application focus changes to ImGui, releases emulated mouse buttons and resets the touch-scroll and pinch recognizers when focus or the native window is lost. Android motion `ACTION_CANCEL` also releases tracked buttons, preventing interrupted gestures from leaving waterfall interaction latched after switching applications.
+- Android Back reliably dismisses the Credits modal, and the dialog's popup lifecycle resets correctly whether it closes by Back, Escape or a tap.
+- Completed application-icon integration across runtime window icons, task switching, executable/bundle metadata and desktop installation, including restoring window icons on BSD GLFW builds and keeping platform-only assets out of runtime resource bundles.
+- Universal macOS bundle generation now removes duplicate runtime search paths before signing.
+
 ## v1.4.0-beta
 
 This beta turns the alpha's experimental band picker and waterfall autoscale into more complete, stable features. It also adds a native macOS audio sink and spectrum-range navigation, makes network connection handling bounded and cancellable, and substantially hardens configuration persistence, server operation and fractional-scale rendering.

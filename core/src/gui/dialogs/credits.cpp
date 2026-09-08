@@ -37,11 +37,10 @@ namespace credits {
         bool open = true;
         imageSize = style::dp(128.0f, 128.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, style::dp(20.0f, 20.0f));
-        // Wide enough to grab with a finger when the dialog overflows a small
-        // screen. Follows the touch style rather than the platform: a desktop
-        // with a touch screen has the same problem a phone does.
-        const bool fatScrollbar = style::touchStyle;
-        if (fatScrollbar) { ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, style::dp(25.0f)); }
+        // The scrollbar keeps the shared style width, like every other scrollable
+        // panel. It used to be widened to a finger-sized 25 dp, but the body
+        // drag-scrolls anywhere (see below), so nobody needs to hit the bar to
+        // scroll on a touch screen and the extra width only steals content space.
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
         ImVec2 dispSize = ImGui::GetIO().DisplaySize;
         ImVec2 center = ImVec2(dispSize.x / 2.0f, dispSize.y / 2.0f);
@@ -57,7 +56,7 @@ namespace credits {
             // style stack is left to unwind here.
             reset();
             ImGui::PopStyleColor();
-            ImGui::PopStyleVar(fatScrollbar ? 2 : 1);
+            ImGui::PopStyleVar();
             return false;
         }
 
@@ -131,7 +130,7 @@ namespace credits {
 
         ImGui::EndPopup();
         ImGui::PopStyleColor();
-        ImGui::PopStyleVar(fatScrollbar ? 2 : 1);
+        ImGui::PopStyleVar();
         return open;
     }
 }

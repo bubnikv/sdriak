@@ -2,6 +2,23 @@
 
 Major releases only. For the detailed per-release history including alpha and beta pre-releases, see [changelog-full.md](changelog-full.md).
 
+## v1.4.0-beta2 - 2026-09-08
+
+This follow-up beta completes the rename to **SDRIAK**, improves QMX panadapter synchronization, and polishes touch interaction on the waterfall.
+
+### QMX panadapter operation
+
+- With **Sync VFO** enabled, the selected VFO remains at the center of the waterfall at every zoom level while tuning or panning, and frequency changes synchronize in both directions between SDRIAK and QMX.
+- QMX and SDRIAK modes now synchronize in both directions. AM is supported by current QMX firmware, and CW/CW-R changes follow the sideband implied by the QMX CW/CWR settings.
+
+### Touch, tuning and interface
+
+- Tuning is now possible by clicking and dragging inside the VFO band if the VFO is already selected ([#21](https://github.com/bubnikv/sdriak/issues/21)).
+
+### SDRIAK identity and packaging
+
+- The former **SDR++ iak** name has been replaced with "SDRIAK" and the icon was changed to differentiate from the SDR++ (to be registered trademark).
+
 ## v1.4.0-beta
 
 The version jumps from the 1.2.2 series to 1.4.0-beta because this release builds on upstream SDR++'s continuously evolving 1.3.0 codebase.

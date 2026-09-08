@@ -1,4 +1,4 @@
-build/
+build*/
 deps/build*/
 deps/.pkg_cache/
 .vscode/
