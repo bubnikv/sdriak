@@ -16,7 +16,8 @@ namespace tuner {
 
     // For synchronization with hardware radio, where the VFO frequency is locked at a fixed offset from IF center frequency.
     // For example, the QMX radio demodulates at +12kHz from the IQ center frequency.
-    void lockVFOtoCenter(double offsetHz);
+    // Returns true if changed.
+    bool lockVFOtoCenter(double offsetHz);
     // Stop synchroning VFO to IQ center frequency.
     void unlockVFO();
     // Returns true if the VFO is currently locked to the IQ center frequency.

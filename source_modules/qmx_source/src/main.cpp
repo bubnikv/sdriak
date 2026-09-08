@@ -310,7 +310,7 @@ private:
         options.androidUsb.fd = self->androidUsbHandle.fd();
 #endif
 
-        self->sync.start(self->freq, self->sync.getSyncVfo());
+        self->sync.start(self->sync.getSyncVfo());
 
         std::string error;
         if (!self->device.start(options, &QMXSourceModule::sampleHandler, self, &QMXSourceModule::statusHandler, self, &error)) {
@@ -458,14 +458,14 @@ private:
         }
 
         SmGui::Separator();
-        if (!self->sync.hasStatus()) {
+
+        const auto& st = self->sync.currentStatus();
+        if (st.empty()) {
             SmGui::Text("CAT Status:");
             SmGui::SameLine();
             SmGui::Text(self->running ? "Waiting for QMX status" : "Unavailable");
             return;
         }
-
-        const auto& st = self->sync.currentStatus();
 
         SmGui::Text("State:");
         SmGui::SameLine();

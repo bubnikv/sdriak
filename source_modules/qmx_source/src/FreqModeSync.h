@@ -45,7 +45,7 @@ public:
     void setDevice(qmx::QmxDevice* device);
 
     // Reset all sync state.  Called when streaming starts.
-    void start(double initialFreq, bool syncVfo);
+    void start(bool syncVfo);
 
     // Reset all sync state.  Called when streaming stops.
     void stop();
@@ -71,13 +71,12 @@ public:
     // ── Accessors for UI display ──────────────────────────────────────
 
     double getFreq() const { return m_iqCenterFreq; }
-    bool hasStatus() const { return m_hasStatus; }
     const qmx::QmxStatus& currentStatus() const { return m_status; }
 
 private:
     qmx::QmxDevice* m_device = nullptr;
     bool m_running = false;
-    double m_iqCenterFreq = 7000000.0;
+    double m_iqCenterFreq = -1.;
     bool m_syncVfo = false;
 
     // Pending status delivered by poller thread, consumed by tick() on GUI thread.
@@ -87,8 +86,4 @@ private:
 
     // Cached QMX status — the single source of truth, only touched on GUI thread.
     qmx::QmxStatus m_status;
-    bool m_hasStatus = false;
-
-    // Tracks the last mode sent to QMX to suppress echoing it back.
-    int m_lastModeSentToQmx = -1;
 };
