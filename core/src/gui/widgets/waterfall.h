@@ -335,7 +335,7 @@ namespace ImGui {
         ImVec2 fftResizePendingPos;
         float fftResizeGrabOffset = 0.0f; // grab-point offset so the divider doesn't jump to the finger/cursor
         bool freqScaleSelect = false;
-        bool vfoSelect = false;
+        bool vfoSelect = false;           // first press selected a different VFO; suppress input until release
         bool vfoBorderSelect = false;
         WaterfallVFO* relatedVfo = NULL;
         ImVec2 mouseDownPos;

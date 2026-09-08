@@ -357,13 +357,16 @@ namespace ImGui {
         if (mousePos.x != lastMousePos.x || mousePos.y != lastMousePos.y) { mouseMoved = true; }
         lastMousePos = mousePos;
 
-        std::string hoveredVFOName = "";
+        std::string hoveredVFOName;
         for (auto const& [name, _vfo] : vfos) {
             if (ImGui::IsMouseHoveringRect(_vfo->rectMin, _vfo->rectMax) || ImGui::IsMouseHoveringRect(_vfo->wfRectMin, _vfo->wfRectMax)) {
                 hoveredVFOName = name;
                 break;
             }
         }
+        // An initial press on empty spectrum or on the already-selected VFO
+        // may tune immediately. A different VFO is handled as selection below.
+        bool allowVfoClickMove = hoveredVFOName.empty() || selectedVFO == hoveredVFOName;
 
         // Deselect everything if the mouse is released
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -398,7 +401,6 @@ namespace ImGui {
 
             fftResizeSelect = false;
             freqScaleSelect = false;
-            vfoSelect = false;
             vfoBorderSelect = false;
             lastDrag = 0;
         }
@@ -484,11 +486,23 @@ namespace ImGui {
             }
 
             // Next, check if a VFO was selected
-            if (!targetFound && hoveredVFOName != "") {
-                selectedVFO = hoveredVFOName;
-                selectedVFOChanged = true;
-                targetFound = true;
-                return;
+            if (!targetFound && !hoveredVFOName.empty()) {
+                if (selectedVFO != hoveredVFOName) {
+                    selectedVFO = hoveredVFOName;
+                    selectedVFOChanged = true;
+                    // Selecting and moving are separate gestures. Latch this
+                    // press until its release so motion from a finger (or a
+                    // slightly moving mouse) cannot immediately drag the VFO.
+                    vfoSelect = true;
+                    // Clear hit state for the rest of this frame so the
+                    // main-window wheel and arrow handlers stay inactive too.
+                    mouseInFFTResize = false;
+                    mouseInFreq = false;
+                    mouseInFFT = false;
+                    mouseInWaterfall = false;
+                    targetFound = true;
+                    return;
+                }
             }
 
             // Now, check frequency scale
@@ -579,7 +593,7 @@ namespace ImGui {
         }
 
         // Finally, if nothing else was selected, just move the VFO
-        if ((VFOMoveSingleClick ? ImGui::IsMouseClicked(ImGuiMouseButton_Left) : ImGui::IsMouseDown(ImGuiMouseButton_Left)) && (mouseInFFT | mouseInWaterfall) && (mouseMoved || hoveredVFOName == "")) {
+        if ((VFOMoveSingleClick ? ImGui::IsMouseClicked(ImGuiMouseButton_Left) : ImGui::IsMouseDown(ImGuiMouseButton_Left)) && (mouseInFFT | mouseInWaterfall) && (mouseMoved || allowVfoClickMove)) {
             if (selVfo != NULL) {
                 int refCenter = mousePos.x - fftAreaMin.x;
                 if (refCenter >= 0 && refCenter < dataWidth) {
@@ -1006,8 +1020,17 @@ namespace ImGui {
         window->DrawList->AddRect(widgetPos, widgetEndPos, IM_COL32(50, 50, 50, 255), 0.0, 0, style::lineWidth());
         window->DrawList->AddLine(ImVec2(widgetPos.x, freqAreaMax.y), ImVec2(widgetPos.x + widgetSize.x, freqAreaMax.y), IM_COL32(50, 50, 50, 255), style::lineWidth());
 
+        // A first press on an unselected VFO only changes the selection. Keep
+        // the whole waterfall inert until that press is released, including
+        // overlay input handlers and the wheel/key handling in main_window.
+        // Do this outside the hover test so a release that happens after the
+        // pointer leaves the waterfall still terminates the gesture.
+        if (vfoSelect && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            vfoSelect = false;
+        }
+
         if (ImGui::IsWindowHovered(ImGuiHoveredFlags_None) &&
-            !gui::mainWindow.lockWaterfallControls)
+            !gui::mainWindow.lockWaterfallControls && !vfoSelect)
         {
             inputHandled = false;
             InputHandlerArgs args;

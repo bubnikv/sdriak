@@ -60,6 +60,7 @@ namespace backend {
     int ShowSoftKeyboardInput();
     int PollUnicodeChars();
     float getContentScale();
+    static void resetInputRecognizers();
     static UsbDeviceHandle getUsbDeviceHandle(const std::vector<DevVIDPID>& allowedVidPids);
     static bool releaseUsbDeviceHandle(const UsbDeviceHandle& handle);
     static bool callActivityVoidMethod(const char* name);
@@ -153,6 +154,24 @@ namespace backend {
         gui::mainWindow.setFirstMenuRender();
     }
 
+    static void handleImGuiAppFocusChange(bool focused) {
+        if (!focused) {
+            // These recognizers outlive the ImGui context across TERM_WINDOW.
+            resetInputRecognizers();
+        }
+        if (!ImGui::GetCurrentContext()) return;
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddFocusEvent(focused);
+        if (!focused) {
+            // Android can interrupt a gesture without delivering its UP event.
+            // Release every emulated mouse button so UI gesture latches cannot
+            // survive switching applications or losing the native window.
+            for (int button = 0; button < ImGuiMouseButton_COUNT; button++) {
+                io.AddMouseButtonEvent(button, false);
+            }
+        }
+    }
+
     void handleAppCmd(struct android_app* app, int32_t appCmd) {
         switch (appCmd) {
         case APP_CMD_SAVE_STATE:
@@ -161,6 +180,7 @@ namespace backend {
             break;
         case APP_CMD_PAUSE:
             flog::warn("APP_CMD_PAUSE");
+            handleImGuiAppFocusChange(false);
             wasPlayingBeforeSuspend = gui::mainWindow.sdrIsRunning();
             // Android may kill the process while it is backgrounded. Commit
             // while the radio interface is still alive, then force the config
@@ -196,15 +216,18 @@ namespace backend {
             break;
         case APP_CMD_TERM_WINDOW:
             flog::warn("APP_CMD_TERM_WINDOW");
+            handleImGuiAppFocusChange(false);
             suspendSleepTimer();
             pauseRendering = true;
             backend::end();
             break;
         case APP_CMD_GAINED_FOCUS:
             flog::warn("APP_CMD_GAINED_FOCUS");
+            handleImGuiAppFocusChange(true);
             break;
         case APP_CMD_LOST_FOCUS:
             flog::warn("APP_CMD_LOST_FOCUS");
+            handleImGuiAppFocusChange(false);
             break;
         case APP_CMD_CONFIG_CHANGED:
             flog::warn("APP_CMD_CONFIG_CHANGED");
@@ -303,6 +326,12 @@ namespace backend {
             }
 
             return 1;  // consume all other events while pinching
+        }
+
+        void reset() {
+            state = State::IDLE;
+            firstFingerId = -1;
+            lastDist = 0.0f;
         }
 
     private:
@@ -486,6 +515,7 @@ namespace backend {
             }
         }
 
+        // All remaining fields are initialized when the next DOWN starts.
         void reset() { state = State::IDLE; }
 
     private:
@@ -599,6 +629,11 @@ namespace backend {
     };
 
     static TouchScrollRecognizer touchScrollRecognizer;
+
+    static void resetInputRecognizers() {
+        gestureRecognizer.reset();
+        touchScrollRecognizer.reset();
+    }
 
     // Back key: one press dismisses one UI layer (popup/modal, credits).
     // With nothing left to dismiss, the app moves to the background instead

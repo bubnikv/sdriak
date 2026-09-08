@@ -224,6 +224,12 @@ int32_t ImGui_ImplAndroid_HandleInputEvent(AInputEvent* input_event)
         case AMOTION_EVENT_ACTION_MOVE:       // Touch pointer moves while DOWN
             io.AddMousePosEvent(AMotionEvent_getX(input_event, event_pointer_index), AMotionEvent_getY(input_event, event_pointer_index));
             break;
+        case AMOTION_EVENT_ACTION_CANCEL:
+            // SDR++ local: the system took ownership of the gesture, so no
+            // ACTION_UP will follow. Release every mouse button tracked above.
+            for (int button = 0; button < 3; button++)
+                io.AddMouseButtonEvent(button, false);
+            break;
         case AMOTION_EVENT_ACTION_SCROLL:
             io.AddMouseWheelEvent(AMotionEvent_getAxisValue(input_event, AMOTION_EVENT_AXIS_HSCROLL, event_pointer_index), AMotionEvent_getAxisValue(input_event, AMOTION_EVENT_AXIS_VSCROLL, event_pointer_index));
             break;
