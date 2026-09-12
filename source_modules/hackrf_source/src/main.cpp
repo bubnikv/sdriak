@@ -83,7 +83,13 @@ public:
     HackRFSourceModule(std::string name) {
         this->name = name;
 
-        hackrf_init();
+        hackrf_error initErr = (hackrf_error)hackrf_init();
+        if (initErr == HACKRF_SUCCESS) {
+            initialized = true;
+        }
+        else {
+            flog::error("Could not initialize HackRF library: {0}", hackrf_error_name(initErr));
+        }
 
         // Select the last samplerate option
         sampleRate = 2000000;
@@ -98,7 +104,7 @@ public:
         handler.tuneHandler = tune;
         handler.stream = &stream;
 
-        refresh();
+        if (initialized) { refresh(); }
 
         std::string confSerial = config.read().value("device", std::string());
         selectBySerial(confSerial);
@@ -108,7 +114,12 @@ public:
 
     ~HackRFSourceModule() {
         stop(this);
-        hackrf_exit();
+        if (initialized) {
+            hackrf_error err = (hackrf_error)hackrf_exit();
+            if (err != HACKRF_SUCCESS) {
+                flog::error("Could not shut down HackRF library: {0}", hackrf_error_name(err));
+            }
+        }
         sigpath::sourceManager.unregisterSource("HackRF");
     }
 
@@ -131,16 +142,20 @@ public:
         devListTxt = "";
 
 #ifndef __ANDROID__
-        uint64_t serials[256];
         hackrf_device_list_t* _devList = hackrf_device_list();
+        if (_devList == NULL) {
+            flog::error("Could not enumerate HackRF devices: {0}", hackrf_error_name(HACKRF_ERROR_LIBUSB));
+            return;
+        }
 
         for (int i = 0; i < _devList->devicecount; i++) {
             // Skip devices that are in use
             if (_devList->serial_numbers[i] == NULL) { continue; }
 
             // Save the device serial number
-            devList.push_back(_devList->serial_numbers[i]);
-            devListTxt += (char*)(_devList->serial_numbers[i] + 16);
+            std::string serial = _devList->serial_numbers[i];
+            devList.push_back(serial);
+            devListTxt += serial.length() > 16 ? serial.substr(16) : serial;
             devListTxt += '\0';
         }
 
@@ -255,6 +270,10 @@ private:
     static void start(void* ctx) {
         HackRFSourceModule* _this = (HackRFSourceModule*)ctx;
         if (_this->running) { return; }
+        if (!_this->initialized) {
+            flog::error("Tried to start HackRF source before the library was initialized");
+            return;
+        }
 #ifdef __ANDROID__
         _this->refreshAndroidSelectionIfNeeded();
 #endif
@@ -289,7 +308,19 @@ private:
         hackrf_set_lna_gain(_this->openDev, _this->lna);
         hackrf_set_vga_gain(_this->openDev, _this->vga);
 
-        hackrf_start_rx(_this->openDev, callback, _this);
+        err = (hackrf_error)hackrf_start_rx(_this->openDev, callback, _this);
+        if (err != HACKRF_SUCCESS) {
+            flog::error("Could not start HackRF {0}: {1}", _this->selectedSerial, hackrf_error_name(err));
+            hackrf_error closeErr = (hackrf_error)hackrf_close(_this->openDev);
+            _this->openDev = NULL;
+            if (closeErr != HACKRF_SUCCESS) {
+                flog::error("Could not close HackRF {0} after start failure: {1}", _this->selectedSerial, hackrf_error_name(closeErr));
+            }
+#ifdef __ANDROID__
+            _this->androidUsbHandle.reset();
+#endif
+            return;
+        }
 
         _this->running = true;
         flog::info("HackRFSourceModule '{0}': Start!", _this->name);
@@ -302,6 +333,7 @@ private:
         _this->stream.stopWriter();
         // TODO: Stream stop
         hackrf_error err = (hackrf_error)hackrf_close(_this->openDev);
+        _this->openDev = NULL;
         if (err != HACKRF_SUCCESS) {
             flog::error("Could not close HackRF {0}: {1}", _this->selectedSerial, hackrf_error_name(err));
         }
@@ -407,7 +439,8 @@ private:
     }
 
     std::string name;
-    hackrf_device* openDev;
+    hackrf_device* openDev = NULL;
+    bool initialized = false;
     bool enabled = true;
     dsp::stream<dsp::complex_t> stream;
     int sampleRate;

@@ -1,0 +1,494 @@
+From: Vojtech Bubnik <bubnikv@gmail.com>
+Date: Sat, 12 Sep 2026 12:00:00 +0200
+Subject: [PATCH] Harden libusb probing and streaming teardown
+
+Keep exact accounting for partial transfer submissions and drain cancelled
+transfers for at most 500 ms. If a wrapped Android fd was closed before the
+transfers could be reaped, retain the complete device and USB session rather
+than freeing objects still referenced by libusb or the kernel. libhackrf uses
+one global context, so retaining the device object is also necessary in case
+another HackRF event thread processes a late callback.
+
+Also validate libusb enumeration and string-descriptor results, initialize USB
+string buffers, pass Android's no-discovery option through libusb_init_context,
+make every hackrf_open_setup failure release partially-created resources, and
+recognize the pthreads4w target exported by the SDR++ dependency build.
+---
+diff --git a/host/libhackrf/src/CMakeLists.txt b/host/libhackrf/src/CMakeLists.txt
+index dc21548e..7e0c9ef9 100644
+--- a/host/libhackrf/src/CMakeLists.txt
++++ b/host/libhackrf/src/CMakeLists.txt
+@@ -62,6 +62,8 @@ function(libhackrf_common_settings libtarget)
+   target_link_libraries(${libtarget} PRIVATE LIBUSB::LIBUSB)
+   if(TARGET PThreads4W::PThreads4W)
+     target_link_libraries(${libtarget} PRIVATE PThreads4W::PThreads4W)
++  elseif(TARGET pthreads4w::pthreadVC3)
++    target_link_libraries(${libtarget} PRIVATE pthreads4w::pthreadVC3)
+   else()
+     target_link_libraries(${libtarget} PRIVATE Threads::Threads)
+   endif()
+diff --git a/host/libhackrf/src/hackrf.c b/host/libhackrf/src/hackrf.c
+index 10868e6f..d9aee06c 100644
+--- a/host/libhackrf/src/hackrf.c
++++ b/host/libhackrf/src/hackrf.c
+@@ -24,6 +24,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
+ #include "hackrf.h"
+ 
+ #include <stdbool.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #ifndef _WIN32
+@@ -153,6 +154,7 @@ struct hackrf_device {
+ 	pthread_mutex_t transfer_lock;  /* must be held to cancel or restart transfers */
+ 	volatile int active_transfers;  /* number of active transfers */
+ 	pthread_cond_t all_finished_cv; /* signalled when all transfers have finished */
++	bool transfers_stuck;           /* cancelled transfers could not be reaped */
+ 	bool flush;
+ 	struct libusb_transfer* flush_transfer;
+ 	hackrf_flush_cb_fn flush_callback;
+@@ -225,53 +227,78 @@ static int transfers_check_setup(hackrf_device* device)
+  * pending transfers.
+  *
+  * Returns HACKRF_SUCCESS if OK, HACKRF_ERROR_OTHER if the
+- * transfers aren't currently setup.
++ * transfers aren't currently setup or could not be reaped.
+  */
+ static int cancel_transfers(hackrf_device* device)
+ {
+ 	uint32_t transfer_index;
++	int drain_slice;
++	int active_transfers;
++	int result;
++	struct timeval timeout = {0, 10000};
+ 
+ 	// If we're cancelling transfers for any reason, we're shutting down.
+ 	device->streaming = false;
+ 
+-	if (transfers_check_setup(device) == true) {
+-		// Take lock while cancelling transfers. This blocks the
+-		// transfer completion callback from restarting a transfer
+-		// while we're in the middle of trying to cancel them all.
+-		pthread_mutex_lock(&device->transfer_lock);
++	// Take lock while cancelling transfers. This blocks the transfer
++	// completion callback from restarting a transfer while we're in the
++	// middle of trying to cancel them all.
++	pthread_mutex_lock(&device->transfer_lock);
++	if (device->transfers_stuck) {
++		pthread_mutex_unlock(&device->transfer_lock);
++		return HACKRF_ERROR_OTHER;
++	}
++	if (transfers_check_setup(device) == false && device->active_transfers <= 0) {
++		pthread_mutex_unlock(&device->transfer_lock);
++		return HACKRF_ERROR_OTHER;
++	}
+ 
+-		for (transfer_index = 0; transfer_index < TRANSFER_COUNT;
+-		     transfer_index++) {
+-			if (device->transfers[transfer_index] != NULL) {
+-				libusb_cancel_transfer(device->transfers[transfer_index]);
+-			}
++	for (transfer_index = 0; transfer_index < TRANSFER_COUNT; transfer_index++) {
++		if (device->transfers[transfer_index] != NULL) {
++			libusb_cancel_transfer(device->transfers[transfer_index]);
+ 		}
++	}
+ 
+-		if (device->flush_transfer != NULL)
+-			libusb_cancel_transfer(device->flush_transfer);
++	if (device->flush_transfer != NULL)
++		libusb_cancel_transfer(device->flush_transfer);
+ 
+-		device->transfers_setup = false;
+-		device->flush = false;
++	device->transfers_setup = false;
++	device->flush = false;
++	pthread_mutex_unlock(&device->transfer_lock);
+ 
+-		// Now wait for the transfer thread to signal that all transfers
+-		// have finished, either by completing or being fully cancelled.
+-		while (device->active_transfers > 0) {
+-			pthread_cond_wait(
+-				&device->all_finished_cv,
+-				&device->transfer_lock);
+-		}
++	/* Drain with a bounded deadline. If the wrapped fd was closed under
++	 * libusb, cancellation can fail with EBADF and no callbacks will arrive. */
++	for (drain_slice = 0; drain_slice < 50; drain_slice++) {
++		pthread_mutex_lock(&device->transfer_lock);
++		active_transfers = device->active_transfers;
+ 		pthread_mutex_unlock(&device->transfer_lock);
++		if (active_transfers <= 0)
++			break;
+ 
+-		return HACKRF_SUCCESS;
+-	} else {
+-		return HACKRF_ERROR_OTHER;
++		result = libusb_handle_events_timeout_completed(
++			g_libusb_context,
++			&timeout,
++			NULL);
++		if (result < 0 && result != LIBUSB_ERROR_INTERRUPTED) {
++			break;
++		}
+ 	}
++
++	pthread_mutex_lock(&device->transfer_lock);
++	device->transfers_stuck = (device->active_transfers > 0);
++	active_transfers = device->active_transfers;
++	pthread_mutex_unlock(&device->transfer_lock);
++
++	return active_transfers > 0 ? HACKRF_ERROR_OTHER : HACKRF_SUCCESS;
+ }
+ 
+ static int free_transfers(hackrf_device* device)
+ {
+ 	uint32_t transfer_index;
+ 
++	if (device->transfers_stuck)
++		return HACKRF_ERROR_OTHER;
++
+ 	if (device->transfers != NULL) {
+ 		// libusb_close() should free all transfers referenced from this array.
+ 		for (transfer_index = 0; transfer_index < TRANSFER_COUNT;
+@@ -335,7 +362,7 @@ static int prepare_transfers(
+ 	const uint_fast8_t endpoint_address,
+ 	libusb_transfer_cb_fn callback)
+ {
+-	int error;
++	int error = LIBUSB_SUCCESS;
+ 	uint32_t transfer_index;
+ 	uint32_t ready_transfers = 0;
+ 
+@@ -343,6 +370,9 @@ static int prepare_transfers(
+ 		// This shouldn't happen.
+ 		return HACKRF_ERROR_OTHER;
+ 	}
++	if (device->transfers_stuck) {
++		return HACKRF_ERROR_OTHER;
++	}
+ 
+ 	// If setting up for TX, call the TX callback to fill each
+ 	// transfer buffer.
+@@ -420,6 +450,11 @@ static int prepare_transfers(
+ 				last_libusb_error = error;
+ 			}
+ 		}
++	} else {
++		/* A later submission can fail after earlier transfers were accepted.
++		 * Mark that partial set as owned by libusb so it is cancelled below. */
++		device->streaming = false;
++		device->transfers_setup = (device->active_transfers > 0);
+ 	}
+ 
+ 	// Now we can release the transfer lock.
+@@ -428,6 +463,10 @@ static int prepare_transfers(
+ 	if (error == 0) {
+ 		return HACKRF_SUCCESS;
+ 	} else {
++		int submit_error = error;
++		if (device->transfers_setup)
++			(void) cancel_transfers(device);
++		last_libusb_error = submit_error;
+ 		return HACKRF_ERROR_LIBUSB;
+ 	}
+ }
+@@ -507,13 +546,23 @@ int ADDCALL hackrf_init(void)
+ 	}
+ 
+ #ifdef DISABLE_USB_DEVICE_DISCOVERY
+-	/* An unprivileged Android app cannot walk the USB bus, so libusb must
+-	 * not try; the caller hands us an already-open fd instead, via
+-	 * hackrf_open_by_fd(). */
+-	libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
++	/* An unprivileged Android app cannot walk the USB bus; it hands us an
++	 * already-open fd instead. Apply the option atomically when supported. */
++#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x0100010A)
++	const struct libusb_init_option options[] = {
++		{.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY},
++	};
++	libusb_error = libusb_init_context(&g_libusb_context, options, 1);
++#else
++	libusb_error =
++		libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
++	if (libusb_error == LIBUSB_SUCCESS)
++		libusb_error = libusb_init(&g_libusb_context);
+ #endif
+-
++#else
+ 	libusb_error = libusb_init(&g_libusb_context);
++#endif
++
+ 	if (libusb_error != 0) {
+ 		last_libusb_error = libusb_error;
+ 		return HACKRF_ERROR_LIBUSB;
+@@ -555,18 +604,30 @@ const char* ADDCALL hackrf_library_release()
+ hackrf_device_list_t* ADDCALL hackrf_device_list()
+ {
+ 	int i;
++	int result;
+ 	libusb_device_handle* usb_device = NULL;
+ 	uint8_t serial_descriptor_index;
+-	char serial_number[64];
+-	uint8_t idx, serial_number_length;
++	char serial_number[64] = {0};
++	int idx, serial_number_length;
++	ssize_t usb_devicecount;
+ 
+ 	hackrf_device_list_t* list = calloc(1, sizeof(*list));
+ 	if (list == NULL)
+ 		return NULL;
+ 
+-	list->usb_devicecount = (int) libusb_get_device_list(
++	usb_devicecount = libusb_get_device_list(
+ 		g_libusb_context,
+ 		(libusb_device***) &list->usb_devices);
++	if (usb_devicecount < 0) {
++		last_libusb_error = (int) usb_devicecount;
++		if (list->usb_devices != NULL)
++			libusb_free_device_list((libusb_device**) list->usb_devices, 1);
++		free(list);
++		return NULL;
++	}
++	list->usb_devicecount = (int) usb_devicecount;
++	if (list->usb_devicecount == 0)
++		return list;
+ 
+ 	list->serial_numbers = calloc(list->usb_devicecount, sizeof(void*));
+ 	list->usb_board_ids =
+@@ -581,7 +642,13 @@ hackrf_device_list_t* ADDCALL hackrf_device_list()
+ 
+ 	for (i = 0; i < list->usb_devicecount; i++) {
+ 		struct libusb_device_descriptor device_descriptor;
+-		libusb_get_device_descriptor(list->usb_devices[i], &device_descriptor);
++		result = libusb_get_device_descriptor(
++			list->usb_devices[i],
++			&device_descriptor);
++		if (result != LIBUSB_SUCCESS) {
++			last_libusb_error = result;
++			continue;
++		}
+ 
+ 		if (device_descriptor.idVendor == hackrf_usb_vid) {
+ 			if ((device_descriptor.idProduct == hackrf_one_usb_pid) ||
+@@ -609,8 +676,12 @@ hackrf_device_list_t* ADDCALL hackrf_device_list()
+ 						serial_number_length =
+ 							USB_MAX_SERIAL_LENGTH;
+ 
+-					serial_number[serial_number_length] = 0;
+-					list->serial_numbers[idx] = strdup(serial_number);
++					if (serial_number_length > 0) {
++						serial_number[serial_number_length] = 0;
++						list->serial_numbers[idx] = strdup(serial_number);
++					} else {
++						last_libusb_error = serial_number_length;
++					}
+ 
+ 					libusb_close(usb_device);
+ 					usb_device = NULL;
+@@ -641,26 +712,39 @@ void ADDCALL hackrf_device_list_free(hackrf_device_list_t* list)
+ 
+ libusb_device_handle* hackrf_open_usb(const char* const desired_serial_number)
+ {
++	int result;
+ 	libusb_device_handle* usb_device = NULL;
+ 	libusb_device** devices = NULL;
+ 	const ssize_t list_length = libusb_get_device_list(g_libusb_context, &devices);
+ 	ssize_t match_len = 0;
+ 	ssize_t i;
+-	char serial_number[64];
++	char serial_number[64] = {0};
+ 	int serial_number_length;
++	if (list_length < 0) {
++		last_libusb_error = (int) list_length;
++		if (devices != NULL)
++			libusb_free_device_list(devices, 1);
++		return NULL;
++	}
+ 
+ 	if (desired_serial_number) {
+ 		/* If a shorter serial number is specified, only match against the suffix.
+ 		 * Should probably complain if the match is not unique, currently doesn't.
+ 		 */
+ 		match_len = strlen(desired_serial_number);
+-		if (match_len > 32)
++		if (match_len > 32) {
++			libusb_free_device_list(devices, 1);
+ 			return NULL;
++		}
+ 	}
+ 
+ 	for (i = 0; i < list_length; i++) {
+ 		struct libusb_device_descriptor device_descriptor;
+-		libusb_get_device_descriptor(devices[i], &device_descriptor);
++		result = libusb_get_device_descriptor(devices[i], &device_descriptor);
++		if (result != LIBUSB_SUCCESS) {
++			last_libusb_error = result;
++			continue;
++		}
+ 
+ 		if (device_descriptor.idVendor == hackrf_usb_vid) {
+ 			if ((device_descriptor.idProduct == hackrf_one_usb_pid) ||
+@@ -687,6 +771,13 @@ libusb_device_handle* hackrf_open_usb(const char* const desired_serial_number)
+ 						    USB_MAX_SERIAL_LENGTH)
+ 							serial_number_length =
+ 								USB_MAX_SERIAL_LENGTH;
++						if (serial_number_length <= 0 ||
++						    match_len > serial_number_length) {
++							last_libusb_error = serial_number_length;
++							libusb_close(usb_device);
++							usb_device = NULL;
++							continue;
++						}
+ 						serial_number[serial_number_length] = 0;
+ 						if (strncmp(serial_number +
+ 								    serial_number_length -
+@@ -700,8 +791,11 @@ libusb_device_handle* hackrf_open_usb(const char* const desired_serial_number)
+ 						}
+ 					}
+ 				} else {
+-					libusb_open(devices[i], &usb_device);
+-					break;
++					result = libusb_open(devices[i], &usb_device);
++					if (result == LIBUSB_SUCCESS)
++						break;
++					last_libusb_error = result;
++					usb_device = NULL;
+ 				}
+ 			}
+ 		}
+@@ -716,6 +810,10 @@ static int hackrf_open_setup(libusb_device_handle* usb_device, hackrf_device** d
+ {
+ 	int result;
+ 	hackrf_device* lib_device;
++	bool mutex_initialized = false;
++	bool condition_initialized = false;
++
++	*device = NULL;
+ 
+ 	//int speed = libusb_get_device_speed(usb_device);
+ 	// TODO: Error or warning if not high speed USB?
+@@ -763,40 +861,41 @@ static int hackrf_open_setup(libusb_device_handle* usb_device, hackrf_device** d
+ 
+ 	result = pthread_mutex_init(&lib_device->transfer_lock, NULL);
+ 	if (result != 0) {
+-		free(lib_device);
+-		libusb_release_interface(usb_device, 0);
+-		libusb_close(usb_device);
+-		return HACKRF_ERROR_THREAD;
++		result = HACKRF_ERROR_THREAD;
++		goto fail;
+ 	}
++	mutex_initialized = true;
+ 
+ 	result = pthread_cond_init(&lib_device->all_finished_cv, NULL);
+ 	if (result != 0) {
+-		free(lib_device);
+-		libusb_release_interface(usb_device, 0);
+-		libusb_close(usb_device);
+-		return HACKRF_ERROR_THREAD;
++		result = HACKRF_ERROR_THREAD;
++		goto fail;
+ 	}
++	condition_initialized = true;
+ 
+ 	result = allocate_transfers(lib_device);
+-	if (result != 0) {
+-		free(lib_device);
+-		libusb_release_interface(usb_device, 0);
+-		libusb_close(usb_device);
+-		return HACKRF_ERROR_NO_MEM;
+-	}
++	if (result != HACKRF_SUCCESS)
++		goto fail;
+ 
+ 	result = create_transfer_thread(lib_device);
+-	if (result != 0) {
+-		free(lib_device);
+-		libusb_release_interface(usb_device, 0);
+-		libusb_close(usb_device);
+-		return result;
+-	}
++	if (result != HACKRF_SUCCESS)
++		goto fail;
+ 
+ 	*device = lib_device;
+ 	open_devices++;
+ 
+ 	return HACKRF_SUCCESS;
++
++fail:
++	free_transfers(lib_device);
++	if (condition_initialized)
++		pthread_cond_destroy(&lib_device->all_finished_cv);
++	if (mutex_initialized)
++		pthread_mutex_destroy(&lib_device->transfer_lock);
++	free(lib_device);
++	libusb_release_interface(usb_device, 0);
++	libusb_close(usb_device);
++	return result;
+ }
+ 
+ int ADDCALL hackrf_open(hackrf_device** device)
+@@ -924,7 +1023,7 @@ int ADDCALL hackrf_device_list_bus_sharing(hackrf_device_list_t* list, int idx)
+ 	int other_device_count = 0;
+ 	int i;
+ 	if (list == NULL || list->usb_devices == NULL || list->usb_device_index == NULL ||
+-	    idx < 0 || idx > list->devicecount) {
++	    idx < 0 || idx >= list->devicecount) {
+ 		return HACKRF_ERROR_INVALID_PARAM;
+ 	}
+ 	hackrf_dev = list->usb_devices[list->usb_device_index[idx]];
+@@ -2234,11 +2333,8 @@ static int kill_transfer_thread(hackrf_device* device)
+ 	int result;
+ 
+ 	if (device->transfer_thread_started != false) {
+-		/*
+-		 * Cancel transfers. This call will block until the transfer
+-		 * thread has handled all completion callbacks.
+-		 */
+-		cancel_transfers(device);
++		/* Cancel and drain transfers while the event thread is still alive. */
++		(void) cancel_transfers(device);
+ 
+ 		// Set flag to tell the thread to exit.
+ 		device->do_exit = true;
+@@ -2256,6 +2352,8 @@ static int kill_transfer_thread(hackrf_device* device)
+ 		}
+ 		device->transfer_thread_started = false;
+ 	}
++	if (device->transfers_stuck)
++		return HACKRF_ERROR_OTHER;
+ 
+ 	/*
+ 	 * Reset do_exit; we're now done here and the thread was
+@@ -2469,6 +2567,17 @@ int ADDCALL hackrf_close(hackrf_device* device)
+ 		 * also cancel any pending transmit/receive transfers.
+ 		 */
+ 		result2 = kill_transfer_thread(device);
++		if (device->transfers_stuck) {
++			/* libusb still references the transfers and their device user_data.
++			 * Since all HackRF handles share one context, another device can
++			 * continue pumping callbacks. Leak the complete dead session rather
++			 * than freeing memory libusb or the kernel may still access. */
++			fprintf(
++				stderr,
++				"hackrf: cancelled USB transfers could not be reaped; "
++				"leaking device and USB session to avoid a use-after-free\n");
++			return HACKRF_ERROR_OTHER;
++		}
+ 		if (device->usb_device != NULL) {
+ 			libusb_release_interface(device->usb_device, 0);
+ 			libusb_close(device->usb_device);
+@@ -2481,8 +2590,10 @@ int ADDCALL hackrf_close(hackrf_device* device)
+ 		pthread_cond_destroy(&device->all_finished_cv);
+ 
+ 		free(device);
++		open_devices--;
++	} else {
++		return HACKRF_ERROR_INVALID_PARAM;
+ 	}
+-	open_devices--;
+ 
+ 	if (result2 != HACKRF_SUCCESS) {
+ 		return result2;

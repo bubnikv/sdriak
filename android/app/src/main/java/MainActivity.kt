@@ -546,10 +546,12 @@ class MainActivity : NativeActivity() {
         (getSystemService(Context.AUDIO_SERVICE) as AudioManager)
             .unregisterAudioDeviceCallback(audioDeviceCallback)
         unregisterUsbReceiver()
+        // Native source modules must cancel and reap libusb transfers before
+        // the Java-owned file descriptors backing wrapped handles are closed.
+        super.onDestroy();
         SDR_conn?.close()
         SDR_conn = null
         Companion.clearRetainedUsbConnections()
-        super.onDestroy();
     }
 
     /**
