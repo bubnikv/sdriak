@@ -1,0 +1,167 @@
+From ae63aef3f72bd538453858490084af7597492454 Mon Sep 17 00:00:00 2001
+From: Vojtech Bubnik <bubnikv@gmail.com>
+Date: Sat, 12 Sep 2026 08:26:32 +0200
+Subject: [PATCH] Add Android open-by-fd support
+
+An unprivileged Android app cannot enumerate the USB bus; it receives an
+already-open file descriptor from UsbManager instead. libhackrf already
+carries the build option for that environment
+(DISABLE_USB_DEVICE_DISCOVERY), but nothing reads the macro it defines
+and there is no entry point that accepts a file descriptor, so the
+option currently does nothing. Add the two missing pieces, ported from
+AlexandreRouma/hackrf@b1275e9c (which carried them against 2022's
+libhackrf) and rebased onto v2026.01.3:
+
+- hackrf_init() honours DISABLE_USB_DEVICE_DISCOVERY by setting
+  LIBUSB_OPTION_NO_DEVICE_DISCOVERY before libusb_init(), so libusb does
+  not attempt the enumeration it cannot perform there.
+- hackrf_open_by_fd() wraps a caller-supplied OS file descriptor with
+  libusb_wrap_sys_device() and then runs the usual open path. It is
+  unavailable on Windows, where it returns the new
+  HACKRF_ERROR_UNSUPPORTED.
+
+Also make the option's default match its help text: it is written
+`option(... ANDROID)`, but option() does not dereference that token and
+cmIsOn("ANDROID") is false, so the option reads OFF even when
+cross-compiling for Android. `${ANDROID}` is what was meant.
+
+Two deliberate differences from the original fork patch: a failing
+libusb_wrap_sys_device() reports HACKRF_ERROR_LIBUSB with
+last_libusb_error set (so hackrf_error_name() yields the libusb message)
+rather than a bare HACKRF_ERROR_NOT_FOUND, and hackrf_error_name() gains
+a case for the new error code. The fork's hackrf-tools link fix for
+Android is not carried over: upstream now derives libm via
+check_library_exists() and needs FFTW only for the optional hackrf_sweep
+tool, so it is no longer necessary.
+---
+ host/libhackrf/src/CMakeLists.txt |  2 +-
+ host/libhackrf/src/hackrf.c       | 47 +++++++++++++++++++++++++++++++
+ host/libhackrf/src/hackrf.h       | 20 +++++++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/host/libhackrf/src/CMakeLists.txt b/host/libhackrf/src/CMakeLists.txt
+index f10ce61..dc21548 100644
+--- a/host/libhackrf/src/CMakeLists.txt
++++ b/host/libhackrf/src/CMakeLists.txt
+@@ -32,7 +32,7 @@ option(ENABLE_SHARED_LIB "Build and Install libhackrf.so shared library" ON)
+ option(
+   DISABLE_USB_DEVICE_DISCOVERY
+   "Prevent libusb from trying to enumerate devices. Useful on non-root android"
+-  ANDROID)
++  ${ANDROID})
+ 
+ # For cygwin just force UNIX OFF and WIN32 ON
+ if(${CYGWIN})
+diff --git a/host/libhackrf/src/hackrf.c b/host/libhackrf/src/hackrf.c
+index 3ada04b..10868e6 100644
+--- a/host/libhackrf/src/hackrf.c
++++ b/host/libhackrf/src/hackrf.c
+@@ -506,6 +506,13 @@ int ADDCALL hackrf_init(void)
+ 		return HACKRF_SUCCESS;
+ 	}
+ 
++#ifdef DISABLE_USB_DEVICE_DISCOVERY
++	/* An unprivileged Android app cannot walk the USB bus, so libusb must
++	 * not try; the caller hands us an already-open fd instead, via
++	 * hackrf_open_by_fd(). */
++	libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
++#endif
++
+ 	libusb_error = libusb_init(&g_libusb_context);
+ 	if (libusb_error != 0) {
+ 		last_libusb_error = libusb_error;
+@@ -849,6 +856,43 @@ int ADDCALL hackrf_open_by_serial(
+ 	return hackrf_open_setup(usb_device, device);
+ }
+ 
++int ADDCALL hackrf_open_by_fd(int fd, hackrf_device** device)
++{
++/* libusb_wrap_sys_device() arrived in libusb 1.0.23 and is not implemented
++ * on Windows. */
++#if !defined(_WIN32) && defined(LIBUSB_API_VERSION) && 	(LIBUSB_API_VERSION >= 0x01000107)
++	libusb_device_handle* usb_device;
++	int result;
++
++	if (fd < 0) {
++		return HACKRF_ERROR_INVALID_PARAM;
++	}
++
++	if (device == NULL) {
++		return HACKRF_ERROR_INVALID_PARAM;
++	}
++
++	result = libusb_wrap_sys_device(
++		g_libusb_context,
++		(intptr_t) fd,
++		&usb_device);
++	if (result != 0) {
++		last_libusb_error = result;
++		return HACKRF_ERROR_LIBUSB;
++	}
++
++	if (usb_device == NULL) {
++		return HACKRF_ERROR_NOT_FOUND;
++	}
++
++	return hackrf_open_setup(usb_device, device);
++#else
++	(void) fd;
++	(void) device;
++	return HACKRF_ERROR_UNSUPPORTED;
++#endif
++}
++
+ int ADDCALL hackrf_device_list_open(
+ 	hackrf_device_list_t* list,
+ 	int idx,
+@@ -2467,6 +2511,9 @@ const char* ADDCALL hackrf_error_name(enum hackrf_error errcode)
+ 	case HACKRF_ERROR_NO_MEM:
+ 		return "insufficient memory";
+ 
++	case HACKRF_ERROR_UNSUPPORTED:
++		return "not supported on this platform";
++
+ 	case HACKRF_ERROR_LIBUSB:
+ #if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000103)
+ 		if (last_libusb_error != LIBUSB_SUCCESS)
+diff --git a/host/libhackrf/src/hackrf.h b/host/libhackrf/src/hackrf.h
+index 0247e6c..b7ba000 100644
+--- a/host/libhackrf/src/hackrf.h
++++ b/host/libhackrf/src/hackrf.h
+@@ -578,6 +578,10 @@ enum hackrf_error {
+ 	 * Memory allocation (on host side) failed
+ 	 */
+ 	HACKRF_ERROR_NO_MEM = -11,
++	/**
++	 * The function is not supported on this platform.
++	 */
++	HACKRF_ERROR_UNSUPPORTED = -12,
+ 	/**
+ 	 * LibUSB error, use @ref hackrf_error_name to get a human-readable error string (using `libusb_strerror`)
+ 	 */
+@@ -1249,6 +1253,22 @@ extern ADDAPI int ADDCALL hackrf_open_by_serial(
+ 	const char* const desired_serial_number,
+ 	hackrf_device** device);
+ 
++/**
++ * Open HackRF device from an already-opened USB file descriptor
++ *
++ * Wraps a file descriptor obtained from the operating system (for example one
++ * handed out by Android's UsbManager, where an unprivileged app cannot
++ * enumerate the USB bus itself) instead of opening a device libusb found. The
++ * caller keeps ownership of @p fd and must not close it before
++ * @ref hackrf_close. Not available on Windows or when libhackrf was built
++ * against a libusb older than 1.0.23.
++ * @param[in] fd operating-system file descriptor for the USB device
++ * @param[out] device device handle
++ * @return @ref HACKRF_SUCCESS on success, @ref HACKRF_ERROR_INVALID_PARAM if @p fd is negative or @p device is NULL, @ref HACKRF_ERROR_UNSUPPORTED where libusb_wrap_sys_device() is unavailable, or other @ref hackrf_error variant
++ * @ingroup device
++ */
++extern ADDAPI int ADDCALL hackrf_open_by_fd(int fd, hackrf_device** device);
++
+ /**
+  * Close a previously opened device
+  * @param[in] device device to close
+-- 
+2.51.0.windows.2
+
