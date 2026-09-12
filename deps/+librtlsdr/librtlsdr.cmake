@@ -1,10 +1,22 @@
 #
-# librtlsdr — built from the AlexandreRouma fork (matches the Android kit).
+# librtlsdr — built from osmocom upstream.
+#
+# We used to build the AlexandreRouma fork, because upstream's Android build
+# takes librtlsdr from the android-sdr-kit Docker image, which vendors that
+# fork. Our Android job builds the deps in this tree instead (see
+# .github/workflows/build_android.yml), so nothing ties us to it — and the
+# fork has been stalled since Jan 2024, missing among other things RTL-SDR
+# Blog V4L (R828S) support and the V4/V4L tracking-filter fix in HF
+# upconversion mode, both of which landed upstream in v2.0.3.
+#
+# The two things the fork gave us that upstream lacks — rtlsdr_open_sys_dev()
+# for Android and the BUILD_UTILITIES option used just below — are carried as
+# patches now; see patch_librtlsdr.cmake.
 #
 add_cmake_project(librtlsdr
-    GIT_REPOSITORY https://github.com/AlexandreRouma/rtl-sdr
-    # master @ 2026-05-31; bump when intentional.
-    GIT_TAG        ddd6811b71359c299cf31b4e3e75fbb1ed5c964d
+    GIT_REPOSITORY https://github.com/osmocom/rtl-sdr
+    # v2.0.3 (2026-08-11); bump when intentional.
+    GIT_TAG        797f8143266d983c56d8f35d2d442527529dd8a5
     GIT_SHALLOW    OFF
     PATCH_COMMAND  ${CMAKE_COMMAND}
                        -DSRC=<SOURCE_DIR>

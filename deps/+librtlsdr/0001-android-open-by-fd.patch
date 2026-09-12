@@ -1,0 +1,275 @@
+From be55c49d86841d4115d4735f194c49c48b82bc98 Mon Sep 17 00:00:00 2001
+From: Marcelo Gadotti <eng.marcelogadotti@gmail.com>
+Date: Wed, 9 Sep 2026 14:24:57 -0300
+Subject: [PATCH 1/2] Add Android open-by-fd support (ported from
+ AlexandreRouma/rtl-sdr@40a1598)
+
+Ports the small Android-specific patch (rtlsdr_create_device /
+rtlsdr_init_device / rtlsdr_free_device split, rtlsdr_open_sys_dev,
+libusb NO_DEVICE_DISCOVERY under __ANDROID__) onto current osmocom
+master (v2.0.3), which already carries RTL-SDR Blog V4 and V4L
+tuner-detection support that AlexandreRouma/rtl-sdr (stalled since
+Jan 2024) lacks. Also ports the BUILD_UTILITIES CMake option used by
+android-sdr-kit's build.sh to skip building rtl_test/rtl_fm/etc for
+Android.
+---
+ include/rtl-sdr.h  |  12 ++++
+ src/CMakeLists.txt |   6 ++
+ src/librtlsdr.c    | 161 ++++++++++++++++++++++++++++++---------------
+ 3 files changed, 127 insertions(+), 52 deletions(-)
+
+diff --git a/include/rtl-sdr.h b/include/rtl-sdr.h
+index d64701e..fca23af 100644
+--- a/include/rtl-sdr.h
++++ b/include/rtl-sdr.h
+@@ -62,6 +62,18 @@ RTLSDR_API int rtlsdr_get_index_by_serial(const char *serial);
+ 
+ RTLSDR_API int rtlsdr_open(rtlsdr_dev_t **dev, uint32_t index);
+ 
++/*!
++ * Open a device from an already-opened OS-level USB file descriptor
++ * (e.g. one handed out by Android's UsbManager), bypassing libusb's
++ * own device discovery. Ported from AlexandreRouma/rtl-sdr@40a1598,
++ * needed by SDR++'s Android build (source_modules/rtl_sdr_source).
++ *
++ * \param out_dev the device handle, set on success
++ * \param sys_dev an OS-level file descriptor for the USB device
++ * \return 0 on success, negative on error, -1 on unsupported platform
++ */
++RTLSDR_API int rtlsdr_open_sys_dev(rtlsdr_dev_t **out_dev, intptr_t sys_dev);
++
+ RTLSDR_API int rtlsdr_close(rtlsdr_dev_t *dev);
+ 
+ /* configuration functions */
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 408a270..d74b97f 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -86,6 +86,9 @@ endif()
+ ########################################################################
+ # Build utility
+ ########################################################################
++option(BUILD_UTILITIES "Build utilities for the RTL-SDR such as rtl_tcp, rtl_test, rtl_fm, etc..." ON)
++
++if (BUILD_UTILITIES)
+ add_executable(rtl_sdr rtl_sdr.c)
+ add_executable(rtl_tcp rtl_tcp.c)
+ add_executable(rtl_test rtl_test.c)
+@@ -157,6 +160,7 @@ set_property(TARGET rtl_adsb APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC"
+ set_property(TARGET rtl_power APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
+ set_property(TARGET rtl_biast APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
+ endif()
++endif()
+ ########################################################################
+ # Install built library files & utilities
+ ########################################################################
+@@ -166,6 +170,8 @@ install(TARGETS rtlsdr EXPORT RTLSDR-export
+ install(TARGETS rtlsdr_static EXPORT RTLSDR-export
+   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} # .so/.dylib file
+   )
++if (BUILD_UTILITIES)
+ install(TARGETS rtl_sdr rtl_tcp rtl_test rtl_fm rtl_eeprom rtl_adsb rtl_power rtl_biast
+   DESTINATION ${CMAKE_INSTALL_BINDIR}
+   )
++endif()
+diff --git a/src/librtlsdr.c b/src/librtlsdr.c
+index 55d2ef1..44069b8 100644
+--- a/src/librtlsdr.c
++++ b/src/librtlsdr.c
+@@ -1442,66 +1442,52 @@ int rtlsdr_check_dongle_model(void *dev, char *manufact_check, char *product_che
+ }
+ 
+ 
+-int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
++int rtlsdr_create_device(rtlsdr_dev_t **dev)
+ {
+ 	int r;
+-	int i;
+-	libusb_device **list;
+-	rtlsdr_dev_t *dev = NULL;
+-	libusb_device *device = NULL;
+-	uint32_t device_count = 0;
+-	struct libusb_device_descriptor dd;
+-	uint8_t reg;
+-	ssize_t cnt;
+ 
+-	dev = malloc(sizeof(rtlsdr_dev_t));
+-	if (NULL == dev)
++	*dev = malloc(sizeof(rtlsdr_dev_t));
++	if (NULL == *dev)
+ 		return -ENOMEM;
+ 
+-	memset(dev, 0, sizeof(rtlsdr_dev_t));
+-	memcpy(dev->fir, fir_default, sizeof(fir_default));
++	memset(*dev, 0, sizeof(rtlsdr_dev_t));
++	memcpy((*dev)->fir, fir_default, sizeof(fir_default));
+ 
+-	r = libusb_init(&dev->ctx);
+-	if(r < 0){
+-		free(dev);
++#ifdef __ANDROID__
++	/* Android apps cannot enumerate the USB bus themselves; the fd is
++	 * handed to us already opened via rtlsdr_open_sys_dev() instead. */
++	libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
++#endif
++
++	r = libusb_init(&(*dev)->ctx);
++	if (r < 0) {
++		free(*dev);
++		*dev = NULL;
+ 		return -1;
+ 	}
+ 
+-	dev->dev_lost = 1;
+-
+-	cnt = libusb_get_device_list(dev->ctx, &list);
++	(*dev)->dev_lost = 1;
+ 
+-	for (i = 0; i < cnt; i++) {
+-		device = list[i];
+-
+-		libusb_get_device_descriptor(list[i], &dd);
+-
+-		if (find_known_device(dd.idVendor, dd.idProduct)) {
+-			device_count++;
+-		}
+-
+-		if (index == device_count - 1)
+-			break;
++	return 0;
++}
+ 
+-		device = NULL;
+-	}
++void rtlsdr_free_device(rtlsdr_dev_t *dev)
++{
++	if (dev) {
++		if (dev->devh)
++			libusb_close(dev->devh);
+ 
+-	if (!device) {
+-		r = -1;
+-		goto err;
+-	}
++		if (dev->ctx)
++			libusb_exit(dev->ctx);
+ 
+-	r = libusb_open(device, &dev->devh);
+-	if (r < 0) {
+-		libusb_free_device_list(list, 1);
+-		fprintf(stderr, "usb_open error %d\n", r);
+-		if(r == LIBUSB_ERROR_ACCESS)
+-			fprintf(stderr, "Please fix the device permissions, e.g. "
+-			"by installing the udev rules file rtl-sdr.rules\n");
+-		goto err;
++		free(dev);
+ 	}
++}
+ 
+-	libusb_free_device_list(list, 1);
++int rtlsdr_init_device(rtlsdr_dev_t **out_dev, rtlsdr_dev_t *dev)
++{
++	int r;
++	uint8_t reg;
+ 
+ 	if (libusb_kernel_driver_active(dev->devh, 0) == 1) {
+ 		dev->driver_active = 1;
+@@ -1648,17 +1634,88 @@ found:
+ 
+ 	return 0;
+ err:
+-	if (dev) {
+-		if (dev->devh)
+-			libusb_close(dev->devh);
++	rtlsdr_free_device(dev);
+ 
+-		if (dev->ctx)
+-			libusb_exit(dev->ctx);
++	return r;
++}
+ 
+-		free(dev);
++int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
++{
++	int r;
++	int i;
++	libusb_device **list;
++	rtlsdr_dev_t *dev = NULL;
++	libusb_device *device = NULL;
++	uint32_t device_count = 0;
++	struct libusb_device_descriptor dd;
++	ssize_t cnt;
++
++	r = rtlsdr_create_device(&dev);
++	if (r < 0)
++		return r;
++
++	cnt = libusb_get_device_list(dev->ctx, &list);
++
++	for (i = 0; i < cnt; i++) {
++		device = list[i];
++
++		libusb_get_device_descriptor(list[i], &dd);
++
++		if (find_known_device(dd.idVendor, dd.idProduct)) {
++			device_count++;
++		}
++
++		if (index == device_count - 1)
++			break;
++
++		device = NULL;
+ 	}
+ 
+-	return r;
++	if (!device) {
++		rtlsdr_free_device(dev);
++		return -1;
++	}
++
++	r = libusb_open(device, &dev->devh);
++	if (r < 0) {
++		libusb_free_device_list(list, 1);
++		fprintf(stderr, "usb_open error %d\n", r);
++		if (r == LIBUSB_ERROR_ACCESS)
++			fprintf(stderr, "Please fix the device permissions, e.g. "
++			"by installing the udev rules file rtl-sdr.rules\n");
++		rtlsdr_free_device(dev);
++		return r;
++	}
++
++	libusb_free_device_list(list, 1);
++
++	return rtlsdr_init_device(out_dev, dev);
++}
++
++int rtlsdr_open_sys_dev(rtlsdr_dev_t **out_dev, intptr_t sys_dev)
++{
++#if !defined(_WIN32) && LIBUSB_API_VERSION >= 0x01000107
++	int r;
++	rtlsdr_dev_t *dev = NULL;
++
++	r = rtlsdr_create_device(&dev);
++	if (r < 0)
++		return r;
++
++	r = libusb_wrap_sys_device(dev->ctx, sys_dev, &dev->devh);
++	if (r < 0) {
++		fprintf(stderr, "usb_open error %d\n", r);
++		if (r == LIBUSB_ERROR_ACCESS)
++			fprintf(stderr, "Please fix the device permissions, e.g. "
++			"by installing the udev rules file rtl-sdr.rules\n");
++		rtlsdr_free_device(dev);
++		return r;
++	}
++
++	return rtlsdr_init_device(out_dev, dev);
++#else
++	return -1;
++#endif
+ }
+ 
+ int rtlsdr_close(rtlsdr_dev_t *dev)
+-- 
+2.51.0.windows.2
+

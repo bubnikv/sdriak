@@ -1,8 +1,8 @@
-From d711b40a4afd69d361391f19dec78afbd7ef4df8 Mon Sep 17 00:00:00 2001
+From 8d173d754f32c23c6970e92c157179421dc57cd1 Mon Sep 17 00:00:00 2001
 From: Vojtech Bubnik <bubnikv@gmail.com>
-Date: Mon, 13 Jul 2026 05:05:42 +0200
-Subject: [PATCH] Fix use-after-free when async teardown exits with un-reaped
- transfers
+Date: Sat, 12 Sep 2026 07:59:38 +0200
+Subject: [PATCH 2/2] Fix use-after-free when async teardown exits with
+ un-reaped transfers
 
 rtlsdr_read_async()'s cancellation loop normally keeps pumping events
 until every transfer's status reads LIBUSB_TRANSFER_CANCELLED, which
@@ -51,7 +51,7 @@ Changes:
  1 file changed, 84 insertions(+), 2 deletions(-)
 
 diff --git a/src/librtlsdr.c b/src/librtlsdr.c
-index a2efe48..b9673f7 100644
+index 44069b8..e0fc098 100644
 --- a/src/librtlsdr.c
 +++ b/src/librtlsdr.c
 @@ -117,6 +117,16 @@ struct rtlsdr_dev {
@@ -71,7 +71,7 @@ index a2efe48..b9673f7 100644
  	int driver_active;
  	unsigned int xfer_errors;
  	char manufact[256];
-@@ -1726,6 +1736,19 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
+@@ -1736,6 +1746,19 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
  		rtlsdr_deinit_baseband(dev);
  	}
  
@@ -91,7 +91,7 @@ index a2efe48..b9673f7 100644
  	libusb_release_interface(dev->devh, 0);
  
  #ifdef DETACH_KERNEL_DRIVER
-@@ -1769,11 +1792,16 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+@@ -1779,11 +1802,16 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
  {
  	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
  
@@ -109,7 +109,7 @@ index a2efe48..b9673f7 100644
  		dev->xfer_errors = 0;
  	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
  #ifndef _WIN32
-@@ -1883,6 +1911,26 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
+@@ -1892,6 +1920,26 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
  	if (!dev)
  		return -1;
  
@@ -136,7 +136,7 @@ index a2efe48..b9673f7 100644
  	if (dev->xfer) {
  		for(i = 0; i < dev->xfer_buf_num; ++i) {
  			if (dev->xfer[i]) {
-@@ -1931,8 +1979,14 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+@@ -1940,8 +1988,14 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
  	if (RTLSDR_INACTIVE != dev->async_status)
  		return -2;
  
@@ -151,7 +151,7 @@ index a2efe48..b9673f7 100644
  
  	dev->cb = cb;
  	dev->cb_ctx = ctx;
-@@ -1970,6 +2024,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+@@ -1979,6 +2033,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
  			dev->async_status = RTLSDR_CANCELING;
  			break;
  		}
@@ -159,7 +159,7 @@ index a2efe48..b9673f7 100644
  	}
  
  	while (RTLSDR_INACTIVE != dev->async_status) {
-@@ -2021,9 +2076,36 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+@@ -2035,9 +2090,36 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
  		}
  	}
  
@@ -195,8 +195,8 @@ index a2efe48..b9673f7 100644
 +	(void)next_status;
 +	dev->async_status = RTLSDR_INACTIVE;
  
- 	return r;
- }
+ 	if (dev->dev_lost)
+ 		return -1;
 -- 
 2.51.0.windows.2
 
