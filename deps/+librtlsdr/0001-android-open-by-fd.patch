@@ -15,8 +15,8 @@ Android.
 ---
  include/rtl-sdr.h  |  12 ++++
  src/CMakeLists.txt |   6 ++
- src/librtlsdr.c    | 161 ++++++++++++++++++++++++++++++---------------
- 3 files changed, 127 insertions(+), 52 deletions(-)
+ src/librtlsdr.c    | 164 ++++++++++++++++++++++++++++++++++++-----------------
+ 3 files changed, 129 insertions(+), 53 deletions(-)
 
 diff --git a/include/rtl-sdr.h b/include/rtl-sdr.h
 index d64701e..fca23af 100644
@@ -73,10 +73,10 @@ index 408a270..d74b97f 100644
    )
 +endif()
 diff --git a/src/librtlsdr.c b/src/librtlsdr.c
-index 55d2ef1..44069b8 100644
+index 55d2ef1..9e0ee5f 100644
 --- a/src/librtlsdr.c
 +++ b/src/librtlsdr.c
-@@ -1442,66 +1442,52 @@ int rtlsdr_check_dongle_model(void *dev, char *manufact_check, char *product_che
+@@ -1442,72 +1442,59 @@ int rtlsdr_check_dongle_model(void *dev, char *manufact_check, char *product_che
  }
  
  
@@ -174,7 +174,15 @@ index 55d2ef1..44069b8 100644
  
  	if (libusb_kernel_driver_active(dev->devh, 0) == 1) {
  		dev->driver_active = 1;
-@@ -1648,17 +1634,88 @@ found:
+ 
+ #ifdef DETACH_KERNEL_DRIVER
+-		if (!libusb_detach_kernel_driver(dev->devh, 0)) {
++		r = libusb_detach_kernel_driver(dev->devh, 0);
++		if (!r) {
+ 			fprintf(stderr, "Detached kernel driver\n");
+ 		} else {
+ 			fprintf(stderr, "Detaching kernel driver failed!");
+@@ -1648,17 +1635,88 @@ found:
  
  	return 0;
  err:
@@ -272,4 +280,3 @@ index 55d2ef1..44069b8 100644
  int rtlsdr_close(rtlsdr_dev_t *dev)
 -- 
 2.51.0.windows.2
-

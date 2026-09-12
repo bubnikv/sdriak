@@ -26,8 +26,12 @@ Changes:
   decremented exactly once per completion callback. All submission,
   event handling and cancellation run on the rtlsdr_read_async()
   caller thread, so no locking is needed.
-- After the cancellation loop, drain with a 500 ms deadline (50 slices
-  of 10 ms) until xfer_live reaches zero, stopping early on an
+- Deliver samples and resubmit completed transfers only while the async
+  state is RTLSDR_RUNNING. This also catches cancellation requested by
+  the sample callback itself.
+- Before draining, force the state to RTLSDR_CANCELING and cancel every
+  allocated transfer. Then drain with a 500 ms deadline (50 slices of
+  10 ms) until xfer_live reaches zero, stopping early on an
   unrecoverable event-handling error.
 - If transfers still cannot be reaped, latch xfer_stuck:
   _rtlsdr_free_async_buffers() leaks the transfers and buffers instead
@@ -47,11 +51,11 @@ Changes:
   indefinitely in its wait loop and rtlsdr_read_async() permanently
   return -2.
 ---
- src/librtlsdr.c | 86 +++++++++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 84 insertions(+), 2 deletions(-)
+ src/librtlsdr.c | 102 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 99 insertions(+), 3 deletions(-)
 
 diff --git a/src/librtlsdr.c b/src/librtlsdr.c
-index 44069b8..e0fc098 100644
+index 9e0ee5f..ee82198 100644
 --- a/src/librtlsdr.c
 +++ b/src/librtlsdr.c
 @@ -117,6 +117,16 @@ struct rtlsdr_dev {
@@ -71,7 +75,7 @@ index 44069b8..e0fc098 100644
  	int driver_active;
  	unsigned int xfer_errors;
  	char manufact[256];
-@@ -1736,6 +1746,19 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
+@@ -1737,6 +1747,19 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
  		rtlsdr_deinit_baseband(dev);
  	}
  
@@ -91,7 +95,7 @@ index 44069b8..e0fc098 100644
  	libusb_release_interface(dev->devh, 0);
  
  #ifdef DETACH_KERNEL_DRIVER
-@@ -1779,11 +1802,16 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+@@ -1780,11 +1803,19 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
  {
  	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
  
@@ -100,16 +104,20 @@ index 44069b8..e0fc098 100644
 +	dev->xfer_live--;
 +
  	if (LIBUSB_TRANSFER_COMPLETED == xfer->status) {
- 		if (dev->cb)
+-		if (dev->cb)
++		if (RTLSDR_RUNNING == dev->async_status && dev->cb)
  			dev->cb(xfer->buffer, xfer->actual_length, dev->cb_ctx);
  
 -		libusb_submit_transfer(xfer); /* resubmit transfer */
-+		if (libusb_submit_transfer(xfer) == 0) /* resubmit transfer */
++		/* The callback may have requested cancellation. Do not resubmit once
++		 * teardown has started. */
++		if (RTLSDR_RUNNING == dev->async_status &&
++		    libusb_submit_transfer(xfer) == 0)
 +			dev->xfer_live++;
  		dev->xfer_errors = 0;
  	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
  #ifndef _WIN32
-@@ -1892,6 +1920,26 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
+@@ -1893,6 +1924,26 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
  	if (!dev)
  		return -1;
  
@@ -136,7 +144,7 @@ index 44069b8..e0fc098 100644
  	if (dev->xfer) {
  		for(i = 0; i < dev->xfer_buf_num; ++i) {
  			if (dev->xfer[i]) {
-@@ -1940,8 +1988,14 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+@@ -1941,8 +1992,14 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
  	if (RTLSDR_INACTIVE != dev->async_status)
  		return -2;
  
@@ -151,7 +159,7 @@ index 44069b8..e0fc098 100644
  
  	dev->cb = cb;
  	dev->cb_ctx = ctx;
-@@ -1979,6 +2033,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+@@ -1980,6 +2037,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
  			dev->async_status = RTLSDR_CANCELING;
  			break;
  		}
@@ -159,14 +167,15 @@ index 44069b8..e0fc098 100644
  	}
  
  	while (RTLSDR_INACTIVE != dev->async_status) {
-@@ -2035,9 +2090,36 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+@@ -2036,9 +2094,47 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
  		}
  	}
  
 +	/* The loop above can exit with transfers still owned by the kernel:
 +	 * on a libusb_handle_events() error, or through the dev_lost path
-+	 * which only performs a single zero-timeout event pass. Drain with a
-+	 * 500 ms deadline; if transfers still cannot be reaped (e.g. the fd
++	 * which only performs a single zero-timeout event pass. Gate callback
++	 * resubmission, make one final cancellation sweep, then drain with a
++	 * 500 ms deadline. If transfers still cannot be reaped (e.g. the fd
 +	 * was closed under libusb and the DISCARDURB ioctls failed), latch
 +	 * xfer_stuck so the transfers and buffers are leaked instead of being
 +	 * freed while libusb's flying-transfers list still references them
@@ -176,6 +185,16 @@ index 44069b8..e0fc098 100644
 +		int drain_slice;
 +		int rc;
 +		struct timeval draintv = { 0, 10000 };
++
++		if (dev->xfer_live > 0) {
++			dev->async_status = RTLSDR_CANCELING;
++			if (dev->xfer) {
++				for (i = 0; i < dev->xfer_buf_num; i++) {
++					if (dev->xfer[i])
++						(void)libusb_cancel_transfer(dev->xfer[i]);
++				}
++			}
++		}
 +
 +		for (drain_slice = 0; drain_slice < 50 && dev->xfer_live > 0; drain_slice++) {
 +			rc = libusb_handle_events_timeout_completed(dev->ctx, &draintv, NULL);
@@ -199,4 +218,3 @@ index 44069b8..e0fc098 100644
  		return -1;
 -- 
 2.51.0.windows.2
-
