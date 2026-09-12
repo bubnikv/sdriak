@@ -28,7 +28,7 @@ index dc21548e..7e0c9ef9 100644
      target_link_libraries(${libtarget} PRIVATE Threads::Threads)
    endif()
 diff --git a/host/libhackrf/src/hackrf.c b/host/libhackrf/src/hackrf.c
-index 10868e6f..d9aee06c 100644
+index d39e3434..9b20fea3 100644
 --- a/host/libhackrf/src/hackrf.c
 +++ b/host/libhackrf/src/hackrf.c
 @@ -24,6 +24,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
@@ -196,7 +196,7 @@ index 10868e6f..d9aee06c 100644
 @@ -507,13 +546,23 @@ int ADDCALL hackrf_init(void)
  	}
  
- #ifdef DISABLE_USB_DEVICE_DISCOVERY
+ #if defined(DISABLE_USB_DEVICE_DISCOVERY) || defined(__ANDROID__)
 -	/* An unprivileged Android app cannot walk the USB bus, so libusb must
 -	 * not try; the caller hands us an already-open fd instead, via
 -	 * hackrf_open_by_fd(). */

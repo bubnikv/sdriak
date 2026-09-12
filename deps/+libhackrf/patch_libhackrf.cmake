@@ -12,9 +12,10 @@
 # reads the macro it defines and there is no fd-taking entry point, so the
 # option is currently inert. The patch adds hackrf_open_by_fd() (what
 # source_modules/hackrf_source calls under __ANDROID__), makes hackrf_init()
-# honour the macro, and fixes the option's default, which is written
-# `option(... ANDROID)` and therefore never actually turns on. Originally from
-# AlexandreRouma/hackrf@b1275e9c, rebased onto v2026.01.3.
+# disable enumeration when either the option or __ANDROID__ says it must, and
+# fixes the option's default, which is written `option(... ANDROID)` and
+# therefore never actually turns on. Originally from AlexandreRouma/hackrf at
+# b1275e9c, rebased onto v2026.01.3.
 #
 # The follow-up patch makes teardown bounded and preserves objects whose
 # transfers libusb has not returned, validates enumeration and open failures,

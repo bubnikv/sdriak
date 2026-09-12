@@ -12,9 +12,9 @@ option currently does nothing. Add the two missing pieces, ported from
 AlexandreRouma/hackrf@b1275e9c (which carried them against 2022's
 libhackrf) and rebased onto v2026.01.3:
 
-- hackrf_init() honours DISABLE_USB_DEVICE_DISCOVERY by setting
-  LIBUSB_OPTION_NO_DEVICE_DISCOVERY before libusb_init(), so libusb does
-  not attempt the enumeration it cannot perform there.
+- hackrf_init() enables LIBUSB_OPTION_NO_DEVICE_DISCOVERY whenever the
+  build requests it or the compiler targets Android, so a missed build
+  option cannot make libusb enumerate an inaccessible USB bus there.
 - hackrf_open_by_fd() wraps a caller-supplied OS file descriptor with
   libusb_wrap_sys_device() and then runs the usual open path. It is
   unavailable on Windows, where it returns the new
@@ -53,14 +53,14 @@ index f10ce61..dc21548 100644
  # For cygwin just force UNIX OFF and WIN32 ON
  if(${CYGWIN})
 diff --git a/host/libhackrf/src/hackrf.c b/host/libhackrf/src/hackrf.c
-index 3ada04b..10868e6 100644
+index 3ada04b..d39e343 100644
 --- a/host/libhackrf/src/hackrf.c
 +++ b/host/libhackrf/src/hackrf.c
 @@ -506,6 +506,13 @@ int ADDCALL hackrf_init(void)
  		return HACKRF_SUCCESS;
  	}
  
-+#ifdef DISABLE_USB_DEVICE_DISCOVERY
++#if defined(DISABLE_USB_DEVICE_DISCOVERY) || defined(__ANDROID__)
 +	/* An unprivileged Android app cannot walk the USB bus, so libusb must
 +	 * not try; the caller hands us an already-open fd instead, via
 +	 * hackrf_open_by_fd(). */
@@ -164,4 +164,3 @@ index 0247e6c..b7ba000 100644
   * @param[in] device device to close
 -- 
 2.51.0.windows.2
-
