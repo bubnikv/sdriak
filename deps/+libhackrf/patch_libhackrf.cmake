@@ -17,11 +17,11 @@
 # therefore never actually turns on. Originally from AlexandreRouma/hackrf at
 # b1275e9c, rebased onto v2026.01.3.
 #
-# The follow-up patch makes teardown bounded and preserves objects whose
-# transfers libusb has not returned, validates enumeration and open failures,
-# uses libusb's no-discovery initialization on current Android libusb, and
-# accepts the pthreads target name exported by this repository's dependency
-# build.
+# The follow-up patch makes teardown bounded, removes the obsolete completion
+# condition variable, and preserves objects whose transfers libusb has not
+# returned. It also validates enumeration, allocation, and open failures, uses
+# libusb's no-discovery initialization on current Android libusb, and accepts
+# the pthreads target name exported by this repository's dependency build.
 #
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/patch_helpers.cmake)
 

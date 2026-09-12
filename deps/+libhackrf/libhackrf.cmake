@@ -1,6 +1,7 @@
 #
-# libhackrf — built from greatscottgadgets upstream. The CMake project lives
-# in host/.
+# libhackrf — built from greatscottgadgets upstream. Configure the standalone
+# library project so the dependency prefix does not acquire the hackrf_* tools
+# or their FFTW discovery/build requirements.
 #
 # We used to build the AlexandreRouma fork, because upstream's Android build
 # takes libhackrf from the android-sdr-kit Docker image, which vendors that
@@ -27,24 +28,16 @@ add_cmake_project(libhackrf
     # v2026.01.3 (2026-01-27); bump when intentional.
     GIT_TAG        1cfe7dfe98d333450217d50e3f3a1ad0702e000f
     GIT_SHALLOW    OFF
-    SOURCE_SUBDIR  host
+    SOURCE_SUBDIR  host/libhackrf
     PATCH_COMMAND  ${CMAKE_COMMAND}
                        -DSRC=<SOURCE_DIR>
                        -P ${CMAKE_CURRENT_LIST_DIR}/patch_libhackrf.cmake
     CMAKE_ARGS
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-        -DENABLE_HACKRF_SWEEP=OFF
+        -DINSTALL_UDEV_RULES=OFF
         ${_libhackrf_android_args}
 )
 
-# hackrf_sweep is the only part of the hackrf host tree that needs FFTW, and we
-# build it with -DENABLE_HACKRF_SWEEP=OFF: we ship none of the hackrf_* command
-# line tools, and leaving it on made the build differ per platform — upstream's
-# FindFFTW3f.cmake locates our fftw3 through CMAKE_PREFIX_PATH on desktop but
-# not under the Android NDK, whose CMAKE_FIND_ROOT_PATH_MODE_*=ONLY hides the
-# deps prefix from a plain find_library(). Restore fftw3 below if the option is
-# ever turned back on. (The FFTW_* pre-feed in deps/CMakeLists.txt does not help
-# here: upstream's module reads FFTW3f_*.)
 set(DEP_libhackrf_DEPENDS libusb)
 if (WIN32)
     list(APPEND DEP_libhackrf_DEPENDS pthreads)

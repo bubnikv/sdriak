@@ -138,6 +138,11 @@ public:
     }
 
     void refresh() {
+        if (!initialized) {
+            flog::error("Tried to refresh HackRF devices before the library was initialized");
+            return;
+        }
+
         devList.clear();
         devListTxt = "";
 
@@ -267,6 +272,19 @@ private:
         return bandwidths[id];
     }
 
+    bool settingApplied(const char* setting, int result, bool warning = false) {
+        hackrf_error err = (hackrf_error)result;
+        if (err == HACKRF_SUCCESS) { return true; }
+
+        if (warning) {
+            flog::warn("Could not set HackRF {0} {1}: {2}", selectedSerial, setting, hackrf_error_name(err));
+        }
+        else {
+            flog::error("Could not set HackRF {0} {1}: {2}", selectedSerial, setting, hackrf_error_name(err));
+        }
+        return false;
+    }
+
     static void start(void* ctx) {
         HackRFSourceModule* _this = (HackRFSourceModule*)ctx;
         if (_this->running) { return; }
@@ -299,26 +317,39 @@ private:
             return;
         }
 
-        hackrf_set_sample_rate(_this->openDev, _this->sampleRate);
-        hackrf_set_baseband_filter_bandwidth(_this->openDev, _this->bandwidthIdToBw(_this->bwId));
-        hackrf_set_freq(_this->openDev, _this->freq);
-
-        hackrf_set_antenna_enable(_this->openDev, _this->biasT);
-        hackrf_set_amp_enable(_this->openDev, _this->amp);
-        hackrf_set_lna_gain(_this->openDev, _this->lna);
-        hackrf_set_vga_gain(_this->openDev, _this->vga);
-
-        err = (hackrf_error)hackrf_start_rx(_this->openDev, callback, _this);
-        if (err != HACKRF_SUCCESS) {
-            flog::error("Could not start HackRF {0}: {1}", _this->selectedSerial, hackrf_error_name(err));
+        auto closeAfterStartFailure = [&]() {
             hackrf_error closeErr = (hackrf_error)hackrf_close(_this->openDev);
             _this->openDev = NULL;
             if (closeErr != HACKRF_SUCCESS) {
-                flog::error("Could not close HackRF {0} after start failure: {1}", _this->selectedSerial, hackrf_error_name(closeErr));
+                flog::error("Could not close HackRF {0} after source start failure: {1}", _this->selectedSerial, hackrf_error_name(closeErr));
             }
 #ifdef __ANDROID__
             _this->androidUsbHandle.reset();
 #endif
+        };
+
+        if (!_this->settingApplied("sample rate", hackrf_set_sample_rate(_this->openDev, _this->sampleRate))) {
+            closeAfterStartFailure();
+            return;
+        }
+        if (!_this->settingApplied("baseband filter bandwidth", hackrf_set_baseband_filter_bandwidth(_this->openDev, _this->bandwidthIdToBw(_this->bwId)))) {
+            closeAfterStartFailure();
+            return;
+        }
+        if (!_this->settingApplied("frequency", hackrf_set_freq(_this->openDev, _this->freq))) {
+            closeAfterStartFailure();
+            return;
+        }
+
+        _this->settingApplied("antenna power", hackrf_set_antenna_enable(_this->openDev, _this->biasT), true);
+        _this->settingApplied("RF amplifier", hackrf_set_amp_enable(_this->openDev, _this->amp), true);
+        _this->settingApplied("LNA gain", hackrf_set_lna_gain(_this->openDev, _this->lna), true);
+        _this->settingApplied("VGA gain", hackrf_set_vga_gain(_this->openDev, _this->vga), true);
+
+        err = (hackrf_error)hackrf_start_rx(_this->openDev, callback, _this);
+        if (err != HACKRF_SUCCESS) {
+            flog::error("Could not start HackRF {0}: {1}", _this->selectedSerial, hackrf_error_name(err));
+            closeAfterStartFailure();
             return;
         }
 
@@ -347,7 +378,7 @@ private:
     static void tune(double freq, void* ctx) {
         HackRFSourceModule* _this = (HackRFSourceModule*)ctx;
         if (_this->running) {
-            hackrf_set_freq(_this->openDev, freq);
+            _this->settingApplied("frequency", hackrf_set_freq(_this->openDev, freq));
         }
         _this->freq = freq;
         flog::info("HackRFSourceModule '{0}': Tune: {1}!", _this->name, freq);
@@ -393,7 +424,7 @@ private:
         SmGui::FillWidth();
         if (SmGui::Combo(CONCAT("##_hackrf_bw_sel_", _this->name), &_this->bwId, bandwidthsTxt)) {
             if (_this->running) {
-                hackrf_set_baseband_filter_bandwidth(_this->openDev, _this->bandwidthIdToBw(_this->bwId));
+                _this->settingApplied("baseband filter bandwidth", hackrf_set_baseband_filter_bandwidth(_this->openDev, _this->bandwidthIdToBw(_this->bwId)), true);
             }
             config.edit().section("devices", _this->selectedSerial).set("bandwidth", _this->bwId);
         }
@@ -402,7 +433,7 @@ private:
         SmGui::FillWidth();
         if (SmGui::SliderFloatWithSteps(CONCAT("##_hackrf_lna_", _this->name), &_this->lna, 0, 40, 8, SmGui::FMT_STR_FLOAT_DB_NO_DECIMAL)) {
             if (_this->running) {
-                hackrf_set_lna_gain(_this->openDev, _this->lna);
+                _this->settingApplied("LNA gain", hackrf_set_lna_gain(_this->openDev, _this->lna), true);
             }
             config.edit().section("devices", _this->selectedSerial).set("lnaGain", (int)_this->lna);
         }
@@ -411,21 +442,21 @@ private:
         SmGui::FillWidth();
         if (SmGui::SliderFloatWithSteps(CONCAT("##_hackrf_vga_", _this->name), &_this->vga, 0, 62, 2, SmGui::FMT_STR_FLOAT_DB_NO_DECIMAL)) {
             if (_this->running) {
-                hackrf_set_vga_gain(_this->openDev, _this->vga);
+                _this->settingApplied("VGA gain", hackrf_set_vga_gain(_this->openDev, _this->vga), true);
             }
             config.edit().section("devices", _this->selectedSerial).set("vgaGain", (int)_this->vga);
         }
 
         if (SmGui::Checkbox(CONCAT("Bias-T##_hackrf_bt_", _this->name), &_this->biasT)) {
             if (_this->running) {
-                hackrf_set_antenna_enable(_this->openDev, _this->biasT);
+                _this->settingApplied("antenna power", hackrf_set_antenna_enable(_this->openDev, _this->biasT), true);
             }
             config.edit().section("devices", _this->selectedSerial).set("biasT", _this->biasT);
         }
 
         if (SmGui::Checkbox(CONCAT("Amp Enabled##_hackrf_amp_", _this->name), &_this->amp)) {
             if (_this->running) {
-                hackrf_set_amp_enable(_this->openDev, _this->amp);
+                _this->settingApplied("RF amplifier", hackrf_set_amp_enable(_this->openDev, _this->amp), true);
             }
             config.edit().section("devices", _this->selectedSerial).set("amp", _this->amp);
         }
