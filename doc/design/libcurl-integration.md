@@ -14,7 +14,7 @@ Per-platform TLS backend table:
     Platform   libcurl source             TLS backend         Cert store
     --------   -------------------------  ------------------  ----------------------------
     Windows    bundled (deps/+libcurl)    Schannel            Windows Cert Store
-    macOS      bundled                    Secure Transport    Keychain
+    macOS      bundled (+mbedtls dep)     MbedTLS             /etc/ssl/cert.pem (built in)
     Linux      system OR bundled          OpenSSL             /etc/ssl/certs
     Android    bundled (+mbedtls dep)     MbedTLS             /system/etc/security/cacerts
 
@@ -30,8 +30,23 @@ System libcurl must be ≥ 8.5 with WebSocket support compiled in
 linking and configure fails cleanly otherwise.
 
 No CA bundle is ever shipped. On Android, curl_init.cpp sets CURLOPT_CAPATH to
-the OS trust store via curl::make_easy(); core networking wrappers use that
-handle factory so plugins never have to touch libcurl directly.
+the OS trust store via curl::make_easy(). macOS needs a store named too, since
+the MbedTLS backend that replaced Secure Transport (removed upstream in curl
+8.15.0) has none of its own, but it is compiled into the bundled build
+(CURL_CA_BUNDLE=/etc/ssl/cert.pem) rather than forced at runtime: a macOS build
+that resolves libcurl to the system copy must keep whatever store that curl was
+built against. /etc/ssl/cert.pem is a static bundle rather than the Keychain, so
+CAs a user installs into the Keychain are not honoured by the bundled build —
+switching macOS to OpenSSL + USE_APPLE_SECTRUST is the way back to native trust
+if that ever matters. Core networking wrappers use the handle factory so plugins
+never have to touch libcurl directly.
+
+The bundled recipe tracks current upstream curl (see deps/+libcurl/libcurl.cmake
+for the pin). It must never be pinned to 8.11.1, the single release carrying
+CVE-2025-0665: its threaded resolver double-closes the eventfd it uses to signal
+resolve completion, so on 64-bit targets every DNS lookup frees an fd number
+another thread may already own. Android's fdsan turns that into a process
+abort.
 
 curl_global_init/cleanup are called from sdrpp_main() in core. Plugins must
 not call them.

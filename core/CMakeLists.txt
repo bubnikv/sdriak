@@ -124,7 +124,7 @@ sdrpp_link_dep(sdrpp_core libcurl PRIVATE
     TARGETS      CURL::libcurl)
 
 # WebSocket support is mandatory. The bundled recipe always forces
-# ENABLE_WEBSOCKETS=ON; distro libcurl may have been packaged without
+# CURL_DISABLE_WEBSOCKETS=OFF; distro libcurl may have been packaged without
 # it (Ubuntu 20.04 / 22.04 jammy ship 7.68 / 7.81, no WS API in the
 # header at all), so probe explicitly when the imported target is in
 # module form.

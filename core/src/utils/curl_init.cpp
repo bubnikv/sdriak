@@ -43,7 +43,12 @@ CURL* make_easy() {
 
 #ifdef __ANDROID__
     // Android ships PEM-encoded CA certs in this directory; libcurl's MbedTLS
-    // backend has no other way to find them.
+    // backend has no other way to find them, and there is no system libcurl to
+    // fall back to, so overriding unconditionally is safe here. macOS also
+    // needs a trust store pointed out since its MbedTLS switch, but gets it
+    // compiled into the bundled build (CURL_CA_BUNDLE in
+    // deps/+libcurl/libcurl.cmake) so that a build resolving libcurl to the
+    // system copy keeps that curl's own store.
     curl_easy_setopt(h, CURLOPT_CAPATH, "/system/etc/security/cacerts");
 #endif
 
