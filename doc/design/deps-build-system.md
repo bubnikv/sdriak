@@ -364,38 +364,47 @@ that targets the deps prefix silently returns `-NOTFOUND`. Downstream symptoms:
   re-configures a tiny sub-project under the same toolchain) hits the same
   filtering and falsely reports the install as broken.
 
-The fix is to add `NO_CMAKE_FIND_ROOT_PATH` to every find command that points
-at the deps prefix. This is a per-call opt-out from the root-path restriction
-and is a no-op on native toolchains where `CMAKE_FIND_ROOT_PATH` isn't set, so
-it's safe to apply unconditionally rather than gating on `if (ANDROID)`.
+The fix for direct lookups is to add `NO_CMAKE_FIND_ROOT_PATH` to every find
+command that points at the deps prefix. This is a per-call opt-out from the
+root-path restriction and is a no-op on native toolchains where
+`CMAKE_FIND_ROOT_PATH` isn't set, so it's safe to apply unconditionally rather
+than gating on `if (ANDROID)`.
 
-Three places own the find calls and must all apply the flag consistently:
+The direct and transitive lookup sites below must handle the restriction
+consistently:
 
 | Location                                                              | Lookups covered                                                                          |
 | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `cmake/sdrpp_find_dep.cmake` (consumer side, `sdrpp_link_dep`)        | the strict step-1 `find_package(<pkg> CONFIG PATHS deps_prefix NO_DEFAULT_PATH)`         |
 | `deps/cmake/ValidateDepStep.cmake` (validator probe)                  | the probe sub-project's `find_package(<pkg> CONFIG PATHS deps_prefix NO_DEFAULT_PATH)`   |
+| consumer and validator lookups above (Android only)                  | transitive `find_dependency` / `find_library` / `find_path` calls made by an upstream Config; prepend the deps prefix to the local `CMAKE_FIND_ROOT_PATH` before loading it |
 | `deps/cmake/AddCMakeProject.cmake` (`sdrpp_emit_imported_config`)     | `find_package` for each `PACKAGE_DEPENDENCIES` entry, plus `find_library` / `find_path` / `find_file` that populate the imported target |
 | `deps/+librtlsdr/fix_librtlsdr_config.cmake` (custom Config rewriter) | every find call inside the hand-written rtlsdr Config (`find_package(libusb …)`, two `find_library`, two `find_path`, one Windows `find_file`) |
 
 Any new dep that ships its own custom Config rewriter (rather than going
 through `sdrpp_emit_imported_config`) must apply the same pattern.
 
-**Boundary:** this only applies to our own explicit lookups into the deps
-prefix. Upstream-provided Configs (e.g. curl's own `CURLConfig.cmake`) bake
-in their target paths at install time and do not call `find_library` /
-`find_path` at consume time, so they are unaffected and need no change. The
-NDK toolchain's restriction is correct for them — they should resolve through
-their own provenance, not through cross-root probes.
+**Boundary:** direct lookups that we own use `NO_CMAKE_FIND_ROOT_PATH`. Many
+upstream-provided Configs bake in their target paths, but that is not a safe
+assumption: curl 8.22's `CURLConfig.cmake`, for example, calls
+`find_dependency(MbedTLS MODULE)`, and that module performs its own
+`find_library` / `find_path` calls. Transitive calls do not inherit
+`NO_CMAKE_FIND_ROOT_PATH` from the outer `find_package(CURL)`. On Android,
+`sdrpp_link_dep` and the validator therefore prepend the explicit deps prefix
+to a normal, locally scoped `CMAKE_FIND_ROOT_PATH` variable immediately before
+loading the Config. This permits only that Config's dependency closure to find
+the same bundled prefix.
 
-**Why not centralize via `CMAKE_FIND_ROOT_PATH` extension?** An earlier
-attempt appended the deps prefix to `CMAKE_FIND_ROOT_PATH` in
-`deps/autobuild.cmake` so the toolchain restriction would naturally permit
-it. That didn't work in practice: the Android Gradle Plugin re-passes
-`CMAKE_FIND_ROOT_PATH` on every reconfigure with its prefab value, which
-overrides our append. Opting out per-call via `NO_CMAKE_FIND_ROOT_PATH`
-avoids the override problem entirely and keeps the toolchain's intended
-behavior for everything we don't explicitly point at.
+**Why not centralize via a cached `CMAKE_FIND_ROOT_PATH` extension?** An
+earlier attempt appended the deps prefix in `deps/autobuild.cmake`. That did
+not survive because the Android Gradle Plugin re-passes
+`CMAKE_FIND_ROOT_PATH` with its prefab value on every reconfigure, overriding
+the cached append. The current extension is deliberately different: it is a
+normal variable set at the point of use, inside the `sdrpp_link_dep` function
+or validator probe. AGP never sees or overwrites it, and its scope ends with
+the lookup. Direct calls still opt out per-call with
+`NO_CMAKE_FIND_ROOT_PATH`, preserving the toolchain's intended behavior for
+unrelated searches.
 
 ### 7.5 `cmake/sdrpp_find_dep.cmake`
 

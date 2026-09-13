@@ -37,8 +37,9 @@ apt_install_with_refresh() {
     return 1
 }
 
-# Install dependencies and tools
-apt_install_with_refresh build-essential cmake git pkg-config libfftw3-dev libglfw3-dev ${VOLK_PACKAGE} liborc-0.4-dev libzstd-dev ${CURL_APT} libairspy-dev libairspyhf-dev \
+# Install dependencies and tools. ca-certificates must exist before bundled
+# curl configures: MbedTLS supplies no trust store and curl bakes in the path.
+apt_install_with_refresh build-essential cmake git pkg-config ca-certificates libfftw3-dev libglfw3-dev ${VOLK_PACKAGE} liborc-0.4-dev libzstd-dev ${CURL_APT} libairspy-dev libairspyhf-dev \
     libiio-dev libad9361-dev librtaudio-dev libhackrf-dev librtlsdr-dev libbladerf-dev liblimesuite-dev p7zip-full wget portaudio19-dev \
     libcodec2-dev libflac-dev libopus-dev libogg-dev autoconf libtool xxd libspdlog-dev ${EXTRA_APT}
 

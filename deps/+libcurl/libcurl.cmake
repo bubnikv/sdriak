@@ -80,9 +80,9 @@ elseif (NOT _libcurl_is_system)
     set(_mbedcrypto_lib "${SDRPP_DEPS_INSTALL_PREFIX}/lib/libmbedcrypto.a")
     list(APPEND _libcurl_cmake_args
         -DCURL_USE_MBEDTLS=ON
-        # Override CURL_USE_OPENSSL=ON left in reusable Linux/AppImage build
-        # trees by the pre-8.22 recipe. Enabling MbedTLS only changes curl's
-        # default for a fresh cache; it does not replace an existing value.
+        # A reusable Linux/AppImage build tree can retain CURL_USE_OPENSSL=ON
+        # from the previous recipe. Turning MbedTLS on does not turn OpenSSL
+        # off, so clear the stale backend choice explicitly.
         -DCURL_USE_OPENSSL=OFF
         -DMBEDTLS_INCLUDE_DIR=${_mbedtls_inc}
         -DMBEDTLS_LIBRARY=${_mbedtls_lib}

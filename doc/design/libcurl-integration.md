@@ -40,11 +40,16 @@ built against. /etc/ssl/cert.pem is a static bundle rather than the Keychain, so
 CAs a user installs into the Keychain are not honoured by the bundled build —
 switching macOS to OpenSSL + USE_APPLE_SECTRUST is the way back to native trust
 if that ever matters. Native bundled Linux builds use curl's normal CA
-bundle/path auto-detection. They use MbedTLS rather than host OpenSSL because
-curl 8.18 and newer require OpenSSL 3, while the AppImage glibc baseline and
-Ubuntu focal still provide OpenSSL 1.1. System-resolved Linux curl keeps the
-distro's TLS backend and trust configuration. Core networking wrappers use the
-handle factory so plugins never have to touch libcurl directly.
+bundle/path auto-detection. The Linux CI images install `ca-certificates`
+explicitly before curl configures because the detected path is compiled into
+the build. Unlike the OpenSSL backend, MbedTLS has no backend-provided default
+certificate directory as a second fallback; if curl detects no CA path, it can
+still build successfully but HTTPS verification will fail at runtime. Bundled
+Linux builds use MbedTLS rather than host OpenSSL because curl 8.18 and newer
+require OpenSSL 3, while the AppImage glibc baseline and Ubuntu focal still
+provide OpenSSL 1.1. System-resolved Linux curl keeps the distro's TLS backend
+and trust configuration. Core networking wrappers use the handle factory so
+plugins never have to touch libcurl directly.
 
 The bundled recipe tracks current upstream curl (see deps/+libcurl/libcurl.cmake
 for the pin). It must never be pinned to 8.11.1, the single release carrying
