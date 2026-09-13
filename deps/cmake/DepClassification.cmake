@@ -113,8 +113,8 @@ sdrpp_register_dep(libcurl
     # /usr/lib/x86_64-linux-gnu/libcurl.so.4 in ld.so.cache order — the
     # system curl would shadow ours at runtime, defeating the WS-mandatory
     # bundled build. Static links curl's symbols (curl_ws_send included)
-    # directly into libsdriak_core.so and leaves only libssl/libcrypto/
-    # libz as NEEDED entries, which dpkg-shlibdeps maps to system packages.
+    # directly into libsdriak_core.so. Its bundled MbedTLS backend is static as
+    # well, avoiding an OpenSSL ABI dependency in portable/focal builds.
     # The distro:static value only takes effect when policy resolves the
     # source to bundled (FORCE_BUNDLED or matrix curl_source=bundled);
     # distro:system builds link the host's shared libcurl as before.

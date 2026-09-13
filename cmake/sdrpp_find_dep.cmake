@@ -136,6 +136,14 @@ function(sdrpp_link_dep target pkg)
     # NO_CMAKE_FIND_ROOT_PATH bypasses cross-toolchain root-path filtering
     # (Android NDK sets CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY, which would
     # otherwise reject our explicit PATHS for living outside the NDK sysroot).
+    # Imported configs can perform their own transitive find_package/find_*
+    # calls, however, and those do not inherit NO_CMAKE_FIND_ROOT_PATH.  Add
+    # the explicit prefixes as Android roots in this function scope so such
+    # calls (curl 8.22 -> Mbed TLS, for example) can resolve the same install.
+    if (ANDROID AND _prefix_hints)
+        list(REMOVE_ITEM CMAKE_FIND_ROOT_PATH ${_prefix_hints})
+        list(PREPEND CMAKE_FIND_ROOT_PATH ${_prefix_hints})
+    endif ()
     if (_prefix_hints AND NOT _is_system)
         find_package(${_package} CONFIG QUIET PATHS ${_prefix_hints} NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
     endif ()

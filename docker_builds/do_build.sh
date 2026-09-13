@@ -5,16 +5,15 @@ cd /root
 # VOLK_PACKAGE: volk library package name (libvolk2-dev or libvolk-dev)
 # EXTRA_APT: space-separated extra apt packages (e.g. ca-certificates)
 # CURL_SOURCE: 'system' uses the distro libcurl; 'bundled' forces deps to
-# build libcurl from source (needs libssl-dev for the OpenSSL backend).
+# build libcurl from source with the bundled MbedTLS backend.
 VOLK_PACKAGE=${VOLK_PACKAGE:-libvolk2-dev}
 CURL_SOURCE=${CURL_SOURCE:-system}
 
 CURL_DEP_ARG=""
-# System build links the distro libcurl; bundled builds it from source (needs
-# libssl-dev) so the distro -dev headers are dead weight there.
+# System builds link the distro libcurl; bundled builds use MbedTLS, so both
+# libcurl and OpenSSL development packages are dead weight there.
 CURL_APT="libcurl4-openssl-dev"
 if [ "$CURL_SOURCE" = "bundled" ]; then
-    EXTRA_APT="${EXTRA_APT:-} libssl-dev"
     CURL_DEP_ARG="-DSDRPP_DEP_FORCE_BUNDLED=libcurl"
     CURL_APT=""
 fi

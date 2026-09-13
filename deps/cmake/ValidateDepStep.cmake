@@ -232,6 +232,17 @@ set(CMAKE_THREAD_LIBS_INIT "")
 ]==])
 list(PREPEND CMAKE_MODULE_PATH "${_probe_module_dir}")
 
+# Android's toolchain restricts package, library, and include searches to
+# CMAKE_FIND_ROOT_PATH.  The package under test can load transitive dependency
+# modules from its Config.cmake (curl 8.22 does this for Mbed TLS), and those
+# nested searches do not inherit NO_CMAKE_FIND_ROOT_PATH from the outer
+# find_package call below.  Make the bundled prefix an explicit Android root so
+# the probe sees the same dependency closure that the main build consumes.
+if (ANDROID)
+    list(REMOVE_ITEM CMAKE_FIND_ROOT_PATH "${_prefix}")
+    list(PREPEND CMAKE_FIND_ROOT_PATH "${_prefix}")
+endif ()
+
 find_package(${_package_name} CONFIG REQUIRED
     PATHS "${_prefix}"
     NO_DEFAULT_PATH

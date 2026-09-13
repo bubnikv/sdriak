@@ -14,7 +14,7 @@ RUN apt-get -o Acquire::Retries=3 update && \
         wget unzip p7zip-full file patchelf xxd \
         autoconf automake libtool \
         libglfw3-dev libpulse-dev libasound2-dev \
-        libssl-dev liborc-0.4-dev && \
+        liborc-0.4-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Focal's apt cmake (3.16) predates `cmake --preset` (needs 3.19+) and

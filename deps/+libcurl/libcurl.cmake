@@ -3,15 +3,16 @@
 #
 # Reworked from cmake/find_or_fetch_curl.cmake. Static + PIC build pinned to
 # curl-8_22_0. Protocols are trimmed to the surface SDRIAK uses; TLS backend is
-# platform-native wherever one still exists:
+# platform-native on Windows and bundled with SDRIAK elsewhere:
 #   - Windows: Schannel
 #   - macOS:   MbedTLS (Apple's Secure Transport backend was removed in
 #              curl 8.15.0; the alternative, OpenSSL + USE_APPLE_SECTRUST,
 #              would mean adding an OpenSSL dep just for macOS)
 #   - Android: MbedTLS (built by deps/+mbedtls)
-#   - Linux:   system OpenSSL (only matters when libcurl is forced bundled;
-#              the distro profile resolves to system curl on trixie/sid/noble/
-#              resolute, but focal/jammy/bookworm build this recipe)
+#   - Linux:   MbedTLS when libcurl is bundled; a system-resolved libcurl keeps
+#              its distro-selected TLS backend. curl 8.18+ requires OpenSSL 3,
+#              while the portable glibc baseline and Ubuntu focal provide
+#              OpenSSL 1.1, so the bundled build must not use host OpenSSL.
 #
 # Do not pin back to 8.11.1 or below 8.12.0: 8.11.1 is the one release carrying
 # CVE-2025-0665. Its threaded resolver closes the same eventfd twice on 64-bit
@@ -23,11 +24,13 @@
 # No CA bundle is shipped. MbedTLS carries no trust store of its own, so each
 # build is pointed at the platform's: Android sets CURLOPT_CAPATH
 # /system/etc/security/cacerts at runtime (see core/utils/curl_init), macOS
-# compiles in CURL_CA_BUNDLE=/etc/ssl/cert.pem below. Note that the macOS file
-# is a static bundle, not the Keychain — CAs a user installs into the Keychain
-# are not honoured since the Secure Transport backend went away.
+# compiles in CURL_CA_BUNDLE=/etc/ssl/cert.pem below, and native Linux uses
+# curl's standard CA bundle/path auto-detection. Note that the macOS file is a
+# static bundle, not the Keychain — CAs a user installs into the Keychain are
+# not honoured since the Secure Transport backend went away.
 #
 sdrpp_dep_get_linkage_option_bools(libcurl _libcurl_build_shared _libcurl_build_static)
+sdrpp_dep_is_system(libcurl _libcurl_is_system)
 
 set(_libcurl_cmake_args
     -DBUILD_CURL_EXE=OFF
@@ -66,7 +69,7 @@ set(_libcurl_cmake_args
 
 if (WIN32)
     list(APPEND _libcurl_cmake_args -DCURL_USE_SCHANNEL=ON)
-elseif (ANDROID OR APPLE)
+elseif (NOT _libcurl_is_system)
     # Pre-feed curl's bundled FindMbedTLS.cmake with the deps install layout
     # so it doesn't have to call find_package(MbedTLS) from a stale module
     # path. MBEDTLS_INCLUDE_DIR is singular; the plural spelling still works
@@ -77,6 +80,10 @@ elseif (ANDROID OR APPLE)
     set(_mbedcrypto_lib "${SDRPP_DEPS_INSTALL_PREFIX}/lib/libmbedcrypto.a")
     list(APPEND _libcurl_cmake_args
         -DCURL_USE_MBEDTLS=ON
+        # Override CURL_USE_OPENSSL=ON left in reusable Linux/AppImage build
+        # trees by the pre-8.22 recipe. Enabling MbedTLS only changes curl's
+        # default for a fresh cache; it does not replace an existing value.
+        -DCURL_USE_OPENSSL=OFF
         -DMBEDTLS_INCLUDE_DIR=${_mbedtls_inc}
         -DMBEDTLS_LIBRARY=${_mbedtls_lib}
         -DMBEDX509_LIBRARY=${_mbedx509_lib}
@@ -92,6 +99,8 @@ elseif (ANDROID OR APPLE)
         list(APPEND _libcurl_cmake_args -DCURL_CA_BUNDLE=/etc/ssl/cert.pem)
     endif ()
 else ()
+    # This ExternalProject is excluded from ALL for a system-resolved libcurl;
+    # retain the conventional backend in case somebody builds it explicitly.
     list(APPEND _libcurl_cmake_args -DCURL_USE_OPENSSL=ON)
 endif ()
 
@@ -101,7 +110,7 @@ add_cmake_project(libcurl
     GIT_SHALLOW    ON
     CMAKE_ARGS     ${_libcurl_cmake_args})
 
-if (ANDROID OR APPLE)
+if (NOT WIN32 AND NOT _libcurl_is_system)
     set(DEP_libcurl_DEPENDS mbedtls)
 endif ()
 

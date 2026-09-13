@@ -1,11 +1,13 @@
 #
-# Mbed-TLS — TLS backend for the Android and macOS libcurl builds.
+# Mbed-TLS — TLS backend for bundled non-Windows libcurl builds.
 #
-# Android and macOS pull this in (via DEP_libcurl_DEPENDS=mbedtls in
-# deps/+libcurl/libcurl.cmake); macOS joined them when curl 8.15.0 removed the
-# Secure Transport backend. Windows uses Schannel and Linux system OpenSSL. The
-# recipe stays platform-agnostic so SDRPP_DEP_FORCE_* overrides on other
-# platforms still work.
+# Android, macOS, and bundled Linux curl pull this in (via
+# DEP_libcurl_DEPENDS=mbedtls in deps/+libcurl/libcurl.cmake). macOS joined when
+# curl 8.15.0 removed Secure Transport; Linux joined when curl 8.18.0 removed
+# OpenSSL 1.1 support, which the Ubuntu focal portability baseline still uses.
+# Windows uses Schannel, and system-resolved Linux curl keeps its distro TLS
+# backend. The recipe stays platform-agnostic so SDRPP_DEP_FORCE_* overrides on
+# other platforms still work.
 #
 # Pinned to v3.6.7 — the current release of the 3.6 LTS line, which carries
 # X.509 and certificate-chain fixes over the v3.6.2 this used to sit on.
