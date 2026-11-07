@@ -2,6 +2,28 @@
 
 The detailed per-release history of the SDRIAK fork, including alpha and beta pre-releases. For a brief summary of the major releases only, see [changelog.md](changelog.md).
 
+## v1.4.0-rc - 2026-09-08
+
+This release candidate adds RTL-SDR Blog V4L support, hardens HackRF and RTL-SDR USB handling, fixes an Android crash in libcurl, and completes the attribution and license notices of the project.
+
+### Added
+
+- RTL-SDR Blog V4L support, including on Android, through osmocom librtlsdr v2.0.3. Based on the Android V4L integration by [@mrgadotti](https://github.com/mrgadotti) (Marcelo Gadotti) ([upstream #1813](https://github.com/AlexandreRouma/SDRPlusPlus/issues/1813)).
+- Every package now contains the GPL text and the notices of the bundled third-party software, in the `licenses` folder of the resources directory. `scripts/generate_third_party_notices.py` regenerates the notices.
+- The About dialog shows the copyright, the no-warranty statement and where to find the licenses, it also lists all contributors and the libraries the application builds or vendors.
+
+### Changed
+
+- librtlsdr moved from the stalled AlexandreRouma fork to osmocom v2.0.3, bringing the latest V4/V4L tracking-filter fixes. The Android open-by-fd support and the asynchronous teardown fix are carried as patches.
+- libhackrf upgraded to upstream 2026.01.3, with Android open-by-fd support carried as a patch.
+- curl upgraded to 8.22.0. On macOS the bundled curl now uses Mbed TLS 3.6.7, because curl removed the Secure Transport backend. Fixes an Android abort during spots HTTP polling.
+- Restored the attribution of code adopted from the [SDRPP](https://github.com/qrp73/SDRPP) fork by @qrp73 and from SDR++Brown by @sannysanoff: the GPL notices in the source files, the authors of the recorder, KiwiSDR and file source modules, and comments in the adapted code ([#24](https://github.com/bubnikv/sdriak/issues/24)).
+
+### Fixed
+
+- HackRF USB teardown is bounded and keeps objects still owned by libusb, probing and setup failures are validated, and Android no longer attempts USB device discovery. The HackRF source reports control failures and stops after a failed mandatory setup step. This targets the Android HackRF crashes reported upstream ([#1313](https://github.com/AlexandreRouma/SDRPlusPlus/issues/1313), [#1654](https://github.com/AlexandreRouma/SDRPlusPlus/issues/1654)), but is not confirmed to fix them.
+- RTL-SDR streaming stops delivering and resubmitting transfers after cancellation, including cancellation requested from the sample callback, and runs a final cancellation sweep before the bounded drain.
+
 ## v1.4.0-beta2 - 2026-09-08
 
 This follow-up beta completes the product rename from SDR++ iak to SDRIAK, makes QMX VFO synchronization behave like a centered panadapter, and resolves several touch-input and application-icon integration issues.

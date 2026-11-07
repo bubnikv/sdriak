@@ -2,6 +2,16 @@
 
 Major releases only. For the detailed per-release history including alpha and beta pre-releases, see [changelog-full.md](changelog-full.md).
 
+## v1.4.0-rc - 2026-09-08
+
+This release candidate adds RTL-SDR Blog V4L support, hardens USB handling and completes the attribution and license notices of the project.
+
+### Hardware and drivers
+
+- RTL-SDR Blog V4L is now supported, including on Android, based on the Android integration by [@mrgadotti](https://github.com/mrgadotti) ([upstream #1813](https://github.com/AlexandreRouma/SDRPlusPlus/issues/1813)).
+- More robust HackRF and RTL-SDR USB start, stop and error handling, with librtlsdr and libhackrf upgraded to current upstream releases. Fixes Android crashes.
+- Fixed an Android crash during spots polling by upgrading curl to 8.22.0 (CVE-2025-0665).
+
 ## v1.4.0-beta2 - 2026-09-08
 
 This follow-up beta completes the rename to **SDRIAK**, improves QMX panadapter synchronization, and polishes touch interaction on the waterfall.
