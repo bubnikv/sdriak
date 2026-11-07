@@ -38,7 +38,7 @@ android {
     defaultConfig {
         // Keep the published ID stable so SDRIAK upgrades the existing app and retains user data.
         applicationId "org.ok1iak.sdrpp"
-        minSdk 23
+        minSdk 24
         targetSdk 36
         versionCode appVersion.code
         versionName appVersion.name
