@@ -1,4 +1,4 @@
-# SDRIAK — Ride the Radio Waves <img src="root/res/icons/sdriak.png" alt="SDRIAK logo" height="32">
+# <img src="root/res/icons/sdriak.png" alt="SDRIAK logo" height="32"> SDRIAK — Ride the Radio Waves
 
 SDRIAK is a cross-platform, open source SDR application for Windows, Linux, macOS and Android. It is a fork of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) by Alexandre Rouma, maintained by Vojtech Bubnik (OK1IAK), and it combines work from several other SDR++ forks and modules, see [Credits](#credits).
 
