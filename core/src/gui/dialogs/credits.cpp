@@ -102,6 +102,9 @@ namespace credits {
         ImGui::Spacing();
         ImGui::Spacing();
         ImGui::TextUnformatted("SDRIAK v" VERSION_STR " (Built at " __TIME__ ", " __DATE__ ")");
+        ImGui::TextUnformatted("Copyright (C) 2020-2026 Alexandre Rouma, Vojtech Bubnik and contributors");
+        ImGui::TextUnformatted("This program comes with ABSOLUTELY NO WARRANTY. It is free software under the GNU GPL version 3.");
+        ImGui::TextUnformatted("See https://www.gnu.org/licenses/gpl-3.0.html and the licenses folder in the resources directory.");
 
         ImGuiIO& io = ImGui::GetIO();
         float dragThreshold = std::max(io.MouseDragThreshold, style::dp(6.0f));
