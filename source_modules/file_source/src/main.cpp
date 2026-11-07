@@ -1,3 +1,20 @@
+/*
+ * Adapted from the SDRPP distribution (https://github.com/qrp73/SDRPP).
+ * Copyright (c) 2023 qrp73.
+ * Modified for SDRIAK, 2026.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
 #define NOMINMAX
 #include <imgui.h>
 #include <utils/flog.h>
@@ -23,7 +40,7 @@
 SDRPP_MOD_INFO{
     /* Name:            */ "file_source",
     /* Description:     */ "Wav file source module for SDRIAK",
-    /* Author:          */ "Ryzerth",
+    /* Author:          */ "Ryzerth, qrp73",
     /* Version:         */ 0, 1, 2,
     /* Max instances    */ 1
 };

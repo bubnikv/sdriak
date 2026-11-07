@@ -1,4 +1,5 @@
 #pragma once
+// Signal level meter adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
 #include <imgui/imgui.h>
 
 namespace ImGui {

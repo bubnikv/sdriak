@@ -1,4 +1,5 @@
 #pragma once
+// FLAC and 24-bit PCM writing adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
 #include <string>
 #include <fstream>
 #include <stdint.h>

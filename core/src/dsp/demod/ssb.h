@@ -1,4 +1,5 @@
 #pragma once
+// Manual/auto AGC switching adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
 #include "../processor.h"
 #include "../channel/frequency_xlator.h" 
 #include "../convert/complex_to_real.h"

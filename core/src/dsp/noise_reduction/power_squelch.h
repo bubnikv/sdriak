@@ -1,4 +1,5 @@
 #pragma once
+// Hysteresis, unmute hold and dB level math adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
 #include "../processor.h"
 
 // TODO: Rewrite better!!!!!

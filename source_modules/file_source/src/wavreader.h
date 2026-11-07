@@ -1,6 +1,7 @@
 /*
  * Adapted from the SDRPP distribution (https://github.com/qrp73/SDRPP).
  * Copyright (c) 2023 qrp73.
+ * Modified for SDRIAK, 2026.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

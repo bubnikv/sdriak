@@ -1,3 +1,4 @@
+// Signal level meter adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
 #include <gui/widgets/snr_meter.h>
 #include <algorithm>
 #include <cmath>

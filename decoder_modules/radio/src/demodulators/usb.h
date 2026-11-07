@@ -1,4 +1,5 @@
 #pragma once
+// Manual/auto AGC controls adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
 #include "../demod.h"
 #include <dsp/demod/ssb.h>
 #include <dsp/convert/mono_to_stereo.h>

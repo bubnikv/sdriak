@@ -32,7 +32,7 @@
 SDRPP_MOD_INFO{
     /* Name:            */ "recorder",
     /* Description:     */ "Recorder module for SDRIAK",
-    /* Author:          */ "Ryzerth",
+    /* Author:          */ "qrp73, Ryzerth",
     /* Version:         */ 0, 3, 0,
     /* Max instances    */ -1
 };
