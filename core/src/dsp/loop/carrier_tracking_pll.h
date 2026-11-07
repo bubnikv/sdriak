@@ -7,8 +7,8 @@ namespace dsp::loop {
     public:
         CarrierTrackingPLL() {}
 
-        CarrierTrackingPLL(stream<complex_t>* in, double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
-            base_type::init(in, bandwidth, initFreq, initPhase, minFreq, maxFreq);
+        CarrierTrackingPLL(double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
+            base_type::init(bandwidth, initPhase, initFreq, minFreq, maxFreq);
         }
 
         inline int process(int count, complex_t* in, complex_t* out) {

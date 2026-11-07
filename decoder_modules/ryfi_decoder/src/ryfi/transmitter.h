@@ -59,9 +59,9 @@ namespace ryfi {
         RSEncoder rs;
         ConvEncoder conv;
         Framer framer;
-        dsp::multirate::RationalResampler<dsp::complex_t> resamp;
-        dsp::tap<float> rrcTaps;
-        dsp::filter::FIR<dsp::complex_t, float> rrc;
+        dsp::multirate::RationalResamplerBlock<dsp::complex_t> resamp;
+        dsp::OwnedTap<float> rrcTaps;
+        dsp::filter::FIRBlock<dsp::complex_t, float> rrc;
 
         bool running = false;
         std::thread workerThread;

@@ -20,16 +20,27 @@ namespace dsp::demod {
 
         SSB(stream<complex_t>* in, Mode mode, double bandwidth, double samplerate, double agcAttack, double agcDecay) { init(in, mode, bandwidth, samplerate, agcAttack, agcDecay); }
 
+        ~SSB() {
+            // Not redundant despite the RAII buffers: ~block() joins the
+            // worker, but it runs *after* this class's members are destroyed.
+            // The thread has to be stopped here, before that happens.
+            if (!base_type::_block_init) { return; }
+            base_type::stop();
+        }
+
         void init(stream<complex_t>* in, Mode mode, double bandwidth, double samplerate, double agcAttack, double agcDecay) {
             _mode = mode;
             _bandwidth = bandwidth;
             _samplerate = samplerate;
 
-            xlator.init(NULL, getTranslation(), _samplerate);
-            agc.init(NULL, 1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
+            xlator.init(getTranslation(), _samplerate);
+            xlatorOut.allocate(STREAM_BUFFER_SIZE);
+            agc.init(1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
 
-            if constexpr (std::is_same_v<T, float>) {
-                agc.out.free();
+            // Only the stereo path needs an AGC scratch buffer; the float
+            // path works directly in the caller's output.
+            if constexpr (std::is_same_v<T, stereo_t>) {
+                agcOut.allocate(STREAM_BUFFER_SIZE);
             }
 
             base_type::init(in);
@@ -38,28 +49,25 @@ namespace dsp::demod {
         void setMode(Mode mode) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _mode = mode;
             xlator.setOffset(getTranslation(), _samplerate);
-            base_type::tempStart();
         }
 
         void setBandwidth(double bandwidth) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _bandwidth = bandwidth;
             xlator.setOffset(getTranslation(), _samplerate);
-            base_type::tempStart();
         }
 
         void setSamplerate(double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _samplerate = samplerate;
             xlator.setOffset(getTranslation(), _samplerate);
-            base_type::tempStart();
         }
 
         void setAGCEnabled(bool enabled) {
@@ -93,16 +101,16 @@ namespace dsp::demod {
 
         int process(int count, const complex_t* in, T* out) {
             // Move back sideband
-            xlator.process(count, in, xlator.out.writeBuf);
+            xlator.process(count, in, xlatorOut);
 
             if constexpr (std::is_same_v<T, float>) {
-                convert::ComplexToReal::process(count, xlator.out.writeBuf, out);
+                convert::ComplexToReal::process(count, xlatorOut, out);
                 agc.process(count, out, out);
             }
             if constexpr (std::is_same_v<T, stereo_t>) {
-                convert::ComplexToReal::process(count, xlator.out.writeBuf, agc.out.writeBuf);
-                agc.process(count, agc.out.writeBuf, agc.out.writeBuf);
-                convert::MonoToStereo::process(count, agc.out.writeBuf, out);
+                convert::ComplexToReal::process(count, xlatorOut, agcOut);
+                agc.process(count, agcOut, agcOut);
+                convert::MonoToStereo::process(count, agcOut, out);
             }
 
             return count;
@@ -136,7 +144,9 @@ namespace dsp::demod {
         double _bandwidth;
         double _samplerate;
         channel::FrequencyXlator xlator;
+        buffer::Buffer<complex_t> xlatorOut;   // scratch, in place of xlator's old out stream
         loop::AGC<float> agc;
+        buffer::Buffer<float> agcOut;   // scratch, stereo path only
 
     };
 };

@@ -1,5 +1,6 @@
 #include <module.h>
 #include <filesystem>
+#include <stdexcept>
 #include <utils/flog.h>
 
 ModuleManager::Module_t ModuleManager::loadModule(std::string path) {
@@ -99,7 +100,28 @@ int ModuleManager::createInstance(std::string name, std::string module) {
     }
     Instance_t inst;
     inst.module = modules[module];
-    inst.instance = inst.module.createInstance(name);
+    // A module constructor can throw: the DSP buffer allocator does so on OOM,
+    // which is reachable on 32-bit builds where the demod chains are large.
+    //
+    // This is NOT recoverable and must not be swallowed. A module constructor
+    // registers global state before it can fail — RadioModule creates a VFO,
+    // binds a waterfall handler carrying `this`, and calls
+    // sinkManager.registerStream(name, &stream) — and a throwing constructor
+    // gets no destructor call, so none of that is ever unregistered. Continuing
+    // would leave the managers holding pointers into freed memory. Log the
+    // context the bare exception lacks, then let it terminate the process.
+    // See doc/design/buffer-size-requirements.md §5.
+    try {
+        inst.instance = inst.module.createInstance(name);
+    }
+    catch (const std::exception& e) {
+        flog::error("Fatal: creating instance '{0}' of module '{1}': {2}", name, module, e.what());
+        throw;
+    }
+    if (!inst.instance) {
+        flog::error("Module '{0}' returned no instance for '{1}'", module, name);
+        return -1;
+    }
     instances[name] = inst;
     onInstanceCreated.emit(name);
     return 0;

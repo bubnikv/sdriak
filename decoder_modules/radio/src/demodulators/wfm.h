@@ -62,9 +62,18 @@ namespace demod {
 
             // Init DSP
             demod.init(input, bandwidth / 2.0f, getIFSampleRate(), _stereo, _lowPass, _rds);
-            rdsDemod.init(&demod.rdsOut, _rdsInfo);
+            // Everything past demod.rdsOut runs at BroadcastFM::RDS_SAMPLERATE,
+            // 1/50 of the IF rate. Size it for that rather than for a full
+            // block: it is otherwise the largest single consumer of memory in
+            // the WFM chain, for the slowest branch in it.
+            // [RATE-SIZED] The bound crosses a module boundary here: it is
+            // computed inside BroadcastFM from its RDS decimation ratio and
+            // sizes every buffer and stream in RDSDemod. see doc/design/buffer-size-requirements.md 2.6
+            rdsDemod.init(&demod.rdsOut, _rdsInfo, demod.getRDSMaxBlock());
             hs.init(&rdsDemod.out, rdsHandler, this);
-            reshape.init(&rdsDemod.soft, 4096, (1187 / 30) - 4096);
+            // keep is fixed and setKeep() is never called here, so the
+            // diagnostic stream is sized for the block it carries.
+            reshape.init(&rdsDemod.soft, 4096, (1187 / 30) - 4096, 4096);
             diagHandler.init(&reshape.out, _diagHandler, this);
 
             // Init RDS display

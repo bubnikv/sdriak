@@ -6,7 +6,7 @@
 #include <dsp/types.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <gui/widgets/waterfall.h>
-#include <fftw3.h>
+#include <dsp/buffer/fftw.h>
 #include <volk/volk.h>
 
 struct SubWaterfall::SubWaterfallPrivate {
@@ -17,10 +17,10 @@ struct SubWaterfall::SubWaterfallPrivate {
     std::vector<dsp::stereo_t> resampledV;
     std::vector<std::pair<float, float>> minMaxQueue;
     ImGui::WaterFall waterfall;
-    fftwf_complex* fft_in;
-    fftwf_complex* fft_out;
-    fftwf_plan fftwPlan;
-    float* spectrumLine;
+    dsp::buffer::FFTWBuffer<fftwf_complex> fft_in;
+    dsp::buffer::FFTWBuffer<fftwf_complex> fft_out;
+    dsp::buffer::FFTWPlan fftwPlan;
+    dsp::buffer::Buffer<float> spectrumLine;
     float hiFreq = 5000;
     int fftSize;
     float waterfallRate = 10;
@@ -37,7 +37,7 @@ struct SubWaterfall::SubWaterfallPrivate {
                 fft_in[i][1] = 0;
             }
             fftwf_execute(fftwPlan);
-            volk_32fc_s32f_power_spectrum_32f(spectrumLine, (const lv_32fc_t*)fft_out, fftSize, fftSize);
+            volk_32fc_s32f_power_spectrum_32f(spectrumLine, (const lv_32fc_t*)fft_out.get(), fftSize, fftSize);
             auto mx = -5000.0;
             for(int i=0; i<fftSize; i++) {
                 if(spectrumLine[i] > mx) {
@@ -124,22 +124,19 @@ SubWaterfall::SubWaterfall(int sampleRate, int wfrange, const std::string & lbl)
     pvt->waterfall.setWaterfallMax(0);
     pvt->waterfall.setFullWaterfallUpdate(false);
 
-    pvt->fft_in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * pvt->fftSize);
-    pvt->fft_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * pvt->fftSize);
-    pvt->fftwPlan = fftwf_plan_dft_1d(pvt->fftSize, pvt->fft_in, pvt->fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
-    pvt->spectrumLine = (float*)volk_malloc(pvt->fftSize * sizeof(float), 16);
+    pvt->fft_in.allocate(pvt->fftSize);
+    pvt->fft_out.allocate(pvt->fftSize);
+    pvt->fftwPlan.planDFT1D(pvt->fftSize, pvt->fft_in, pvt->fft_out, FFTW_FORWARD);
+    pvt->spectrumLine.allocate(pvt->fftSize);
 }
 
 SubWaterfall::~SubWaterfall() {
-    fftwf_destroy_plan(pvt->fftwPlan);
-    fftwf_free(pvt->fft_in);
-    fftwf_free(pvt->fft_out);
-    volk_free(pvt->spectrumLine);
+    // Everything pvt holds is released by its own destructor.
 }
 
 void SubWaterfall::init() {
     pvt->waterfall.init();
-    pvt->res.init(nullptr, pvt->sampleRate, 2 * pvt->hiFreq);
+    pvt->res.init(pvt->sampleRate, 2 * pvt->hiFreq);
 }
 
 void SubWaterfall::draw() {

@@ -24,7 +24,6 @@ namespace dsp::demod {
         ~AM() {
             if (!base_type::_block_init) { return; }
             base_type::stop();
-            taps::free(lpfTaps);
         }
 
         void init(stream<complex_t>* in, AGCMode agcMode, double bandwidth, double agcAttack, double agcDecay, double dcBlockRate, double samplerate) {
@@ -32,19 +31,21 @@ namespace dsp::demod {
             _bandwidth = bandwidth;
             _samplerate = samplerate;
 
-            carrierAgc.init(NULL, 1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
-            audioAgc.init(NULL, 1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
+            carrierAgc.init(1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
+            audioAgc.init(1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
+            carrierAgcOut.allocate(STREAM_BUFFER_SIZE);
             dcBlock.init(NULL, dcBlockRate);
             lpfTaps = taps::lowPass(bandwidth / 2.0, (bandwidth / 2.0) * 0.1, samplerate);
-            lpf.init(NULL, lpfTaps);
+            lpf.init(lpfTaps);
 
             audioAgc.setEnabled(_agcMode == AGCMode::AUDIO);
 
-            if constexpr (std::is_same_v<T, float>) {
-                audioAgc.out.free();
+            // Only the stereo path needs an audio scratch buffer; the float
+            // path works directly in the caller's output.
+            if constexpr (std::is_same_v<T, stereo_t>) {
+                audioAgcOut.allocate(STREAM_BUFFER_SIZE);
             }
             dcBlock.out.free();
-            lpf.out.free();
             
             base_type::init(in);
         }
@@ -52,7 +53,7 @@ namespace dsp::demod {
         void setAGCMode(AGCMode agcMode) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             // Carry the current gain to the newly active AGC so the audio level doesn't jump
             // on a mode switch (setGain also seeds the AGC envelope)
             float gain = (_agcMode == AGCMode::CARRIER) ? carrierAgc.getGain() : audioAgc.getGain();
@@ -64,7 +65,6 @@ namespace dsp::demod {
             else {
                 audioAgc.setGain(gain);
             }
-            base_type::tempStart();
         }
 
         void setAGCGain(float gain) {
@@ -84,7 +84,6 @@ namespace dsp::demod {
             if (bandwidth == _bandwidth) { return; }
             _bandwidth = bandwidth;
             std::lock_guard<std::mutex> lck2(lpfMtx);
-            taps::free(lpfTaps);
             lpfTaps = taps::lowPass(_bandwidth / 2.0, (_bandwidth / 2.0) * 0.1, _samplerate);
             lpf.setTaps(lpfTaps);
         }
@@ -114,18 +113,17 @@ namespace dsp::demod {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             carrierAgc.reset();
             audioAgc.reset();
             dcBlock.reset();
-            base_type::tempStart();
         }
 
         int process(int count, complex_t* in, T* out) {
             // Apply carrier AGC if needed
             if (_agcMode == AGCMode::CARRIER) {
-                carrierAgc.process(count, in, carrierAgc.out.writeBuf);
-                in = carrierAgc.out.writeBuf;
+                carrierAgc.process(count, in, carrierAgcOut);
+                in = carrierAgcOut;
             }
 
             if constexpr (std::is_same_v<T, float>) {
@@ -140,16 +138,16 @@ namespace dsp::demod {
                 }
             }
             if constexpr (std::is_same_v<T, stereo_t>) {
-                volk_32fc_magnitude_32f(audioAgc.out.writeBuf, (lv_32fc_t*)in, count);
-                dcBlock.process(count, audioAgc.out.writeBuf, audioAgc.out.writeBuf);
+                volk_32fc_magnitude_32f(audioAgcOut, (lv_32fc_t*)in, count);
+                dcBlock.process(count, audioAgcOut, audioAgcOut);
                 if (_agcMode != AGCMode::CARRIER) {
-                    audioAgc.process(count, audioAgc.out.writeBuf, audioAgc.out.writeBuf);
+                    audioAgc.process(count, audioAgcOut, audioAgcOut);
                 }
                 {
                     std::lock_guard<std::mutex> lck(lpfMtx);
-                    lpf.process(count, audioAgc.out.writeBuf, audioAgc.out.writeBuf);
+                    lpf.process(count, audioAgcOut, audioAgcOut);
                 }
-                convert::MonoToStereo::process(count, audioAgc.out.writeBuf, out);
+                convert::MonoToStereo::process(count, audioAgcOut, out);
             }
 
             return count;
@@ -173,9 +171,11 @@ namespace dsp::demod {
         double _bandwidth;
 
         loop::AGC<complex_t> carrierAgc;
+        buffer::Buffer<complex_t> carrierAgcOut;   // scratch, in place of its old out stream
         loop::AGC<float> audioAgc;
+        buffer::Buffer<float> audioAgcOut;         // scratch, stereo path only
         correction::DCBlocker<float> dcBlock;
-        tap<float> lpfTaps;
+        OwnedTap<float> lpfTaps;
         filter::FIR<float, float> lpf;
         std::mutex lpfMtx;
 

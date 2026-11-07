@@ -90,7 +90,7 @@ namespace dsp::noise_reduction {
         static constexpr float HYSTERESIS = 1.0f;   // dB
         static constexpr double HOLD_TIME = 0.1;    // seconds above threshold before unmuting
 
-        float* normBuffer;
+        float* normBuffer = NULL;
         float _level = -50.0f;
         double _samplerate = 48000.0;
         int _holdSamples = 4800;

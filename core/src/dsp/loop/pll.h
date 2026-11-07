@@ -1,18 +1,21 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include "../types.h"
 #include "../math/normalize_phase.h"
 #include "../math/phasor.h"
 #include "phase_control_loop.h"
 
 namespace dsp::loop {
-    class PLL : public Processor<complex_t, complex_t> {
-        using base_type = Processor<complex_t, complex_t>;
+    // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
+    // The caller must have stopped the containing block's worker before calling
+    // any setter or reset().
+    class PLL {
     public:
         PLL() {}
 
-        PLL(stream<complex_t>* in, double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) { init(in, bandwidth, initFreq, initPhase, minFreq, maxFreq); }
+        PLL(double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) { init(bandwidth, initPhase, initFreq, minFreq, maxFreq); }
 
-        void init(stream<complex_t>* in, double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
+        void init(double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
             _initPhase = initPhase;
             _initFreq = initFreq;
 
@@ -20,45 +23,36 @@ namespace dsp::loop {
             float alpha, beta;
             PhaseControlLoop<float>::criticallyDamped(bandwidth, alpha, beta);
             pcl.init(alpha, beta, initPhase, -FL_M_PI, FL_M_PI, initFreq, minFreq, maxFreq);
-            
-            base_type::init(in);
+
+            _init = true;
         }
 
         void setBandwidth(double bandwidth) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             float alpha, beta;
             PhaseControlLoop<float>::criticallyDamped(bandwidth, alpha, beta);
             pcl.setCoefficients(alpha, beta);
-            base_type::tempStart();
         }
 
         void setInitialPhase(double initPhase) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _initPhase = initPhase;
         }
 
         void setInitialFreq(double initFreq) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _initFreq = initFreq;
         }
 
         void setFrequencyLimits(double minFreq, double maxFreq) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             pcl.setFreqLimits(minFreq, maxFreq);
         }
 
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             pcl.phase = _initPhase;
             pcl.freq = _initFreq;
-            base_type::tempStart();
         }
 
         virtual inline int process(int count, complex_t* in, complex_t* out) {
@@ -69,18 +63,9 @@ namespace dsp::loop {
             return count;
         }
 
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            base_type::_in->flush();
-            if (!base_type::out.swap(count)) { return -1; }
-            return count;
-        }
 
     protected:
+        bool _init = false;
         PhaseControlLoop<float> pcl;
         float _initPhase;
         float _initFreq;

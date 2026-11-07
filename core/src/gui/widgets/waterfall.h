@@ -224,6 +224,7 @@ namespace ImGui {
         void drawFFT();
         void drawVFOs();
         void drawBandPlan();
+        void drawFreqScrollButtons();
         void processInputs(bool fftResizePillVisible, const ImVec2& fftResizePillCenter);
         // Pan the view by viewDelta Hz: positive moves the view up in frequency, sliding the
         // spectrum left on screen. Callers negate as their input device requires.
@@ -335,6 +336,14 @@ namespace ImGui {
         ImVec2 fftResizePendingPos;
         float fftResizeGrabOffset = 0.0f; // grab-point offset so the divider doesn't jump to the finger/cursor
         bool freqScaleSelect = false;
+        // Arrow buttons pinned to the ends of the frequency scale. One click
+        // pans the view by FREQ_SCROLL_FRACTION of its width, exactly as if the
+        // ruler had been dragged that far. Laid out by onResize().
+        static constexpr double FREQ_SCROLL_FRACTION = 2.0 / 3.0;
+        ImVec2 freqScrollLeftMin;
+        ImVec2 freqScrollLeftMax;
+        ImVec2 freqScrollRightMin;
+        ImVec2 freqScrollRightMax;
         bool vfoSelect = false;           // first press selected a different VFO; suppress input until release
         bool vfoBorderSelect = false;
         WaterfallVFO* relatedVfo = NULL;

@@ -22,9 +22,8 @@ namespace dsp::compression {
         void setPCMType(PCMType pcmType) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _pcmType = pcmType;
-            base_type::tempStart();
         }
 
         inline static int process(int count, PCMType pcmType, const complex_t* in, uint8_t* out) {

@@ -24,8 +24,18 @@ namespace dsp::buffer {
         void init(stream<T>* in) {
             _in = in;
 
-            for (int i = 0; i < TEST_BUFFER_SIZE; i++) {
-                buffers[i] = buffer::alloc<T>(STREAM_BUFFER_SIZE);
+            // alloc() throws on OOM: null the table first so the cleanup below
+            // (and the destructor) see a consistent state, and release whatever
+            // was already taken rather than leaking it.
+            for (int i = 0; i < TEST_BUFFER_SIZE; i++) { buffers[i] = NULL; }
+            try {
+                for (int i = 0; i < TEST_BUFFER_SIZE; i++) {
+                    buffers[i] = buffer::alloc<T>(STREAM_BUFFER_SIZE);
+                }
+            }
+            catch (...) {
+                for (int i = 0; i < TEST_BUFFER_SIZE; i++) { buffer::free(buffers[i]); }
+                throw;
             }
 
             base_type::registerInput(in);
@@ -36,11 +46,10 @@ namespace dsp::buffer {
         void setInput(stream<T>* in) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             base_type::unregisterInput(_in);
             _in = in;
             base_type::registerInput(_in);
-            base_type::tempStart();
         }
 
         void flush() {

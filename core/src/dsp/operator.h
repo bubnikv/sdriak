@@ -24,34 +24,31 @@ namespace dsp {
         virtual void setInputs(stream<A>* a, stream<B>* b) {
             assert(_block_init);
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             base_type::unregisterInput(_a);
             base_type::unregisterInput(_b);
             _a = a;
             _b = b;
             base_type::registerInput(_a);
             base_type::registerInput(_b);
-            base_type::tempStart();
         }
 
         virtual void setInputA(stream<A>* a) {
             assert(_block_init);
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             base_type::unregisterInput(_a);
             _a = a;
             base_type::registerInput(_a);
-            base_type::tempStart();
         }
 
         virtual void setInputB(stream<B>* b) {
             assert(_block_init);
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             base_type::unregisterInput(_b);
             _b = b;
             base_type::registerInput(_b);
-            base_type::tempStart();
         }
 
         virtual int run() = 0;

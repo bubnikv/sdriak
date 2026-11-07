@@ -12,11 +12,20 @@ namespace dsp::mod {
             init(in, symbolrate, samplerate, rrcBeta, rrcTapCount, deviation);
         }
 
+        ~GFSK() {
+            // Not redundant despite the RAII buffers: ~block() joins the
+            // worker, but it runs *after* this class's members are destroyed.
+            // The thread has to be stopped here, before that happens.
+            if (!base_type::_block_init) { return; }
+            base_type::stop();
+        }
+
         void init(stream<float>* in, double symbolrate, double samplerate, double rrcBeta, int rrcTapCount, double deviation) {
             _samplerate = samplerate;
             _deviation = deviation;
             
-            interp.init(NULL, symbolrate, _samplerate, rrcBeta, rrcTapCount);
+            interp.init(symbolrate, _samplerate, rrcBeta, rrcTapCount);
+            interpOut.allocate(STREAM_BUFFER_SIZE);
             mod.init(NULL, _deviation, _samplerate);
 
             base_type::init(in);
@@ -25,19 +34,17 @@ namespace dsp::mod {
         void setRates(double symbolrate, double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _samplerate = samplerate;
             interp.setRates(symbolrate, _samplerate);
             mod.setDeviation(_deviation, _samplerate);
-            base_type::tempStart();
         }
 
         void setRRCParams(double rrcBeta, int rrcTapCount) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             interp.setRRCParam(rrcBeta, rrcTapCount);
-            base_type::tempStart();
         }
 
         void setDeviation(double deviation) {
@@ -50,15 +57,14 @@ namespace dsp::mod {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             interp.reset();
             mod.reset();
-            base_type::tempStart();
         }
 
         inline int process(int count, const float* in, complex_t* out) {
-            count = interp.process(count, in, interp.out.writeBuf);
-            mod.process(count, interp.out.writeBuf, out);
+            count = interp.process(count, in, interpOut);
+            mod.process(count, interpOut, out);
             return count;
         }
 
@@ -81,6 +87,7 @@ namespace dsp::mod {
         double _deviation;
 
         multirate::RRCInterpolator<float> interp;
+        buffer::Buffer<float> interpOut;   // scratch, in place of its old out stream
         Quadrature mod;
     };
 }

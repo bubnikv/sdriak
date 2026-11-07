@@ -45,7 +45,20 @@ namespace dsp {
 
         Processor(stream<I>* in) { init(in); }
 
-        virtual ~Processor() {}
+        // `out` below is a member of *this* class, so it is destroyed before
+        // ~block() gets to join the worker -- which would then be writing into
+        // freed stream buffers. Stopping here, in the body of the destructor
+        // that owns the stream, is the only placement that covers every
+        // subclass; the per-class `~X() { stop(); }` overrides remain necessary
+        // for classes that own buffers in their *own* subobject, and are cheap
+        // no-ops once they have run (stop() returns immediately if !running).
+        //
+        // Qualified block::stop() rather than the virtual call: dispatch here
+        // resolves to the base anyway, and saying so documents that a subclass
+        // doStop() override would not run at this point.
+        virtual ~Processor() {
+            if (_block_init) { block::stop(); }
+        }
 
         virtual void init(stream<I>* in) {
             _in = in;
@@ -58,11 +71,10 @@ namespace dsp {
             assert(_block_init);
             assert(in); // there is no detached state: run() dereferences _in unconditionally
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
-            tempStop();
+            dsp::block::TempStop guard(this);
             unregisterInput(_in);
             _in = in;
             registerInput(_in);
-            tempStart();
         }
 
         virtual int run() = 0;

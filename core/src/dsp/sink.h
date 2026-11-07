@@ -20,11 +20,10 @@ namespace dsp {
         virtual void setInput(stream<T>* in) {
             assert(_block_init);
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
-            tempStop();
+            dsp::block::TempStop guard(this);
             unregisterInput(_in);
             _in = in;
             registerInput(_in);
-            tempStart();
         }
 
         virtual int run() = 0;

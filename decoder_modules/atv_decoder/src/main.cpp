@@ -49,7 +49,7 @@ class ATVDecoderModule : public ModuleManager::Instance {
         sync.init(&demod.out, 1.0f, 1e-6, 1.0, 0.05);
         sink.init(&sync.out, handler, this);
 
-        r2c.init(NULL);
+        r2c.init();
 
         agc.start();
         demod.start();
@@ -294,7 +294,7 @@ class ATVDecoderModule : public ModuleManager::Instance {
 
     VFOManager::VFO *vfo = NULL;
     // dsp::demod::Quadrature demod;
-    dsp::loop::FastAGC<dsp::complex_t> agc;
+    dsp::loop::FastAGCBlock<dsp::complex_t> agc;
     dsp::demod::Amplitude demod;
     //dsp::demod::AM<float> demod;
     LineSync sync;

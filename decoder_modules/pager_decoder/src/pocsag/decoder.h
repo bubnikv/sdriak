@@ -26,7 +26,7 @@ public:
         vfo->setBandwidthLimits(12500, 12500, true);
         vfo->setSampleRate(SAMPLERATE, 12500);
         dsp.init(vfo->output, SAMPLERATE, BAUDRATE);
-        reshape.init(&dsp.soft, BAUDRATE, (BAUDRATE / 30.0) - BAUDRATE);
+        reshape.init(&dsp.soft, BAUDRATE, (BAUDRATE / 30.0) - BAUDRATE, BAUDRATE);
         dataHandler.init(&dsp.out, _dataHandler, this);
         diagHandler.init(&reshape.out, _diagHandler, this);
 

@@ -4,77 +4,54 @@
 #include <numeric>
 
 namespace dsp::multirate {
+    // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
     template <class T>
-    class RRCInterpolator : public Processor<T, T> {
-        using base_type = Processor<T, T>;
+    class RRCInterpolator {
     public:
         RRCInterpolator() {}
 
-        RRCInterpolator(stream<T>* in, double symbolrate, double samplerate, double rrcBeta, int rrcTapCount) { init(in, symbolrate, samplerate, rrcBeta, rrcTapCount); }
+        RRCInterpolator(double symbolrate, double samplerate, double rrcBeta, int rrcTapCount) { init(symbolrate, samplerate, rrcBeta, rrcTapCount); }
 
-        void init(stream<T>* in, double symbolrate, double samplerate, double rrcBeta, int rrcTapCount) {
+        void init(double symbolrate, double samplerate, double rrcBeta, int rrcTapCount) {
             _symbolrate = symbolrate;
             _samplerate = samplerate;
             _rrcTapCount = rrcTapCount;
 
             rrcTaps = taps::rootRaisedCosine<float>(_rrcTapCount, rrcBeta, _symbolrate, _samplerate);
-            resamp.init(NULL, 1, 1, rrcTaps);
-            resamp.out.free();
+            resamp.init(1, 1, rrcTaps);
+            _rrcBeta = rrcBeta;
             genTaps();
 
-            base_type::init(in);
+            _init = true;
         }
 
         void setRates(double symbolrate, double samplerate) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             _symbolrate = symbolrate;
             _samplerate = samplerate;
             genTaps();
-            base_type::tempStart();
         }
 
         void setRRCParam(double rrcBeta, int rrcTapCount) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             _rrcBeta = rrcBeta;
             _rrcTapCount = rrcTapCount;
             genTaps();
-            base_type::tempStart();
         }
 
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             resamp.reset();
-            base_type::tempStart();
         }
 
         inline int process(int count, const T* in, T* out) {
             return resamp.process(count, in, out);
         }
 
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            int outCount = process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            // Swap if some data was generated
-            base_type::_in->flush();
-            if (outCount) {
-                if (!base_type::out.swap(outCount)) { return -1; }
-            }
-            return outCount;
-        }
 
     private:
         void genTaps() {
             // Free current taps if they exist
-            taps::free(rrcTaps);
 
             // Calculate the rational samplerate ratio
             int InSR = round(_symbolrate);
@@ -94,7 +71,7 @@ namespace dsp::multirate {
         double _rrcBeta;
         int _rrcTapCount;
 
-        tap<float> rrcTaps;
+        OwnedTap<float> rrcTaps;
         multirate::PolyphaseResampler<T> resamp;
 
     };

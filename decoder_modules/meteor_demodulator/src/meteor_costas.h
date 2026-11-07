@@ -8,16 +8,14 @@ namespace dsp::loop {
     public:
         MeteorCostas() {}
 
-        MeteorCostas(stream<complex_t>* in, double bandwidth, bool brokenModulation, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) { init(in, bandwidth, brokenModulation, initFreq, initPhase, minFreq, maxFreq); }
+        MeteorCostas(double bandwidth, bool brokenModulation, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) { init(bandwidth, brokenModulation, initPhase, initFreq, minFreq, maxFreq); }
 
-        void init(stream<complex_t>* in, double bandwidth, bool brokenModulation, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
+        void init(double bandwidth, bool brokenModulation, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
             _broken = brokenModulation;
-            base_type::init(in, bandwidth, initPhase, initFreq, minFreq, maxFreq);
+            base_type::init(bandwidth, initPhase, initFreq, minFreq, maxFreq);
         }
 
         void setBrokenModulation(bool enabled) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
             _broken = enabled;
         }
 

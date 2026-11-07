@@ -1,38 +1,68 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include <string.h>
+#include <volk/volk.h>
+#include "../types.h"
+#include "../buffer/buffer.h"
 #include "../taps/tap.h"
+#include "../processor.h"
 
 namespace dsp::filter {
+    // Computation kernel, not a dsp::block. Twelve of the fourteen FIR instances
+    // in this tree are fused inside a composite that calls process() inline, so
+    // the output stream, worker thread and mutexes were dead weight in all of
+    // them -- 8-16 MB each. The two that really are chain nodes use FIRBlock
+    // below. The containing block owns the thread and must stop it before
+    // calling setTaps()/reset().
     template <class D, class T>
-    class FIR : public Processor<D, D> {
-        using base_type = Processor<D, D>;
+    class FIR {
     public:
         FIR() {}
 
-        FIR(stream<D>* in, tap<T>& taps) { init(in, taps); }
+        FIR(tap<T>& taps, int maxBlock = STREAM_BUFFER_SIZE) { init(taps, maxBlock); }
 
-        ~FIR() {
-            if (!base_type::_block_init) { return; }
-            base_type::stop();
-            buffer::free(buffer);
-        }
 
-        virtual void init(stream<D>* in, tap<T>& taps) {
+        virtual void init(tap<T>& taps, int maxBlock = STREAM_BUFFER_SIZE) {
             _taps = taps;
+            _maxBlock = maxBlock;
 
-            // Allocate and clear buffer
-            buffer = buffer::alloc<D>(STREAM_BUFFER_SIZE + 64000);
+            // [RATE-SIZED] Callers may pass a maxBlock derived from a rate
+            // ratio rather than STREAM_BUFFER_SIZE; process() then relies on
+            // count <= maxBlock. Overruns here are silent heap corruption.
+            // see doc/design/buffer-size-requirements.md 2.6
+            buffer.allocate(_maxBlock + 64000);
             bufStart = &buffer[_taps.size - 1];
             buffer::clear<D>(buffer, _taps.size - 1);
 
-            base_type::init(in);
+            _init = true;
         }
 
-        virtual void setTaps(tap<T>& taps) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        // maxBlock defaults to -1, meaning "keep the current delay line".
+        // Pass a value when the caller's block bound has changed -- a filter
+        // that runs after a resampler sees a fraction of the block its owner
+        // was sized for, and the delay line is the expensive part. Resizing
+        // discards the history, so only do it while reconfiguring a rate.
+        virtual void setTaps(tap<T>& taps, int maxBlock = -1) {
+            assert(_init);
 
+            if (maxBlock > 0 && maxBlock != _maxBlock) {
+                // [RATE-SIZED] Same contract as init(): the new bound comes
+                // from the caller's rate arithmetic. see doc/design/buffer-size-requirements.md 2.6
+                //
+                // Nothing is committed before the allocation. Publishing _taps
+                // first and then throwing would restart the worker with the new
+                // tap count, the old capacity and a bufStart computed from the
+                // old count -- a read past the end of the retained buffer on any
+                // tap-count increase.
+                buffer.allocate(maxBlock + 64000);
+                _maxBlock = maxBlock;
+                _taps = taps;
+                bufStart = &buffer[_taps.size - 1];
+                buffer::clear<D>(buffer, _taps.size - 1);
+                return;
+            }
+
+            // From here on nothing can throw, so the order does not matter.
             int oldTC = _taps.size;
             _taps = taps;
 
@@ -47,22 +77,17 @@ namespace dsp::filter {
                 memmove(&buffer[_taps.size - oldTC], buffer, (oldTC - 1) * sizeof(D));
                 buffer::clear<D>(buffer, _taps.size - oldTC);
             }
-            
-            base_type::tempStart();
         }
 
         virtual void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             buffer::clear<D>(buffer, _taps.size - 1);
-            base_type::tempStart();
         }
 
         inline int process(int count, const D* in, D* out) {
             // Copy data to work buffer
             memcpy(bufStart, in, count * sizeof(D));
-            
+
             // Do convolution
             for (int i = 0; i < count; i++) {
                 if constexpr (std::is_same_v<D, float> && std::is_same_v<T, float>) {
@@ -82,20 +107,67 @@ namespace dsp::filter {
             return count;
         }
 
-        virtual int run() {
+    protected:
+        bool _init = false;
+        int _maxBlock = 0;
+        // Not owned: init() is handed a tap set the caller generated and keeps.
+        tap<T> _taps;
+        buffer::Buffer<D> buffer;
+        D* bufStart = NULL;
+    };
+
+    // Threaded adapter around the kernel, for the FIRs that really are chain
+    // nodes with their own worker and output stream.
+    template <class D, class T>
+    class FIRBlock : public Processor<D, D> {
+        using base_type = Processor<D, D>;
+    public:
+        FIRBlock() {}
+
+        FIRBlock(stream<D>* in, tap<T>& taps) { init(in, taps); }
+
+        ~FIRBlock() {
+            // The owning members below are destroyed before ~block() runs, so
+            // the worker must be joined here -- otherwise it keeps reading
+            // buffers that have already been freed.
+            if (!base_type::_block_init) { return; }
+            base_type::stop();
+        }
+
+        void init(stream<D>* in, tap<T>& taps) {
+            kernel.init(taps);
+            base_type::init(in);
+        }
+
+        void setTaps(tap<T>& taps, int maxBlock = -1) {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            dsp::block::TempStop guard(this);
+            kernel.setTaps(taps, maxBlock);
+        }
+
+        void reset() {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            dsp::block::TempStop guard(this);
+            kernel.reset();
+        }
+
+        inline int process(int count, const D* in, D* out) {
+            return kernel.process(count, in, out);
+        }
+
+        int run() {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
-            process(count, base_type::_in->readBuf, base_type::out.writeBuf);
+            kernel.process(count, base_type::_in->readBuf, base_type::out.writeBuf);
 
             base_type::_in->flush();
             if (!base_type::out.swap(count)) { return -1; }
             return count;
         }
 
-    protected:
-        tap<T> _taps;
-        D* buffer;
-        D* bufStart;
+        FIR<D, T> kernel;
     };
 }

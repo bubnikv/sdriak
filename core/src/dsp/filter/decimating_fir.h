@@ -8,38 +8,26 @@ namespace dsp::filter {
     public:
         DecimatingFIR() {}
 
-        DecimatingFIR(stream<D>* in, tap<T>& taps, int decimation) { init(in, taps, decimation); }
+        DecimatingFIR(tap<T>& taps, int decimation, int maxBlock = STREAM_BUFFER_SIZE) { init(taps, decimation, maxBlock); }
 
-        void init(stream<D>* in, tap<T>& taps, int decimation) {
+        void init(tap<T>& taps, int decimation, int maxBlock = STREAM_BUFFER_SIZE) {
             _decimation = decimation;
-            base_type::init(in, taps);
+            base_type::init(taps, maxBlock);
         }
 
-        void setTaps(tap<T>& taps) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        void setTaps(tap<T>& taps, int maxBlock = -1) override {
             offset = 0;
-            base_type::setTaps(taps);
-            base_type::tempStart();
+            base_type::setTaps(taps, maxBlock);
         }
 
         void setDecimation(int decimation) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
             _decimation = decimation;
             offset = 0;
-            base_type::tempStart();
         }
 
-        void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        void reset() override {
             offset = 0;
             base_type::reset();
-            base_type::tempStart();
         }
 
         inline int process(int count, const D* in, D* out) {
@@ -67,19 +55,6 @@ namespace dsp::filter {
             return outCount;
         }
 
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            int outCount = process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            // Swap if some data was generated
-            base_type::_in->flush();
-            if (outCount) {
-                if (!base_type::out.swap(outCount)) { return -1; }
-            }
-            return outCount;
-        }
 
     protected:
         int _decimation;

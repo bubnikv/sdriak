@@ -61,7 +61,7 @@ public:
         split.init(&demod.out);
         split.bindStream(&symSinkStream);
         split.bindStream(&sinkStream);
-        reshape.init(&symSinkStream, 1024, (72000 / 30) - 1024);
+        reshape.init(&symSinkStream, 1024, (72000 / 30) - 1024, 1024);
         symSink.init(&reshape.out, symSinkHandler, this);
         sink.init(&sinkStream, sinkHandler, this);
 

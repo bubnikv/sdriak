@@ -18,7 +18,6 @@ namespace dsp::demod {
         ~GFSK() {
             if (!base_type::_block_init) { return; }
             base_type::stop();
-            taps::free(rrcTaps);
         }
 
         void init(stream<complex_t>* in, double symbolrate, double samplerate, double deviation, int rrcTapCount, double rrcBeta, double omegaGain, double muGain, double omegaRelLimit = 0.01) {
@@ -28,14 +27,11 @@ namespace dsp::demod {
             _rrcTapCount = rrcTapCount;
             _rrcBeta = rrcBeta;
             
-            demod.init(NULL, _deviation, _samplerate);
+            demod.init(_deviation, _samplerate);
             rrcTaps = taps::rootRaisedCosine<float>(_rrcTapCount, _rrcBeta, _symbolrate, _samplerate);
-            rrc.init(NULL, rrcTaps);
-            recov.init(NULL, _samplerate / _symbolrate,  omegaGain, muGain, omegaRelLimit);
+            rrc.init(rrcTaps);
+            recov.init(_samplerate / _symbolrate,  omegaGain, muGain, omegaRelLimit);
 
-            demod.out.free();
-            rrc.out.free();
-            recov.out.free();
 
             base_type::init(in);
         }
@@ -43,26 +39,22 @@ namespace dsp::demod {
         void setSymbolrate(double symbolrate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _symbolrate = symbolrate;
-            taps::free(rrcTaps);
             rrcTaps = taps::rootRaisedCosine<float>(_rrcTapCount, _rrcBeta, _symbolrate, _samplerate);
             rrc.setTaps(rrcTaps);
             recov.setOmega(_samplerate / _symbolrate);
-            base_type::tempStart();
         }
 
         void setSamplerate(double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _samplerate = samplerate;
             demod.setDeviation(_deviation, _samplerate);
-            taps::free(rrcTaps);
             rrcTaps = taps::rootRaisedCosine<float>(_rrcTapCount, _rrcBeta, _symbolrate, _samplerate);
             rrc.setTaps(rrcTaps);
             recov.setOmega(_samplerate / _symbolrate);
-            base_type::tempStart();
         }
 
         void setDeviation(double deviation) {
@@ -75,13 +67,11 @@ namespace dsp::demod {
         void setRRCParams(int rrcTapCount, double rrcBeta) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _rrcTapCount = rrcTapCount;
             _rrcBeta = rrcBeta;
-            taps::free(rrcTaps);
             rrcTaps = taps::rootRaisedCosine<float>(_rrcTapCount, _rrcBeta, _symbolrate, _samplerate);
             rrc.setTaps(rrcTaps);
-            base_type::tempStart();
         }
 
         void setRRCTapCount(int rrcTapCount) {
@@ -121,11 +111,10 @@ namespace dsp::demod {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             demod.reset();
             rrc.reset();
             recov.reset();
-            base_type::tempStart();
         }
 
         inline int process(int count, complex_t* in, float* out) {
@@ -156,7 +145,7 @@ namespace dsp::demod {
         double _rrcBeta;
 
         Quadrature demod;
-        tap<float> rrcTaps;
+        OwnedTap<float> rrcTaps;
         filter::FIR<float, float> rrc;
         clock_recovery::MM<float> recov;
     };

@@ -19,11 +19,10 @@ namespace dsp::routing {
         void setOutput(stream<T>* out) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             base_type::unregisterOutput(_out);
             _out = out;
             base_type::registerOutput(_out);
-            base_type::tempStart();
         }
 
         int run() {

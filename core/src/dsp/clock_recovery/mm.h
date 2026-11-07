@@ -1,27 +1,26 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include "../types.h"
+#include "../buffer/buffer.h"
+#include "../stream.h"
 #include "../loop/phase_control_loop.h"
 #include "../taps/windowed_sinc.h"
 #include "../multirate/polyphase_bank.h"
 #include "../math/step.h"
 
 namespace dsp::clock_recovery {
+    // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
+    // The caller must have stopped the containing block's worker before calling
+    // any setter or reset().
     template<class T>
-    class MM : public Processor<T, T> {
-        using base_type = Processor<T, T> ;
+    class MM {
     public:
         MM() {}
 
-        MM(stream<T>* in, double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8) { init(in, omega, omegaGain, muGain, omegaRelLimit, interpPhaseCount, interpTapCount); }
+        MM(double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8, int maxBlock = STREAM_BUFFER_SIZE) { init(omega, omegaGain, muGain, omegaRelLimit, interpPhaseCount, interpTapCount, maxBlock); }
 
-        ~MM() {
-            if (!base_type::_block_init) { return; }
-            base_type::stop();
-            dsp::multirate::freePolyphaseBank(interpBank);
-            buffer::free(buffer);
-        }
-
-        void init(stream<T>* in, double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8) {
+        void init(double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8, int maxBlock = STREAM_BUFFER_SIZE) {
+            _maxBlock = maxBlock;
             _omega = omega;
             _omegaGain = omegaGain;
             _muGain = muGain;
@@ -30,71 +29,67 @@ namespace dsp::clock_recovery {
             _interpTapCount = interpTapCount;
 
             pcl.init(_muGain, _omegaGain, 0.0, 0.0, 1.0, _omega, _omega * (1.0 - omegaRelLimit), _omega * (1.0 + omegaRelLimit));
-            generateInterpTaps();
-            buffer = buffer::alloc<T>(STREAM_BUFFER_SIZE + _interpTapCount);
+            interpBank = buildInterpBank(_interpPhaseCount, _interpTapCount);
+            // [RATE-SIZED] RDSDemod and POCSAGDSP pass a rate-derived maxBlock
+            // here rather than STREAM_BUFFER_SIZE. see doc/design/buffer-size-requirements.md 2.6
+            buffer.allocate(_maxBlock + _interpTapCount);
             bufStart = &buffer[_interpTapCount - 1];
-        
-            base_type::init(in);
+
+            _init = true;
         }
 
         void setOmega(double omega) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             _omega = omega;
             offset = 0;
             pcl.phase = 0.0f;
             pcl.freq = _omega;
             pcl.setFreqLimits(_omega * (1.0 - _omegaRelLimit), _omega * (1.0 + _omegaRelLimit));
-            base_type::tempStart();
         }
 
         void setOmegaGain(double omegaGain) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _omegaGain = omegaGain;
             pcl.setCoefficients(_muGain, _omegaGain);
         }
 
         void setMuGain(double muGain) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _muGain = muGain;
             pcl.setCoefficients(_muGain, _omegaGain);
         }
 
         void setOmegaRelLimit(double omegaRelLimit) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _omegaRelLimit = omegaRelLimit;
             pcl.setFreqLimits(_omega * (1.0 - _omegaRelLimit), _omega * (1.0 + _omegaRelLimit));
         }
 
         void setInterpParams(int interpPhaseCount, int interpTapCount) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
+
+            // Acquire both the bank and the buffer before committing anything.
+            // Buffer::allocate() frees the old storage once it succeeds, so it
+            // must be the last thing that can throw -- otherwise bufStart is
+            // left pointing into memory that has already been released.
+            dsp::multirate::OwnedPolyphaseBank<float> freshBank =
+                buildInterpBank(interpPhaseCount, interpTapCount);
+            buffer.allocate(_maxBlock + interpTapCount);
+
             _interpPhaseCount = interpPhaseCount;
             _interpTapCount = interpTapCount;
-            dsp::multirate::freePolyphaseBank(interpBank);
-            buffer::free(buffer);
-            generateInterpTaps();
-            buffer = buffer::alloc<T>(STREAM_BUFFER_SIZE + _interpTapCount);
+            interpBank = std::move(freshBank);
             bufStart = &buffer[_interpTapCount - 1];
-            base_type::tempStart();
         }
 
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            assert(_init);
             offset = 0;
             pcl.phase = 0.0f;
             pcl.freq = _omega;
             lastOut = 0.0f;
             _p_0T = { 0.0f, 0.0f }; _p_1T = { 0.0f, 0.0f }; _p_2T = { 0.0f, 0.0f };
             _c_0T = { 0.0f, 0.0f }; _c_1T = { 0.0f, 0.0f }; _c_2T = { 0.0f, 0.0f };
-            base_type::tempStart();
         }
 
         inline int process(int count, const T* in, T* out) {
@@ -155,29 +150,20 @@ namespace dsp::clock_recovery {
             return outCount;
         }
 
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            int outCount = process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            // Swap if some data was generated
-            base_type::_in->flush();
-            if (outCount) {
-                if (!base_type::out.swap(outCount)) { return -1; }
-            }
-            return outCount;
-        }
 
     protected:
-        void generateInterpTaps() {
-            double bw = 0.5 / (double)_interpPhaseCount;
-            dsp::tap<float> lp = dsp::taps::windowedSinc<float>(_interpPhaseCount * _interpTapCount, dsp::math::hzToRads(bw, 1.0), dsp::window::nuttall, _interpPhaseCount);
-            interpBank = dsp::multirate::buildPolyphaseBank<float>(_interpPhaseCount, lp);
-            taps::free(lp);
+        bool _init = false;
+        int _maxBlock = STREAM_BUFFER_SIZE;
+        // Returns the bank instead of assigning it, so callers can build the
+        // replacement before committing anything. lp is an OwnedTap: if the bank
+        // allocation throws, the windowed sinc is released on the way out.
+        dsp::multirate::PolyphaseBank<float> buildInterpBank(int phaseCount, int tapCount) {
+            double bw = 0.5 / (double)phaseCount;
+            dsp::OwnedTap<float> lp = dsp::taps::windowedSinc<float>(phaseCount * tapCount, dsp::math::hzToRads(bw, 1.0), dsp::window::nuttall, phaseCount);
+            return dsp::multirate::buildPolyphaseBank<float>(phaseCount, lp);
         }
 
-        dsp::multirate::PolyphaseBank<float> interpBank;
+        dsp::multirate::OwnedPolyphaseBank<float> interpBank;
         loop::PhaseControlLoop<float, false> pcl;
 
         double _omega;
@@ -193,7 +179,7 @@ namespace dsp::clock_recovery {
         complex_t _c_0T = { 0.0f, 0.0f }, _c_1T = { 0.0f, 0.0f }, _c_2T = { 0.0f, 0.0f };
 
         int offset = 0;
-        T* buffer;
-        T* bufStart;
+        buffer::Buffer<T> buffer;
+        T* bufStart = NULL;
     };
 }

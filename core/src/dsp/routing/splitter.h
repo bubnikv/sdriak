@@ -19,11 +19,13 @@ namespace dsp::routing {
                 throw std::runtime_error("[Splitter] Tried to bind stream to that is already bound");
             }
 
-            // Add to the list
-            base_type::tempStop();
+            // Add to the list. Reserve first: the two vectors have to agree, and
+            // growing the second one after the first has committed would leave
+            // the stream registered as an output but absent from the split.
+            dsp::block::TempStop guard(this);
+            streams.reserve(streams.size() + 1);
             base_type::registerOutput(stream);
             streams.push_back(stream);
-            base_type::tempStart();
         }
 
         void unbindStream(stream<T>* stream) {
@@ -37,10 +39,9 @@ namespace dsp::routing {
             }
 
             // Add to the list
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             streams.erase(sit);
             base_type::unregisterOutput(stream);
-            base_type::tempStart();
         }
 
         int run() {

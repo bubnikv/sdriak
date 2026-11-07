@@ -1,7 +1,7 @@
 #pragma once
 #include "../processor.h"
 #include "../window/nuttall.h"
-#include <fftw3.h>
+#include "../buffer/fftw.h"
 
 namespace dsp::noise_reduction {
     class FMIF : public Processor<complex_t, complex_t> {
@@ -12,9 +12,10 @@ namespace dsp::noise_reduction {
         FMIF(stream<complex_t>* in, int bins) { init(in, bins); }
 
         ~FMIF() {
+            // The owners below are destroyed before ~block() runs, so the
+            // worker must be joined here; they then release everything.
             if (!base_type::_block_init) { return; }
             base_type::stop();
-            destroyBuffers();
         }
 
         void init(stream<complex_t>* in, int bins) {
@@ -26,37 +27,45 @@ namespace dsp::noise_reduction {
         void setBins(int bins) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _bins = bins;
-            destroyBuffers();
-            initBuffers();
-            base_type::tempStart();
+            initBuffers();   // leaves everything empty if it throws
         }
 
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
-            buffer::clear(buffer, _bins - 1);
-            buffer::clear(backFFTIn, _bins);
-            base_type::tempStart();
+            dsp::block::TempStop guard(this);
+            if (!bufferStart) { return; }
+            buffer::clear<complex_t>(buffer, _bins - 1);
+            buffer::clear<complex_t>(backFFTIn, _bins);
         }
 
         int process(int count, const complex_t* in, complex_t* out) {
+            // Pass through if the buffers are gone. setBins() releases them and
+            // rethrows when an allocation fails, and ~TempStop restarts the
+            // worker on its way out -- so this runs with everything NULL while
+            // the OOM exception is still unwinding. Faulting here would bury
+            // the diagnostic that exception carries.
+            if (!bufferStart) {
+                if (out != in) { memcpy(out, in, count * sizeof(complex_t)); }
+                return count;
+            }
+
             // Write new input data to buffer buffer
             memcpy(bufferStart, in, count * sizeof(complex_t));
             
             // Iterate the FFT
             for (int i = 0; i < count; i++) {
                 // Apply windows
-                volk_32fc_32f_multiply_32fc((lv_32fc_t*)forwFFTIn, (lv_32fc_t*)&buffer[i], fftWin, _bins);
+                volk_32fc_32f_multiply_32fc((lv_32fc_t*)forwFFTIn.get(), (lv_32fc_t*)&buffer[i], fftWin, _bins);
 
                 // Do forward FFT
                 fftwf_execute(forwardPlan);
 
                 // Process bins here
                 uint32_t idx;
-                volk_32fc_magnitude_32f(ampBuf, (lv_32fc_t*)forwFFTOut, _bins);
+                volk_32fc_magnitude_32f(ampBuf, (lv_32fc_t*)forwFFTOut.get(), _bins);
                 volk_32f_index_max_32u(&idx, ampBuf, _bins);
 
                 // Keep only the bin of highest amplitude
@@ -90,58 +99,85 @@ namespace dsp::noise_reduction {
 
     protected:
         void initBuffers() {
+            // Any allocation below can throw, and _bins has already been
+            // updated by then. Release everything on the way out rather than
+            // leave a mix of new- and old-sized buffers, which the new _bins
+            // would index out of bounds; process() passes through while they
+            // are empty. release() is a no-op on an owner that is already
+            // empty, so this is safe on partially built state too.
+            try {
+                initBuffersUnsafe();
+            }
+            catch (...) {
+                releaseBuffers();
+                throw;
+            }
+        }
+
+        void initBuffersUnsafe() {
+            // The plans are bound to the alignment of the arrays they were
+            // built against and cannot survive their reallocation, so they go
+            // first -- before the storage under them moves, not after.
+            forwardPlan.destroy();
+            backwardPlan.destroy();
+
             // Allocate FFT buffers
-            forwFFTIn = (complex_t*)fftwf_malloc(_bins * sizeof(complex_t));
-            forwFFTOut = (complex_t*)fftwf_malloc(_bins * sizeof(complex_t));
-            backFFTIn = (complex_t*)fftwf_malloc(_bins * sizeof(complex_t));
-            backFFTOut = (complex_t*)fftwf_malloc(_bins * sizeof(complex_t));
+            forwFFTIn.allocate(_bins);
+            forwFFTOut.allocate(_bins);
+            backFFTIn.allocate(_bins);
+            backFFTOut.allocate(_bins);
 
             // Allocate and clear delay buffer
-            buffer = buffer::alloc<complex_t>(STREAM_BUFFER_SIZE + 64000);
-            bufferStart = &buffer[_bins - 1];
-            buffer::clear(buffer, _bins - 1);
+            buffer.allocate(STREAM_BUFFER_SIZE + 64000);
+            buffer::clear<complex_t>(buffer, _bins - 1);
 
             // Clear backward FFT input since only one value is changed and reset at a time
-            buffer::clear(backFFTIn, _bins);
+            buffer::clear<complex_t>(backFFTIn, _bins);
 
             // Allocate amplitude buffer
-            ampBuf = buffer::alloc<float>(_bins);
+            ampBuf.allocate(_bins);
 
             // Allocate and generate Window
-            fftWin = buffer::alloc<float>(_bins);
+            fftWin.allocate(_bins);
             for (int i = 0; i < _bins; i++) { fftWin[i] = window::nuttall(i, _bins - 1); }
 
             // Plan FFTs
-            forwardPlan = fftwf_plan_dft_1d(_bins, (fftwf_complex*)forwFFTIn, (fftwf_complex*)forwFFTOut, FFTW_FORWARD, FFTW_ESTIMATE);
-            backwardPlan = fftwf_plan_dft_1d(_bins, (fftwf_complex*)backFFTIn, (fftwf_complex*)backFFTOut, FFTW_BACKWARD, FFTW_ESTIMATE);
+            forwardPlan.planDFT1D(_bins, (fftwf_complex*)forwFFTIn.get(), (fftwf_complex*)forwFFTOut.get(), FFTW_FORWARD);
+            backwardPlan.planDFT1D(_bins, (fftwf_complex*)backFFTIn.get(), (fftwf_complex*)backFFTOut.get(), FFTW_BACKWARD);
+
+            // Committed last: process() reads a null bufferStart as "not
+            // configured" and passes through, so it must not become non-null
+            // until everything above has succeeded.
+            bufferStart = &buffer[_bins - 1];
         }
 
-        void destroyBuffers() {
-            fftwf_destroy_plan(forwardPlan);
-            fftwf_destroy_plan(backwardPlan);
-            fftwf_free(forwFFTIn);
-            fftwf_free(forwFFTOut);
-            fftwf_free(backFFTIn);
-            fftwf_free(backFFTOut);
-            buffer::free(buffer);
-            buffer::free(ampBuf);
-            buffer::free(fftWin);
+        void releaseBuffers() {
+            forwardPlan.destroy();
+            backwardPlan.destroy();
+            forwFFTIn.release();
+            forwFFTOut.release();
+            backFFTIn.release();
+            backFFTOut.release();
+            buffer.release();
+            ampBuf.release();
+            fftWin.release();
+            bufferStart = NULL;
         }
 
-        complex_t* forwFFTIn;
-        complex_t* forwFFTOut;
-        complex_t* backFFTIn;
-        complex_t* backFFTOut;
+        buffer::FFTWBuffer<complex_t> forwFFTIn;
+        buffer::FFTWBuffer<complex_t> forwFFTOut;
+        buffer::FFTWBuffer<complex_t> backFFTIn;
+        buffer::FFTWBuffer<complex_t> backFFTOut;
 
-        fftwf_plan forwardPlan;
-        fftwf_plan backwardPlan;
+        buffer::FFTWPlan forwardPlan;
+        buffer::FFTWPlan backwardPlan;
 
-        complex_t* buffer;
-        complex_t* bufferStart;
+        buffer::Buffer<complex_t> buffer;
+        complex_t* bufferStart = NULL;
 
-        float* fftWin;
+        buffer::Buffer<float> fftWin;
 
-        float* ampBuf;
+        buffer::Buffer<float> ampBuf;
 
         int _bins;
 

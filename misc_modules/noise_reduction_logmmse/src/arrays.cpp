@@ -1,5 +1,5 @@
 #include "arrays.h"
-#include <fftw3.h>
+#include <dsp/buffer/fftw.h>
 
 #include <algorithm>
 #include <array>
@@ -368,11 +368,13 @@ namespace dsp {
         struct fftwPlanImplFFTW : public FFTPlan {
             int nbuckets;
             bool reverse;
-            fftwf_plan_s* p;
             // Fixed-size working buffers the FFTW plan is bound to; they must
             // never reallocate.
             ComplexArray input;
             ComplexArray output;
+            // Declared last so it is destroyed first, before the arrays it was
+            // planned against -- the order the hand-written destructor had.
+            dsp::buffer::FFTWPlan p;
 
             fftwPlanImplFFTW(bool backward, int buckets) : FFTPlan() {
                 nbuckets = buckets;
@@ -382,7 +384,11 @@ namespace dsp {
                 // via getOutput() before the first execute.
                 input.assign(buckets, dsp::complex_t{ 0, 0 });
                 output.assign(buckets, dsp::complex_t{ 0, 0 });
-                p = fftwf_plan_dft_1d(buckets, (fftwf_complex*)input.data(), (fftwf_complex*)output.data(), backward ? FFTW_BACKWARD : FFTW_FORWARD, FFTW_ESTIMATE);
+                // FFTWPlan serialises this against every other planner call
+                // in the process: this one runs on a DSP worker while the UI
+                // and the IQ front end plan on their own threads, and only
+                // fftwf_execute() is thread-safe.
+                p.planDFT1D(buckets, (fftwf_complex*)input.data(), (fftwf_complex*)output.data(), backward ? FFTW_BACKWARD : FFTW_FORWARD);
             }
 
             const ComplexArray& getOutput() override {
@@ -401,9 +407,7 @@ namespace dsp {
                 return output;
             }
 
-            virtual ~fftwPlanImplFFTW() {
-                fftwf_destroy_plan(p);
-            }
+            virtual ~fftwPlanImplFFTW() {}
         };
 
         std::shared_ptr<FFTPlan> allocateFFTWPlan(bool backward, int buckets) {

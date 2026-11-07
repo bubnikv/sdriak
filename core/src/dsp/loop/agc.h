@@ -1,16 +1,21 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include <algorithm>
+#include <cmath>
+#include "../types.h"
 
 namespace dsp::loop {
+    // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
+    // The caller must have stopped the containing block's worker before calling
+    // any setter or reset().
     template <class T>
-    class AGC : public Processor<T, T> {
-        using base_type = Processor<T, T>;
+    class AGC {
     public:
         AGC() {}
 
-        AGC(stream<T>* in, double setPoint, double attack, double decay, double maxGain, double maxOutputAmp, double initGain = 1.0) { init(in, setPoint, attack, decay, maxGain, maxOutputAmp, initGain); }
+        AGC(double setPoint, double attack, double decay, double maxGain, double maxOutputAmp, double initGain = 1.0) { init(setPoint, attack, decay, maxGain, maxOutputAmp, initGain); }
 
-        void init(stream<T>* in, double setPoint, double attack, double decay, double maxGain, double maxOutputAmp, double initGain = 1.0) {
+        void init(double setPoint, double attack, double decay, double maxGain, double maxOutputAmp, double initGain = 1.0) {
             _setPoint = setPoint;
             _attack = attack;
             _invAttack = 1.0f - _attack;
@@ -22,7 +27,7 @@ namespace dsp::loop {
             amp = _setPoint / _initGain;
             _gain = std::min<float>(_initGain, _maxGain);
             _enabled = true;
-            base_type::init(in);
+            _init = true;
         }
 
         float getGain() {
@@ -30,8 +35,7 @@ namespace dsp::loop {
         }
 
         void setGain(float gain) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _gain = gain;
             // Seed the envelope so that when enabled, the AGC continues from this gain
             // instead of recomputing it from a stale envelope on the next sample
@@ -39,57 +43,49 @@ namespace dsp::loop {
         }
 
         void setEnabled(bool enabled) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _enabled = enabled;
         }
 
         void setSetPoint(double setPoint) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _setPoint = setPoint;
         }
 
         void setAttack(double attack) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _attack = attack;
             _invAttack = 1.0f - _attack;
         }
 
         void setDecay(double decay) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _decay = decay;
             _invDecay = 1.0f - _decay;
         }
 
         void setMaxGain(double maxGain) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _maxGain = maxGain;
         }
 
         void setMaxOutputAmp(double maxOutputAmp) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _maxOutputAmp = maxOutputAmp;
         }
 
         void setInitialGain(double initGain) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             _initGain = initGain;
         }
 
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            assert(_init);
             amp = _setPoint / _initGain;
             _gain = std::min<float>(_initGain, _maxGain);
         }
 
-        inline int process(int count, T* in, T* out) {
+        inline int process(int count, const T* in, T* out) {
             for (int i = 0; i < count; i++) {
                 // Get signal amplitude
                 float inAmp;
@@ -138,18 +134,9 @@ namespace dsp::loop {
             return count;
         }
 
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            base_type::_in->flush();
-            if (!base_type::out.swap(count)) { return -1; }
-            return count;
-        }
 
     protected:
+        bool _init = false;
         float _setPoint;
         float _attack;
         float _invAttack;

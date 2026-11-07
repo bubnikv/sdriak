@@ -40,10 +40,10 @@ public:
     LineSync(dsp::stream<float>* in, double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8) { init(in, omega, omegaGain, muGain, omegaRelLimit, interpPhaseCount, interpTapCount); }
 
     ~LineSync() {
+        // The owning members below are destroyed before ~block() runs, so the
+        // worker must be joined here.
         if (!base_type::_block_init) { return; }
         base_type::stop();
-        dsp::multirate::freePolyphaseBank(interpBank);
-        dsp::buffer::free(buffer);
     }
 
     void init(dsp::stream<float>* in, double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8) {
@@ -54,8 +54,13 @@ public:
         _interpPhaseCount = interpPhaseCount;
         _interpTapCount = interpTapCount;
 
-        generateInterpTaps();
-        buffer = dsp::buffer::alloc<float>(STREAM_BUFFER_SIZE + _interpTapCount);
+        // Acquire both before committing either: alloc() throws on OOM and a
+        // completed bank would otherwise leak.
+        {
+            dsp::multirate::OwnedPolyphaseBank<float> freshBank = buildInterpBank(_interpPhaseCount, _interpTapCount);
+            buffer.allocate(STREAM_BUFFER_SIZE + _interpTapCount);
+            interpBank = std::move(freshBank);
+        }
         bufStart = &buffer[_interpTapCount - 1];
 
         // TODO: Needs tuning, so do the gains
@@ -68,24 +73,28 @@ public:
     void setInterpParams(int interpPhaseCount, int interpTapCount) {
         assert(base_type::_block_init);
         std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-        base_type::tempStop();
+        dsp::block::TempStop guard(this);
+        // Build everything from the *arguments* and commit the dimensions only
+        // once both allocations have succeeded. Committing them first and then
+        // throwing would let TempStop restart the worker with the new phase/tap
+        // counts indexing the old bank and buffer.
+        dsp::multirate::OwnedPolyphaseBank<float> freshBank = buildInterpBank(interpPhaseCount, interpTapCount);
+        // allocate() acquires before it releases, so a throw here leaves the
+        // block on its existing buffer rather than empty.
+        buffer.allocate(STREAM_BUFFER_SIZE + interpTapCount);
+
+        interpBank = std::move(freshBank);
         _interpPhaseCount = interpPhaseCount;
         _interpTapCount = interpTapCount;
-        dsp::multirate::freePolyphaseBank(interpBank);
-        dsp::buffer::free(buffer);
-        generateInterpTaps();
-        buffer = dsp::buffer::alloc<float>(STREAM_BUFFER_SIZE + _interpTapCount);
         bufStart = &buffer[_interpTapCount - 1];
-        base_type::tempStart();
     }
 
     void reset() {
         assert(base_type::_block_init);
         std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-        base_type::tempStop();
+        dsp::block::TempStop guard(this);
         offset = 0;
         phase = 0;
-        base_type::tempStart();
     }
 
     int run() {
@@ -227,14 +236,17 @@ public:
     bool fastLock = true;
 
 protected:
-    void generateInterpTaps() {
-        double bw = 0.5 / (double)_interpPhaseCount;
-        dsp::tap<float> lp = dsp::taps::windowedSinc<float>(_interpPhaseCount * _interpTapCount, dsp::math::hzToRads(bw, 1.0), dsp::window::nuttall, _interpPhaseCount);
-        interpBank = dsp::multirate::buildPolyphaseBank<float>(_interpPhaseCount, lp);
-        dsp::taps::free(lp);
+    // Returns the bank instead of assigning it, and takes the dimensions as
+    // arguments rather than reading the members, so callers can build a
+    // replacement before committing anything. lp is an OwnedTap: if the bank
+    // allocation throws, the windowed sinc is released on the way out.
+    dsp::multirate::PolyphaseBank<float> buildInterpBank(int phaseCount, int tapCount) {
+        double bw = 0.5 / (double)phaseCount;
+        dsp::OwnedTap<float> lp = dsp::taps::windowedSinc<float>(phaseCount * tapCount, dsp::math::hzToRads(bw, 1.0), dsp::window::nuttall, phaseCount);
+        return dsp::multirate::buildPolyphaseBank<float>(phaseCount, lp);
     }
 
-    dsp::multirate::PolyphaseBank<float> interpBank;
+    dsp::multirate::OwnedPolyphaseBank<float> interpBank;
 
     double _omega;
     double _omegaGain;
@@ -242,8 +254,8 @@ protected:
     double _omegaRelLimit;
     int _interpPhaseCount;
     int _interpTapCount;
-    float* buffer;
-    float* bufStart;
+    dsp::buffer::Buffer<float> buffer;
+    float* bufStart = NULL;
 
     uint32_t phase = 0;
     uint32_t maxPeriod;

@@ -40,14 +40,13 @@ namespace dsp::correction {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             if constexpr (std::is_same_v<T, float>) {
                 offset = 0.0f;
             }
             if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
                 offset = { 0.0f, 0.0f };
             }
-            base_type::tempStart();
         }
 
         // TODO: Add back the const

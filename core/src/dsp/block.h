@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include "stream.h"
+#include "../utils/flog.h"
 #include "types.h"
 
 namespace dsp {
@@ -56,12 +57,51 @@ namespace dsp {
             assert(_block_init);
             if (tempStopDepth++) { return; }
             if (running && !tempStopped) {
-                doStop();
+                // Restore the depth if the worker cannot be joined. Left
+                // elevated, it turns the matching tempStart() into a silent
+                // no-op and the block stays stopped for the rest of the run.
+                try {
+                    doStop();
+                }
+                catch (...) {
+                    --tempStopDepth;
+                    throw;
+                }
                 tempStopped = true;
             }
         }
 
         virtual int run() = 0;
+
+        // Scope guard for the tempStop()/tempStart() pairs that bracket every
+        // reconfiguration. Doing it by hand is not exception-safe: buffer::alloc()
+        // throws on OOM, and a throw between the two calls skips tempStart(),
+        // leaving tempStopDepth elevated and the block permanently wedged even
+        // if the caller handles the exception.
+        class TempStop {
+        public:
+            explicit TempStop(block* blk) : _blk(blk) { _blk->tempStop(); }
+            ~TempStop() {
+                // A destructor must not throw: tempStart() spawns the worker via
+                // std::thread, whose constructor can throw, and this destructor
+                // runs during unwinding of the very exceptions it exists to
+                // survive. Leaving the block stopped is recoverable; calling
+                // std::terminate mid-unwind is not.
+                try {
+                    _blk->tempStart();
+                }
+                catch (const std::exception& e) {
+                    flog::error("Failed to restart a DSP block after reconfiguration: {0}", e.what());
+                }
+                catch (...) {
+                    flog::error("Failed to restart a DSP block after reconfiguration");
+                }
+            }
+            TempStop(const TempStop&) = delete;
+            TempStop& operator=(const TempStop&) = delete;
+        private:
+            block* _blk;
+        };
 
     protected:
         void workerLoop() {

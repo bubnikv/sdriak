@@ -45,14 +45,13 @@ namespace dsp::filter {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             if constexpr (std::is_same_v<T, float>) {
                 lastOut = 0;
             }
             if constexpr (std::is_same_v<T, stereo_t>) {
                 lastOut = { 0, 0 };
             }
-            base_type::tempStart();
         }
 
         inline int process(int count, const T* in, T* out) {

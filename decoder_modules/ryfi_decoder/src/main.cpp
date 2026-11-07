@@ -37,7 +37,7 @@ public:
 
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, INPUT_BANDWIDTH, INPUT_SAMPLE_RATE, INPUT_BANDWIDTH, INPUT_BANDWIDTH, true);
         rx.init(vfo->output, INPUT_BAUDRATE, INPUT_SAMPLE_RATE);
-        reshape.init(rx.softOut, SYMBOL_DIAG_COUNT, (INPUT_BAUDRATE / SYMBOL_DIAG_RATE) - SYMBOL_DIAG_COUNT);
+        reshape.init(rx.softOut, SYMBOL_DIAG_COUNT, (INPUT_BAUDRATE / SYMBOL_DIAG_RATE) - SYMBOL_DIAG_COUNT, SYMBOL_DIAG_COUNT);
         symSink.init(&reshape.out, symSinkHandler, this);
         rx.onPacket.bind(&RyFiDecoderModule::packetHandler, this);
 

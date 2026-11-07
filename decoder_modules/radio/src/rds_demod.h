@@ -13,28 +13,47 @@ class RDSDemod : public dsp::Processor<dsp::complex_t, uint8_t> {
     using base_type = dsp::Processor<dsp::complex_t, uint8_t>;
 public:
     RDSDemod() {}
-    RDSDemod(dsp::stream<dsp::complex_t>* in, bool enableSoft) { init(in, enableSoft); }
-    ~RDSDemod() {}
+    RDSDemod(dsp::stream<dsp::complex_t>* in, bool enableSoft, int maxBlock = STREAM_BUFFER_SIZE) { init(in, enableSoft, maxBlock); }
+    ~RDSDemod() {
+        // Owning members are destroyed before ~block() runs, so the worker must
+        // be joined here or it keeps reading freed buffers.
+        if (!base_type::_block_init) { return; }
+        base_type::stop();
+    }
 
-    void init(dsp::stream<dsp::complex_t>* in, bool enableSoft) {
+    // maxBlock is the largest block this demodulator can be handed, which is
+    // whatever BroadcastFM's RDS branch emits -- 1/50 of the full rate at the
+    // usual 250 kHz IF. Everything below runs at 5 kHz, so sizing it for a
+    // full-rate block wastes ~50x on every buffer and both streams.
+    void init(dsp::stream<dsp::complex_t>* in, bool enableSoft, int maxBlock = STREAM_BUFFER_SIZE) {
         // Save config
         this->enableSoft = enableSoft;
 
         // Initialize the DSP
-        agc.init(NULL, 1.0, 1e6, 0.1);
-        costas.init(NULL, 0.005f);
+        agc.init(1.0, 1e6, 0.1);
+        costas.init(0.005f);
         taps = dsp::taps::bandPass<dsp::complex_t>(0, 2375, 100, 5000);
-        fir.init(NULL, taps);
+        fir.init(taps, maxBlock);   // [RATE-SIZED]
         double baudfreq = dsp::math::hzToRads(2375.0/2.0, 5000);
-        costas2.init(NULL, 0.01, 0.0, baudfreq, baudfreq - (baudfreq*0.1), baudfreq + (baudfreq*0.1));
-        recov.init(NULL, 5000.0 / (2375.0 / 2.0), 1e-6, 0.01, 0.01);
-        diff.init(NULL, 2);
+        costas2.init(0.01, 0.0, baudfreq, baudfreq - (baudfreq*0.1), baudfreq + (baudfreq*0.1));
+        recov.init(5000.0 / (2375.0 / 2.0), 1e-6, 0.01, 0.01, 128, 8, maxBlock);
+        diff.init(2);
 
-        // Free useless buffers
-        agc.out.free();
-        fir.out.free();
-        costas2.out.free();
-        recov.out.free();
+        // [RATE-SIZED] Every buffer and both streams below are sized from
+        // `maxBlock`, which the caller derived from BroadcastFM's RDS
+        // decimation ratio -- none of them is STREAM_BUFFER_SIZE any more, and
+        // process() bound-checks none of them. see doc/design/buffer-size-requirements.md 2.6
+        diffScratch.allocate(maxBlock);
+
+        // Two scratch buffers in place of the costas.out read/write ping-pong
+        scratchA.allocate(maxBlock);
+        scratchB.allocate(maxBlock);
+
+        // Both output streams carry at most one input block: `soft` one sample
+        // per input sample, `out` one symbol per ~4.2. Sized before anything is
+        // started, so no reader can be holding the old buffer.
+        soft.setBufferSize(maxBlock);
+        base_type::out.setBufferSize(maxBlock);
 
         // Init the rest
         base_type::init(in);
@@ -43,33 +62,31 @@ public:
     void setSoftEnabled(bool enable) {
         assert(base_type::_block_init);
         std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-        base_type::tempStop();
+        dsp::block::TempStop guard(this);
         enableSoft = enable;
-        base_type::tempStart();
     }
 
     void reset() {
         assert(base_type::_block_init);
         std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-        base_type::tempStop();
+        dsp::block::TempStop guard(this);
         agc.reset();
         costas.reset();
         fir.reset();
         costas2.reset();
         recov.reset();
         diff.reset();
-        base_type::tempStart();
     }
 
     inline int process(int count, dsp::complex_t* in, float* softOut, uint8_t* hardOut) {
-        count = agc.process(count, in, costas.out.readBuf);
-        count = costas.process(count, costas.out.readBuf, costas.out.writeBuf);
-        count = fir.process(count, costas.out.writeBuf, costas.out.writeBuf);
-        count = costas2.process(count, costas.out.writeBuf, costas.out.readBuf);
-        count = dsp::convert::ComplexToReal::process(count, costas.out.readBuf, softOut);
+        count = agc.process(count, in, scratchA);
+        count = costas.process(count, scratchA, scratchB);
+        count = fir.process(count, scratchB, scratchB);
+        count = costas2.process(count, scratchB, scratchA);
+        count = dsp::convert::ComplexToReal::process(count, scratchA, softOut);
         count = recov.process(count, softOut, softOut);
-        count = dsp::digital::BinarySlicer::process(count, softOut, diff.out.readBuf);
-        count = diff.process(count, diff.out.readBuf, hardOut);
+        count = dsp::digital::BinarySlicer::process(count, softOut, diffScratch);
+        count = diff.process(count, diffScratch, hardOut);
         return count;
     }
 
@@ -92,9 +109,13 @@ public:
 private:
     bool enableSoft = false;
     
+    dsp::buffer::Buffer<uint8_t> diffScratch;
+    dsp::buffer::Buffer<dsp::complex_t> scratchA;
+    dsp::buffer::Buffer<dsp::complex_t> scratchB;
+
     dsp::loop::FastAGC<dsp::complex_t> agc;
     dsp::loop::Costas<2> costas;
-    dsp::tap<dsp::complex_t> taps;
+    dsp::OwnedTap<dsp::complex_t> taps;
     dsp::filter::FIR<dsp::complex_t, dsp::complex_t> fir;
     dsp::loop::Costas<2> costas2;
     dsp::clock_recovery::MM<float> recov;

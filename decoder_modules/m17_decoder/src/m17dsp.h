@@ -109,11 +109,10 @@ namespace dsp {
         void setInput(stream<float>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -167,11 +166,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -301,11 +299,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -378,11 +375,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -458,11 +454,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         bool isReceiving() {
@@ -556,11 +551,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
