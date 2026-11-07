@@ -2,7 +2,7 @@
 
 Major releases only. For the detailed per-release history including alpha and beta pre-releases, see [changelog-full.md](changelog-full.md).
 
-## v1.4.0-rc - 2026-09-08
+## v1.4.0-rc - 2026-11-07
 
 This release candidate adds RTL-SDR Blog V4L support, hardens USB handling and completes the attribution and license notices of the project.
 

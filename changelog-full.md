@@ -2,7 +2,7 @@
 
 The detailed per-release history of the SDRIAK fork, including alpha and beta pre-releases. For a brief summary of the major releases only, see [changelog.md](changelog.md).
 
-## v1.4.0-rc - 2026-09-08
+## v1.4.0-rc - 2026-11-07
 
 This release candidate adds RTL-SDR Blog V4L support, hardens HackRF and RTL-SDR USB handling, fixes an Android crash in libcurl, and completes the attribution and license notices of the project.
 
