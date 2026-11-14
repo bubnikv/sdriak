@@ -1,101 +1,219 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include <string.h>
+#include <utility>
+#include <volk/volk.h>
+#include "../types.h"
+#include "../buffer/buffer.h"
+#include "../buffer/history_buffer.h"
 #include "../taps/tap.h"
+#include "../processor.h"
 
 namespace dsp::filter {
+    // FIR Filter computation kernel.
+    //
+    // Tap ownership: init()/setTaps() taking an rvalue (a freshly generated
+    // set, or std::move(t)) adopt it and free it when replaced or destroyed.
+    // Taking an lvalue they only borrow it, and the caller must keep it alive,
+    // unchanged, for as long as the FIR uses it. Prefer handing ownership over;
+    // borrowing exists for sets shared with something else.
     template <class D, class T>
-    class FIR : public Processor<D, D> {
-        using base_type = Processor<D, D>;
+    class FIR {
     public:
-        FIR() {}
+        FIR() = default;
 
-        FIR(stream<D>* in, tap<T>& taps) { init(in, taps); }
+        FIR(tap<T>&& taps, int maxBlock = STREAM_BUFFER_SIZE) { init(std::move(taps), maxBlock); }
+        FIR(const tap<T>& taps, int maxBlock = STREAM_BUFFER_SIZE) { init(taps, maxBlock); }
 
-        ~FIR() {
-            if (!base_type::_block_init) { return; }
-            base_type::stop();
-            buffer::free(buffer);
+        void init(tap<T>&& taps, int maxBlock = STREAM_BUFFER_SIZE) {
+            // Adopted only once initTaps() has succeeded: on a throw the
+            // caller's temporary still owns and frees the set.
+            initTaps(taps, maxBlock);
+            m_ownedTaps = std::move(taps);
         }
 
-        virtual void init(stream<D>* in, tap<T>& taps) {
-            _taps = taps;
-
-            // Allocate and clear buffer
-            buffer = buffer::alloc<D>(STREAM_BUFFER_SIZE + 64000);
-            bufStart = &buffer[_taps.size - 1];
-            buffer::clear<D>(buffer, _taps.size - 1);
-
-            base_type::init(in);
+        void init(const tap<T>& taps, int maxBlock = STREAM_BUFFER_SIZE) {
+            initTaps(taps, maxBlock);
+            m_ownedTaps.release();
         }
 
-        virtual void setTaps(tap<T>& taps) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        // maxBlock defaults to -1, meaning "keep the current delay line".
+        // Pass a value when the caller's block bound has changed -- a filter
+        // that runs after a resampler sees a fraction of the block its owner
+        // was sized for, and the delay line is the expensive part. Resizing
+        // discards the history, so only do it while reconfiguring a rate.
+        //
+        // The previous set, if owned, is freed only after the new one is
+        // published, so the FIR never points at freed taps.
+        void setTaps(tap<T>&& taps, int maxBlock = -1) {
+            applyTaps(taps, maxBlock);
+            m_ownedTaps = std::move(taps);
+        }
 
-            int oldTC = _taps.size;
-            _taps = taps;
+        void setTaps(const tap<T>& taps, int maxBlock = -1) {
+            applyTaps(taps, maxBlock);
+            m_ownedTaps.release();
+        }
 
-            // Update start of buffer
-            bufStart = &buffer[_taps.size - 1];
+        // Resize the delay line for a new block bound, keeping the taps.
+        // Discards the history when the bound actually changes.
+        void setMaxBlock(int maxBlock) {
+            applyTaps(m_taps, maxBlock);
+        }
 
-            // Move existing data to make transition seemless
-            if (_taps.size < oldTC) {
-                memmove(buffer, &buffer[oldTC - _taps.size], (_taps.size - 1) * sizeof(D));
-            }
-            else if (_taps.size > oldTC) {
-                memmove(&buffer[_taps.size - oldTC], buffer, (oldTC - 1) * sizeof(D));
-                buffer::clear<D>(buffer, _taps.size - oldTC);
-            }
-            
-            base_type::tempStart();
+        int tapCount() const { return m_taps.size(); }
+        bool ownsTaps() const { return m_ownedTaps.taps() != NULL; }
+
+        // The set this FIR owns, for another FIR to borrow. The borrower must
+        // be re-pointed (setTaps()) whenever this one's taps are replaced, and
+        // must not outlive it.
+        const tap<T>& ownedTaps() const {
+            assert(ownsTaps());
+            return m_ownedTaps;
         }
 
         virtual void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
-            buffer::clear<D>(buffer, _taps.size - 1);
-            base_type::tempStart();
+            assert(m_init);
+            m_hist.clear();
         }
 
+        // The delay line keeps the last taps-1 input samples; see
+        // buffer::HistoryBuffer for the layout and why the input is copied.
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const D* in, D* out) {
-            // Copy data to work buffer
-            memcpy(bufStart, in, count * sizeof(D));
-            
+            const D* window = m_hist.push(in, count);
+
             // Do convolution
             for (int i = 0; i < count; i++) {
-                if constexpr (std::is_same_v<D, float> && std::is_same_v<T, float>) {
-                    volk_32f_x2_dot_prod_32f(&out[i], &buffer[i], _taps.taps, _taps.size);
-                }
-                if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, float>) {
-                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&out[i], (lv_32fc_t*)&buffer[i], _taps.taps, _taps.size);
-                }
-                if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, complex_t>) {
-                    volk_32fc_x2_dot_prod_32fc((lv_32fc_t*)&out[i], (lv_32fc_t*)&buffer[i], (lv_32fc_t*)_taps.taps, _taps.size);
+                if constexpr (std::is_same_v<D, float> && std::is_same_v<T, float>)
+                    volk_32f_x2_dot_prod_32f(&out[i], &window[i], m_taps.taps(), m_taps.size());
+                else if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, float>)
+                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&out[i], (const lv_32fc_t*)&window[i], m_taps.taps(), m_taps.size());
+                else if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, complex_t>)
+                    volk_32fc_x2_dot_prod_32fc((lv_32fc_t*)&out[i], (const lv_32fc_t*)&window[i], (const lv_32fc_t*)m_taps.taps(), m_taps.size());
+                else {
+                    static_assert(dependent_false_v<D, T>, "Unsupported FIR input/output/tap type combination");
                 }
             }
 
-            // Move unused data
-            memmove(buffer, &buffer[count], (_taps.size - 1) * sizeof(D));
-
+            m_hist.advance(count);
             return count;
         }
 
-        virtual int run() {
+    protected:
+        void initTaps(TapView<T> taps, int maxBlock) {
+            // [RATE-SIZED] Callers may pass a maxBlock derived from a rate
+            // ratio rather than STREAM_BUFFER_SIZE; process() then relies on
+            // count <= maxBlock. see doc/design/buffer-size-requirements.md 2.6
+            // Allocate first, so a throw commits nothing.
+            m_hist.init(maxBlock, taps.size() - 1);
+            m_taps = taps;
+#ifndef NDEBUG
+            m_init = true;
+#endif
+        }
+
+        // Publishes a new active tap set and, if maxBlock > 0, a new block
+        // bound. Overridden by DecimatingFIR to reset its phase.
+        //
+        // The delay line is reshaped before the taps are committed, and both
+        // HistoryBuffer calls give the strong guarantee, so a throw leaves the
+        // FIR on its old taps, bound and delay line.
+        virtual void applyTaps(TapView<T> taps, int maxBlock) {
+            assert(m_init);
+            if (maxBlock > 0 && maxBlock != m_hist.maxBlock()) {
+                // [RATE-SIZED] Same contract as init(): the new bound comes
+                // from the caller's rate arithmetic. Discards the history.
+                // see doc/design/buffer-size-requirements.md 2.6
+                m_hist.resize(maxBlock, taps.size() - 1);
+            }
+            else {
+                // Keeps the history, so a tap change is seamless.
+                m_hist.setHistory(taps.size() - 1);
+            }
+            m_taps = taps;
+        }
+
+#ifndef NDEBUG
+        bool m_init = false;
+#endif
+        // The active tap set: points into m_ownedTaps when the FIR owns it,
+        // into a caller-kept set when it borrows. Moving the FIR keeps it
+        // valid, since the view holds the data pointer, not the tap object.
+        TapView<T> m_taps;
+        // Non-empty exactly when the FIR owns the set m_taps points at.
+        tap<T> m_ownedTaps;
+        // [ history: taps-1 | block: <= maxBlock ]
+        buffer::HistoryBuffer<D> m_hist;
+    };
+
+    // Threaded adapter around the kernel, for the FIRs that really are chain
+    // nodes with their own worker and output stream.
+    template <class D, class T>
+    class FIRBlock : public Processor<D, D> {
+        using base_type = Processor<D, D>;
+    public:
+        FIRBlock() = default;
+
+        FIRBlock(stream<D>* in, tap<T>&& taps) { init(in, std::move(taps)); }
+        FIRBlock(stream<D>* in, const tap<T>& taps) { init(in, taps); }
+
+        ~FIRBlock() {
+            // The owning members below are destroyed before ~block() runs, so
+            // the worker must be joined here -- otherwise it keeps reading
+            // buffers that have already been freed.
+            if (base_type::_block_init)
+                base_type::stop();
+        }
+
+        // Same ownership rules as FIR: an rvalue is adopted, an lvalue borrowed.
+        void init(stream<D>* in, tap<T>&& taps) {
+            kernel.init(std::move(taps));
+            base_type::init(in);
+        }
+
+        void init(stream<D>* in, const tap<T>& taps) {
+            kernel.init(taps);
+            base_type::init(in);
+        }
+
+        void setTaps(tap<T>&& taps, int maxBlock = -1) {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            dsp::block::TempStop guard(this);
+            kernel.setTaps(std::move(taps), maxBlock);
+        }
+
+        void setTaps(const tap<T>& taps, int maxBlock = -1) {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            dsp::block::TempStop guard(this);
+            kernel.setTaps(taps, maxBlock);
+        }
+
+        void reset() {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            dsp::block::TempStop guard(this);
+            kernel.reset();
+        }
+
+        // IN-PLACE: safe (in == out). Delegates to the kernel above.
+        inline int process(int count, const D* in, D* out) {
+            return kernel.process(count, in, out);
+        }
+
+        int run() {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
-            process(count, base_type::_in->readBuf, base_type::out.writeBuf);
+            kernel.process(count, base_type::_in->readBuf, base_type::out.writeBuf);
 
             base_type::_in->flush();
             if (!base_type::out.swap(count)) { return -1; }
             return count;
         }
 
-    protected:
-        tap<T> _taps;
-        D* buffer;
-        D* bufStart;
+        FIR<D, T> kernel;
     };
 }

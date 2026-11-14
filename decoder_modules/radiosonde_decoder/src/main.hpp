@@ -31,7 +31,7 @@ private:
 	char ptuFilename[2048];
 	VFOManager::VFO *vfo;
 	dsp::demod::FM<float> fmDemod;
-	dsp::multirate::RationalResampler<float> resampler;
+	dsp::multirate::RationalResamplerBlock<float> resampler;
 
 	radiosonde::Decoder<RS41Decoder, rs41_decoder_init, rs41_decoder_deinit, rs41_decode> rs41decoder;
 	radiosonde::Decoder<DFM09Decoder, dfm09_decoder_init, dfm09_decoder_deinit, dfm09_decode> dfm09decoder;

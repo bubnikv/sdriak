@@ -1,76 +1,56 @@
 #pragma once
-#include "../processor.h"
+#include <string.h>
+#include <assert.h>
+#include "../types.h"
+#include "../buffer/history_buffer.h"
+// Only for the STREAM_BUFFER_SIZE default below. When block sizes become
+// explicit (chunking), maxBlock becomes a required argument and this goes.
+#include "../stream.h"
 
 namespace dsp::math {
+    // Computation kernel, not a dsp::block: no output stream, no worker thread,
+    // no mutexes. Every use of Delay in this tree is inside a composite that
+    // calls process() inline, so the threading machinery a Processor carries was
+    // dead weight in all of them -- and each instance cost a 16 MB stream that
+    // existed only to be freed again. The containing block owns the thread and
+    // is responsible for stopping it before touching setDelay()/reset().
     template<class T>
-    class Delay : public Processor<T, T> {
-        using base_type = Processor<T, T>;
+    class Delay {
     public:
         Delay() {}
 
-        Delay(stream<T>* in, int delay) { init(in, delay); }
+        Delay(int delay, int maxBlock = STREAM_BUFFER_SIZE) { init(delay, maxBlock); }
 
-        ~Delay() {
-            if (!base_type::_block_init) { return; }
-            base_type::stop();
-            buffer::free(buffer);
+        // The delay line is a HistoryBuffer whose history is the delay: the
+        // output block is the first count samples of the window.
+        void init(int delay, int maxBlock = STREAM_BUFFER_SIZE) {
+            hist.init(maxBlock, delay);
+            _init = true;
         }
 
-        void init(stream<T>* in, int delay) {
-            _delay = delay;
-
-            buffer = buffer::alloc<T>(STREAM_BUFFER_SIZE + 64000);
-            bufStart = &buffer[_delay];
-            buffer::clear(buffer, _delay);
-
-            base_type::init(in);
-        }
-
+        // Clears the delay line. Reallocates only when the new delay no
+        // longer fits; a throw leaves the old delay in place.
         void setDelay(int delay) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
-            _delay = delay;
-            bufStart = &buffer[_delay];
-            reset();
-            base_type::tempStart();
+            assert(_init);
+            hist.resize(hist.maxBlock(), delay);
         }
 
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
-            buffer::clear(buffer, _delay);
-            base_type::tempStart();
+            assert(_init);
+            hist.clear();
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const T* in, T* out) {
-            // Copy data into delay buffer
-            memcpy(bufStart, in, count * sizeof(T));
+            const T* window = hist.push(in, count);
+            memcpy(out, window, count * sizeof(T));
+            hist.advance(count);
 
-            // Copy data out of the delay buffer
-            memcpy(out, buffer, count * sizeof(T));
-
-            // Move end of the delay buffer to the front
-            memmove(buffer, &buffer[count], _delay * sizeof(T));
-
-            return count;
-        }
-
-        virtual int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            base_type::_in->flush();
-            if (!base_type::out.swap(count)) { return -1; }
             return count;
         }
 
     private:
-        int _delay;
-        T* buffer;
-        T* bufStart;
+        bool _init = false;
+        buffer::HistoryBuffer<T> hist;
     };
 }

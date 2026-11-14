@@ -5,6 +5,7 @@
 #include "bgnoise.h"
 #include <utils/flog.h>
 #include <cstring>
+#include <atomic>
 #include <deque>
 #include <utility>
 
@@ -43,11 +44,13 @@ namespace dsp {
                 int len2;
                 FloatArray win;
                 int nFFT;
-                std::shared_ptr<FFTPlan> forwardPlan;
-                std::shared_ptr<FFTPlan> reversePlan;
+                std::unique_ptr<ZeroPaddedFFTW> forwardPlan;
+                std::unique_ptr<ZeroPaddedFFTW> reversePlan;
                 float aa = 0.98;
                 float ksi_min;
-                bool hold = false;
+                // Written by the TX-state handler on another thread, read on
+                // the DSP thread.
+                std::atomic<bool> hold{ false };
 
                 void reset() {
                     noise_history.clear();
@@ -142,15 +145,15 @@ namespace dsp {
                 params->win = nphanning(params->Slen);
                 params->win = div(mul(params->win, params->len2), npsum(params->win));
                 params->nFFT = 2 * params->Slen;
-                params->forwardPlan = allocateFFTWPlan(false, params->nFFT);
-                params->reversePlan = allocateFFTWPlan(true, params->nFFT);
+                params->forwardPlan = std::make_unique<ZeroPaddedFFTW>(false, params->nFFT);
+                params->reversePlan = std::make_unique<ZeroPaddedFFTW>(true, params->nFFT);
                 params->sums = npzeros(params->nFFT);
                 params->devs = npzeros(params->nFFT);
 
                 flog::debug("logmmse: sampling noise, srate={}, Slen={}, nFFT={}", Srate, params->Slen, params->nFFT);
                 auto noise_mean = npzeros(params->nFFT);
                 for (int j = 0; j < params->Slen * noise_frames; j += params->Slen) {
-                    npfftfft((muleach(params->win, nparange(x, j, j + params->Slen))), params->forwardPlan);
+                    params->forwardPlan->npfftfft(muleach(params->win, nparange(x, j, j + params->Slen)));
                     auto noise = npabsolute(params->forwardPlan->getOutput());
                     noise_mean = addeach(noise_mean, noise);
                     params->add_noise_history(std::move(noise));
@@ -175,7 +178,7 @@ namespace dsp {
                 auto xfinal = npzeros_c(Nframes * params->len2);
                 for (int k = 0; k < Nframes * params->len2; k += params->len2) {
                     auto insign = muleach(params->win, nparange(x, k, k + params->Slen));
-                    npfftfft(insign, params->forwardPlan);
+                    params->forwardPlan->npfftfft(insign);
                     const auto& spec = params->forwardPlan->getOutput();
                     auto sig = npabsolute(spec);
                     auto sigD = sig.data();
@@ -209,7 +212,7 @@ namespace dsp {
                     // equivalent.
                     params->add_noise_history(std::move(sig));
                     auto hwmulspec = muleach(hw, spec);
-                    npfftfft(hwmulspec, params->reversePlan);
+                    params->reversePlan->npfftfft(hwmulspec);
                     const auto& xi_w0 = params->reversePlan->getOutput();
                     auto final = addeach(params->x_old, nparange(xi_w0, 0, params->len1));
                     nparangeset(xfinal, k, final);

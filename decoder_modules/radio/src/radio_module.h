@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <memory>
 #include <utils/optionlist.h>
 #include <radio_interface.h>
 #include "demod.h"
@@ -112,8 +113,7 @@ public:
 
         ctcss.init(NULL, 50000.0);
         resamp.init(NULL, 250000.0, 48000.0);
-        hpTaps = dsp::taps::highPass(300.0, 100.0, 48000.0);
-        hpf.init(NULL, hpTaps);
+        hpf.init(NULL, dsp::taps::highPass(300.0, 100.0, 48000.0));
         deemp.init(NULL, 50e-6, 48000.0);
 
         afChain.addBlock(&ctcss, false);
@@ -393,18 +393,21 @@ private:
     }
 
     demod::Demodulator* instantiateDemod(DemodID id) {
-        demod::Demodulator* demod = NULL;
+        // Owned until the last step, so an exception out of init() below frees
+        // the demodulator instead of leaking it. Ownership is released to the
+        // caller only on success.
+        std::unique_ptr<demod::Demodulator> demod;
         switch (id) {
-            case DemodID::RADIO_DEMOD_NFM:  demod = new demod::NFM(); break;
-            case DemodID::RADIO_DEMOD_WFM:  demod = new demod::WFM(); break;
-            case DemodID::RADIO_DEMOD_AM:   demod = new demod::AM();  break;
-            case DemodID::RADIO_DEMOD_DSB:  demod = new demod::DSB(); break;
-            case DemodID::RADIO_DEMOD_USB:  demod = new demod::USB(); break;
-            case DemodID::RADIO_DEMOD_CW:   demod = new demod::CW();  break;
-            case DemodID::RADIO_DEMOD_LSB:  demod = new demod::LSB(); break;
-            case DemodID::RADIO_DEMOD_RAW:  demod = new demod::RAW(); break;
-            case DemodID::RADIO_DEMOD_CWR:  demod = new demod::CWR(); break;
-            default:                        demod = NULL; break;
+            case DemodID::RADIO_DEMOD_NFM:  demod.reset(new demod::NFM()); break;
+            case DemodID::RADIO_DEMOD_WFM:  demod.reset(new demod::WFM()); break;
+            case DemodID::RADIO_DEMOD_AM:   demod.reset(new demod::AM());  break;
+            case DemodID::RADIO_DEMOD_DSB:  demod.reset(new demod::DSB()); break;
+            case DemodID::RADIO_DEMOD_USB:  demod.reset(new demod::USB()); break;
+            case DemodID::RADIO_DEMOD_CW:   demod.reset(new demod::CW());  break;
+            case DemodID::RADIO_DEMOD_LSB:  demod.reset(new demod::LSB()); break;
+            case DemodID::RADIO_DEMOD_RAW:  demod.reset(new demod::RAW()); break;
+            case DemodID::RADIO_DEMOD_CWR:  demod.reset(new demod::CWR()); break;
+            default:                        break;
         }
         if (!demod) { return NULL; }
 
@@ -423,7 +426,7 @@ private:
         // Initialize
         demod->init(name, &config, ifChain.out, bw, stream.getSampleRate());
 
-        return demod;
+        return demod.release();
     }
 
     void selectDemodByID(DemodID id) {
@@ -612,8 +615,7 @@ private:
         resamp.setOutSamplerate(audioSampleRate);
 
         // Configure the HPF sample rate
-        hpTaps = dsp::taps::highPass(300.0, 100.0, audioSampleRate);
-        hpf.setTaps(hpTaps);
+        hpf.setTaps(dsp::taps::highPass(300.0, 100.0, audioSampleRate));
 
         // Configure deemphasis sample rate
         deemp.setSamplerate(audioSampleRate);
@@ -878,9 +880,8 @@ private:
     dsp::stream<dsp::stereo_t> dummyAudioStream;
     dsp::chain<dsp::stereo_t> afChain;
     dsp::noise_reduction::CTCSSSquelch ctcss;
-    dsp::multirate::RationalResampler<dsp::stereo_t> resamp;
-    dsp::tap<float> hpTaps;
-    dsp::filter::FIR<dsp::stereo_t, float> hpf;
+    dsp::multirate::RationalResamplerBlock<dsp::stereo_t> resamp;
+    dsp::filter::FIRBlock<dsp::stereo_t, float> hpf;
     dsp::filter::Deemphasis<dsp::stereo_t> deemp;
 
     SinkManager::Stream stream;

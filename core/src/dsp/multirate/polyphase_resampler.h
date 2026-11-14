@@ -1,84 +1,91 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include <string.h>
+#include "../types.h"
+#include "../buffer/buffer.h"
+#include "../buffer/history_buffer.h"
+#include "../stream.h"
 #include "../taps/tap.h"
 #include "polyphase_bank.h"
 
 namespace dsp::multirate {
+    // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
+    // Only ever used inside RationalResampler and RRCInterpolator, both of which
+    // call process() inline. The caller must stop the containing block's worker
+    // before calling setRatio()/reset().
     template<class T>
-    class PolyphaseResampler : public Processor<T, T> {
-        using base_type = Processor<T, T>;
+    class PolyphaseResampler {
     public:
         PolyphaseResampler() {}
 
-        PolyphaseResampler(stream<T>* in, int interp, int decim, tap<float> taps) { init(in, interp, decim, taps); }
+        PolyphaseResampler(int interp, int decim, const tap<float>& taps, int maxBlock = STREAM_BUFFER_SIZE) { init(interp, decim, taps, maxBlock); }
 
-        ~PolyphaseResampler() {
-            if (!base_type::_block_init) { return; }
-            base_type::stop();
-            buffer::free(buffer);
-            freePolyphaseBank(phases);
-        }
-
-        void init(stream<T>* in, int interp, int decim, tap<float> taps) {
+        void init(int interp, int decim, const tap<float>& taps, int maxBlock = STREAM_BUFFER_SIZE) {
             _interp = interp;
             _decim = decim;
-            _taps = taps;
 
-            // Build filter bank
-            phases = buildPolyphaseBank(_interp, _taps);
+            // Build filter bank. The bank is a copy, so the taps are not kept.
+            phases = buildPolyphaseBank(_interp, taps);
 
-            // Allocate delay buffer
-            buffer = buffer::alloc<T>(STREAM_BUFFER_SIZE + 64000);
-            bufStart = &buffer[phases.tapsPerPhase - 1];
-            buffer::clear<T>(buffer, phases.tapsPerPhase - 1);
+            // Delay line: the last tapsPerPhase-1 input samples.
+            hist.init(maxBlock, phases.tapsPerPhase() - 1);
 
-            base_type::init(in);
+            _init = true;
         }
 
-        void setRatio(int interp, int decim, tap<float>& taps) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        // maxBlock defaults to -1, meaning "keep the current delay line". Pass
+        // a value when the caller's own block bound has changed -- a resampler
+        // that sits behind a decimator sees a fraction of the block the owner
+        // was sized for, and the delay line is the expensive part.
+        void setRatio(int interp, int decim, const tap<float>& taps, int maxBlock = -1) {
+            assert(_init);
 
-            // Update settings
+            // Build first, commit second. Committing _interp/_decim up front and
+            // then throwing would leave the new phase arithmetic running against
+            // the old bank, eventually indexing past it.
+            // Held in a local first: the buffer allocation below can throw, and
+            // the old bank must survive that.
+            PolyphaseBank<float> fresh = buildPolyphaseBank(interp, taps);
+
+            // Both acquisitions are strong, and both happen before anything is
+            // committed: a throw here leaves the resampler on its existing bank
+            // and delay line, and `fresh` is released on the way out.
+            // [RATE-SIZED] maxBlock is what the stage in front of this one
+            // emits, not a constant. see doc/design/buffer-size-requirements.md 2.6
+            // The history is discarded (the phase arithmetic restarts), and
+            // resize() reallocates only if the bound or the room changed.
+            hist.resize((maxBlock > 0) ? maxBlock : hist.maxBlock(), fresh.tapsPerPhase() - 1);
+
             _interp = interp;
             _decim = decim;
-            _taps = taps;
+            phases = std::move(fresh);
 
-            // Re-generate polyphase bank
-            freePolyphaseBank(phases);
-            phases = buildPolyphaseBank(_interp, _taps);
-
-            // Reset buffer
-            bufStart = &buffer[phases.tapsPerPhase - 1];
             reset();
-
-            base_type::tempStart();
         }
 
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
-            buffer::clear<T>(buffer, phases.tapsPerPhase - 1);
+            assert(_init);
+            hist.clear();
             phase = 0;
             offset = 0;
-            base_type::tempStart();
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const T* in, T* out) {
             int outCount = 0;
 
-            // Copy input to buffer
-            memcpy(bufStart, in, count * sizeof(T));
+            const T* window = hist.push(in, count);
 
             while (offset < count) {
                 // Do convolution
                 if constexpr (std::is_same_v<T, float>) {
-                    volk_32f_x2_dot_prod_32f(&out[outCount++], &buffer[offset], phases.phases[phase], phases.tapsPerPhase);
+                    volk_32f_x2_dot_prod_32f(&out[outCount++], &window[offset], phases.phase(phase), phases.tapsPerPhase());
                 }
-                if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
-                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&out[outCount++], (lv_32fc_t*)&buffer[offset], phases.phases[phase], phases.tapsPerPhase);
+                else if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
+                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&out[outCount++], (const lv_32fc_t*)&window[offset], phases.phase(phase), phases.tapsPerPhase());
+                }
+                else {
+                    static_assert(dependent_false_v<T>, "Unsupported sample type");
                 }
 
                 // Increment phase
@@ -92,35 +99,21 @@ namespace dsp::multirate {
             }
             offset -= count;
 
-            // Move delay
-            memmove(buffer, &buffer[count], (phases.tapsPerPhase - 1) * sizeof(T));
+            hist.advance(count);
 
             return outCount;
         }
 
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            int outCount = process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            // Swap if some data was generated
-            base_type::_in->flush();
-            if (outCount) {
-                if (!base_type::out.swap(outCount)) { return -1; }
-            }
-            return outCount;
-        }
 
     protected:
+        bool _init = false;
         int _interp;
         int _decim;
-        tap<float> _taps;
         PolyphaseBank<float> phases;
         int phase = 0;
         int offset = 0;
-        T* buffer;
-        T* bufStart;
+        // [ history: tapsPerPhase-1 | block: <= maxBlock ]
+        buffer::HistoryBuffer<T> hist;
 
     };
 }

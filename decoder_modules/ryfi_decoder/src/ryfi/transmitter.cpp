@@ -8,17 +8,9 @@ namespace ryfi {
         framer.setInput(&conv.out);
         resamp.init(&framer.out, baudrate, samplerate);
 
-        rrcTaps = dsp::taps::rootRaisedCosine<float>(511, 0.6, baudrate, samplerate);
-        // Normalize the taps
-        float tot = 0.0f;
-        for (int i = 0; i < rrcTaps.size; i++) {
-            tot += rrcTaps.taps[i];
-        }
-        for (int i = 0; i < rrcTaps.size; i++) {
-            rrcTaps.taps[i] /= tot;
-        }
-
-        rrc.init(&resamp.out, rrcTaps);
+        dsp::tap<float> rrcTaps = dsp::taps::rootRaisedCosine<float>(511, 0.6, baudrate, samplerate);
+        rrcTaps.normalize();
+        rrc.init(&resamp.out, std::move(rrcTaps));
         out = &rrc.out;
     }
 

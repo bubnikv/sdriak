@@ -1,8 +1,17 @@
 #pragma once
 #include <math.h>
+#include <type_traits>
 #include "math/constants.h"
 
 namespace dsp {
+    // Always false, but dependent on its arguments: put
+    // static_assert(dependent_false_v<T>, ...) in the final else of an if constexpr
+    // type dispatch, and it fires only when that branch is instantiated, i.e. for
+    // an unsupported type. A plain static_assert(false) there is ill-formed in
+    // C++17 even in a discarded branch (GCC < 13 and Clang < 17 reject it).
+    template<class...>
+    inline constexpr bool dependent_false_v = false;
+
     struct complex_t {
         complex_t operator*(const float b) const {
             return complex_t{ re * b, im * b };

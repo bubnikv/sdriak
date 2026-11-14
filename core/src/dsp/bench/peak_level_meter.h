@@ -11,12 +11,12 @@ namespace dsp::bench {
         PeakLevelMeter(stream<T>* in) { init(in); }
 
         void init(stream<T>* in) {
-            if constexpr (std::is_same_v<T, float>) {
+            if constexpr (std::is_same_v<T, float>)
                 level = 0.0f;
-            }
-            if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>)
                 level = { 0.0f, 0.0f };
-            }
+            else
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             base_type::init(in);
         }
 
@@ -26,12 +26,12 @@ namespace dsp::bench {
 
         void resetLevel() {
             assert(base_type::_block_init);
-            if constexpr (std::is_same_v<T, float>) {
+            if constexpr (std::is_same_v<T, float>)
                 level = 0.0f;
-            }
-            if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>)
                 level = { 0.0f, 0.0f };
-            }
+            else
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
         }
 
         int process(int count, T* in) {
@@ -40,17 +40,20 @@ namespace dsp::bench {
                     float lvl = fabsf(in[i]);
                     if (lvl > level) { level = lvl; }
                 }
-                if constexpr (std::is_same_v<T, complex_t>) {
+                else if constexpr (std::is_same_v<T, complex_t>) {
                     float lvlre = fabsf(in[i].re);
                     float lvlim = fabsf(in[i].im);
                     if (lvlre > level.re) { level.re = lvlre; }
                     if (lvlim > level.im) { level.im = lvlim; }
                 }
-                if constexpr (std::is_same_v<T, stereo_t>) {
+                else if constexpr (std::is_same_v<T, stereo_t>) {
                     float lvll = fabsf(in[i].l);
                     float lvlr = fabsf(in[i].r);
                     if (lvll > level.l) { level.l = lvll; }
                     if (lvlr > level.r) { level.r = lvlr; }
+                }
+                else {
+                    static_assert(dependent_false_v<T>, "Unsupported sample type");
                 }
             }
             return count;

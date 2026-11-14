@@ -8,80 +8,64 @@ namespace dsp::filter {
     public:
         DecimatingFIR() {}
 
-        DecimatingFIR(stream<D>* in, tap<T>& taps, int decimation) { init(in, taps, decimation); }
+        // Same ownership rules as FIR: an rvalue is adopted, an lvalue borrowed.
+        DecimatingFIR(tap<T>&& taps, int decimation, int maxBlock = STREAM_BUFFER_SIZE) { init(std::move(taps), decimation, maxBlock); }
+        DecimatingFIR(const tap<T>& taps, int decimation, int maxBlock = STREAM_BUFFER_SIZE) { init(taps, decimation, maxBlock); }
 
-        void init(stream<D>* in, tap<T>& taps, int decimation) {
+        void init(tap<T>&& taps, int decimation, int maxBlock = STREAM_BUFFER_SIZE) {
             _decimation = decimation;
-            base_type::init(in, taps);
+            offset = 0;
+            base_type::init(std::move(taps), maxBlock);
         }
 
-        void setTaps(tap<T>& taps) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        void init(const tap<T>& taps, int decimation, int maxBlock = STREAM_BUFFER_SIZE) {
+            _decimation = decimation;
             offset = 0;
-            base_type::setTaps(taps);
-            base_type::tempStart();
+            base_type::init(taps, maxBlock);
         }
 
         void setDecimation(int decimation) {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
             _decimation = decimation;
             offset = 0;
-            base_type::tempStart();
         }
 
-        void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+        void reset() override {
             offset = 0;
             base_type::reset();
-            base_type::tempStart();
         }
 
+        // Same delay line as FIR::process(), but only every _decimation-th
+        // output is computed; offset carries the phase over.
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const D* in, D* out) {
-            // Copy data to work buffer
-            memcpy(base_type::bufStart, in, count * sizeof(D));
+            const TapView<T>& taps = base_type::m_taps;
+            const D* window = base_type::m_hist.push(in, count);
 
             // Do convolution
             int outCount = 0;
             for (; offset < count; offset += _decimation) {
-                if constexpr (std::is_same_v<D, float> && std::is_same_v<T, float>) {
-                    volk_32f_x2_dot_prod_32f(&out[outCount++], &base_type::buffer[offset], base_type::_taps.taps, base_type::_taps.size);
-                }
-                if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, float>) {
-                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&out[outCount++], (lv_32fc_t*)&base_type::buffer[offset], base_type::_taps.taps, base_type::_taps.size);
-                }
-                if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, complex_t>) {
-                    volk_32fc_x2_dot_prod_32fc((lv_32fc_t*)&out[outCount++], (lv_32fc_t*)&base_type::buffer[offset], (lv_32fc_t*)base_type::_taps.taps, base_type::_taps.size);
+                if constexpr (std::is_same_v<D, float> && std::is_same_v<T, float>)
+                    volk_32f_x2_dot_prod_32f(&out[outCount++], &window[offset], taps.taps(), taps.size());
+                else if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, float>)
+                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&out[outCount++], (const lv_32fc_t*)&window[offset], taps.taps(), taps.size());
+                else if constexpr ((std::is_same_v<D, complex_t> || std::is_same_v<D, stereo_t>) && std::is_same_v<T, complex_t>)
+                    volk_32fc_x2_dot_prod_32fc((lv_32fc_t*)&out[outCount++], (const lv_32fc_t*)&window[offset], (const lv_32fc_t*)taps.taps(), taps.size());
+                else {
+                    static_assert(dependent_false_v<D, T>, "Unsupported DecimatingFIR input/output/tap type combination");
                 }
             }
             offset -= count;
 
-            // Move unused data
-            memmove(base_type::buffer, &base_type::buffer[count], (base_type::_taps.size - 1) * sizeof(D));
-
-            return outCount;
-        }
-
-        int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            int outCount = process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            // Swap if some data was generated
-            base_type::_in->flush();
-            if (outCount) {
-                if (!base_type::out.swap(outCount)) { return -1; }
-            }
+            base_type::m_hist.advance(count);
             return outCount;
         }
 
     protected:
+        void applyTaps(TapView<T> taps, int maxBlock) override {
+            offset = 0;
+            base_type::applyTaps(taps, maxBlock);
+        }
+
         int _decimation;
         int offset = 0;
     };

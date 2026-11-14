@@ -23,7 +23,7 @@ public:
         // Init DSP
         vfo->setBandwidthLimits(12500, 12500, true);
         vfo->setSampleRate(16000, 12500);
-        reshape.init(&dummy1, 1600.0, (1600 / 30.0) - 1600.0);
+        reshape.init(&dummy1, 1600.0, (1600 / 30.0) - 1600.0, 1600);
         dataHandler.init(&dummy2, _dataHandler, this);
         diagHandler.init(&reshape.out, _diagHandler, this);
     }

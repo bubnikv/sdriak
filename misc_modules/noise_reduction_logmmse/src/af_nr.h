@@ -34,9 +34,10 @@ namespace dsp {
 
         float scaled = 32767.0;      // amplitude shaper
 
+        // IN-PLACE: safe (readBuf == writeBuf).
         void process(stereo_t *readBuf, int count, stereo_t *writeBuf, int &wrote) {
             if (!allowed || failed) {
-                std::copy(readBuf, readBuf+count, writeBuf);
+                if (writeBuf != readBuf) { std::copy(readBuf, readBuf+count, writeBuf); }
                 wrote = count;
                 buffer.clear();
                 return;

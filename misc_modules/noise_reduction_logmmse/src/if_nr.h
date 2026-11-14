@@ -47,19 +47,21 @@ namespace dsp {
             disableCpuDeactivation = disable;
         }
 
-        bool shouldReset = true;
+        // Set from the retune handler (UI / rigctl thread) and doStart();
+        // consumed by process() on the DSP thread.
+        std::atomic<bool> shouldReset{ true };
         void reset() {
             shouldReset = true;
         }
 
+        // IN-PLACE: safe (in == out).
         void process(complex_t* in, int count, complex_t* out, int& outCount) {
             // Detect sample rate / decimation changes: the noise profile is
             // only valid for the rate it was sampled at.
             int curFreq = (int)sigpath::iqFrontEnd.getSampleRate();
             if (curFreq != freq) { shouldReset = true; }
-            if (shouldReset) {
+            if (shouldReset.exchange(false)) {
                 flog::debug("Resetting IF NR LogMMSE");
-                shouldReset = false;
                 worker1c.clear();
                 params.reset();
                 freq = curFreq;

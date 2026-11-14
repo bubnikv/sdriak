@@ -1,4 +1,6 @@
 #pragma once
+#include <cmath>
+#include <algorithm>
 #include "quadrature.h"
 #include "../taps/low_pass.h"
 #include "../taps/band_pass.h"
@@ -25,42 +27,73 @@ namespace dsp::demod {
         ~BroadcastFM() {
             if (!base_type::_block_init) { return; }
             base_type::stop();
-            buffer::free(lmr);
-            buffer::free(l);
-            buffer::free(r);
-            taps::free(pilotFirTaps);
-            taps::free(audioFirTaps);
         }
 
-        virtual void init(stream<complex_t>* in, double deviation, double samplerate, bool stereo = true, bool lowPass = true, bool rdsOut = false) {
+        // The RDS branch runs at RDS_SAMPLERATE, not at `samplerate`, so
+        // everything downstream of rdsResamp is sized for that -- see
+        // getRDSMaxBlock(). At the usual 250 kHz IF that is a 50:1 reduction.
+        static constexpr double RDS_SAMPLERATE = 5000.0;
+
+        // Largest block the RDS output can carry, for a given input bound.
+        // Deliberately not clamped to maxBlock: if someone configures an input
+        // rate below RDS_SAMPLERATE the branch interpolates, and under-sizing
+        // it would overflow rather than merely waste.
+        // [RATE-SIZED] ASSUMED ratio: RDS_SAMPLERATE / samplerate. This bound
+        // leaves the object -- getRDSMaxBlock() hands it to RDSDemod, which
+        // sizes its own streams and buffers from it -- so an error here
+        // propagates across a module boundary. see doc/design/buffer-size-requirements.md 2.6
+        static int rdsBlockFor(int maxBlock, double samplerate) {
+            if (!(samplerate > 0.0) || maxBlock <= 0) { return maxBlock; }
+            // + 64 for the resampler's retained phase state, which can emit one
+            // extra sample beyond the flat ratio on any given block.
+            double n = std::ceil((double)maxBlock * RDS_SAMPLERATE / samplerate) + 64.0;
+            return (int)(std::max)(1.0, n);
+        }
+
+        // Valid after init(). Hand this to whatever consumes rdsOut.
+        int getRDSMaxBlock() const { return _rdsMaxBlock; }
+
+        virtual void init(stream<complex_t>* in, double deviation, double samplerate, bool stereo = true, bool lowPass = true, bool rdsOut = false, int maxBlock = STREAM_BUFFER_SIZE) {
+            _maxBlock = maxBlock;
             _deviation = deviation;
             _samplerate = samplerate;
             _stereo = stereo;
             _lowPass = lowPass;
             _rdsOut = rdsOut;
             
-            demod.init(NULL, _deviation, _samplerate);
-            pilotFirTaps = taps::bandPass<complex_t>(18750.0, 19250.0, 3000.0, _samplerate, true);
-            pilotFir.init(NULL, pilotFirTaps);
-            rtoc.init(NULL);
-            pilotPLL.init(NULL, 25000.0 / _samplerate, 0.0, math::hzToRads(19000.0, _samplerate), math::hzToRads(18750.0, _samplerate), math::hzToRads(19250.0, _samplerate));
-            lprDelay.init(NULL, ((pilotFirTaps.size - 1) / 2) + 1);
-            lmrDelay.init(NULL, ((pilotFirTaps.size - 1) / 2) + 1);
-            audioFirTaps = taps::lowPass(15000.0, 4000.0, _samplerate);
-            alFir.init(NULL, audioFirTaps);
-            arFir.init(NULL, audioFirTaps);
-            xlator.init(NULL, -57000.0, samplerate);
-            rdsResamp.init(NULL, samplerate, 5000.0);
+            // Every sub-block below is *fused*: it is never start()ed and never
+            // swap()ed, process() calls it inline. So none of them needs a
+            // dsp::stream -- two buffers plus two mutexes and two condition
+            // variables for handing data to a thread that does not exist. They
+            // get a plain scratch buffer and an explicit block bound instead.
+            demod.init(_deviation, _samplerate);
+            pilotFir.init(taps::bandPass<complex_t>(18750.0, 19250.0, 3000.0, _samplerate, true), _maxBlock);
+            rtoc.init();
+            pilotPLL.init(25000.0 / _samplerate, 0.0, math::hzToRads(19000.0, _samplerate), math::hzToRads(18750.0, _samplerate), math::hzToRads(19250.0, _samplerate));
+            lprDelay.init(((pilotFir.tapCount() - 1) / 2) + 1, _maxBlock);
+            lmrDelay.init(((pilotFir.tapCount() - 1) / 2) + 1, _maxBlock);
+            // Both channels use one tap set: alFir owns it, arFir borrows it.
+            alFir.init(taps::lowPass(15000.0, 4000.0, _samplerate), _maxBlock);
+            arFir.init(alFir.ownedTaps(), _maxBlock);
+            xlator.init(-57000.0, samplerate);
+            rdsResamp.init(samplerate, RDS_SAMPLERATE, _maxBlock);
 
-            lmr = buffer::alloc<float>(STREAM_BUFFER_SIZE);
-            l = buffer::alloc<float>(STREAM_BUFFER_SIZE);
-            r = buffer::alloc<float>(STREAM_BUFFER_SIZE);
+            // [RATE-SIZED] rdsOut is no longer STREAM_BUFFER_SIZE; it holds
+            // ~1/50 of a block at the usual 250 kHz IF. Nothing is started yet,
+            // so no reader can hold the old buffer. see doc/design/buffer-size-requirements.md 2.6
+            _rdsMaxBlock = rdsBlockFor(_maxBlock, samplerate);
+            // this-> because init()'s `bool rdsOut` parameter shadows the
+            // stream member of the same name.
+            this->rdsOut.setBufferSize(_rdsMaxBlock);
 
-            lprDelay.out.free();
-            arFir.out.free();
-            alFir.out.free();
-            xlator.out.free();
-            rdsResamp.out.free();
+            // Scratch for the fused stages. Every stage that can runs in place
+            // on a buffer owned by an earlier one; see process() for who holds
+            // what when.
+            demodOut.allocate(_maxBlock);
+            rtocOut.allocate(_maxBlock);
+            pilotOut.allocate(_maxBlock);
+            lmr.allocate(_maxBlock);
+            l.allocate(_maxBlock);
 
             base_type::init(in);
         }
@@ -75,62 +108,72 @@ namespace dsp::demod {
         void setSamplerate(double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _samplerate = samplerate;
 
             demod.setDeviation(_deviation, _samplerate);
-            taps::free(pilotFirTaps);
-            pilotFirTaps = taps::bandPass<complex_t>(18750.0, 19250.0, 3000.0, samplerate, true);
-            pilotFir.setTaps(pilotFirTaps);
+            pilotFir.setTaps(taps::bandPass<complex_t>(18750.0, 19250.0, 3000.0, samplerate, true));
             
             pilotPLL.setFrequencyLimits(math::hzToRads(18750.0, _samplerate), math::hzToRads(19250.0, _samplerate));
             pilotPLL.setInitialFreq(math::hzToRads(19000.0, _samplerate));
-            lprDelay.setDelay(((pilotFirTaps.size - 1) / 2) + 1);
-            lmrDelay.setDelay(((pilotFirTaps.size - 1) / 2) + 1);
+            lprDelay.setDelay(((pilotFir.tapCount() - 1) / 2) + 1);
+            lmrDelay.setDelay(((pilotFir.tapCount() - 1) / 2) + 1);
 
-            taps::free(audioFirTaps);
-            audioFirTaps = taps::lowPass(15000.0, 4000.0, _samplerate);
-            alFir.setTaps(audioFirTaps);
-            arFir.setTaps(audioFirTaps);
+            // arFir points at the set alFir has just freed until it is
+            // re-pointed on the next line; the worker is stopped meanwhile.
+            alFir.setTaps(taps::lowPass(15000.0, 4000.0, _samplerate));
+            arFir.setTaps(alFir.ownedTaps());
 
             xlator.setOffset(-57000.0, samplerate);
             rdsResamp.setInSamplerate(samplerate);
 
+            // Keep the RDS branch sized for the new rate; a lower IF rate
+            // means *more* RDS samples per block.
+            //
+            // PRECONDITION: the caller must have stopped whatever consumes
+            // rdsOut. TempStop above stops this block, not the reader, and
+            // setBufferSize() frees the buffer that reader may still hold.
+            // Grow-only, so a rate that needs less keeps the larger buffer
+            // until the next init() -- memory, never correctness. (No caller
+            // today: WFM's IF rate is the constant 250 kHz.)
+            // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
+            int wanted = rdsBlockFor(_maxBlock, samplerate);
+            if (wanted > _rdsMaxBlock) {
+                _rdsMaxBlock = wanted;
+                rdsOut.setBufferSize(_rdsMaxBlock);
+            }
+
             reset();
-            base_type::tempStart();
         }
 
         void setStereo(bool stereo) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _stereo = stereo;
             reset();
-            base_type::tempStart();
         }
 
         void setLowPass(bool lowPass) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _lowPass = lowPass;
             reset();
-            base_type::tempStart();
         }
 
         void setRDSOut(bool rdsOut) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _rdsOut = rdsOut;
             reset();
-            base_type::tempStart();
         }
 
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             demod.reset();
             pilotFir.reset();
             pilotPLL.reset();
@@ -138,47 +181,57 @@ namespace dsp::demod {
             lmrDelay.reset();
             alFir.reset();
             arFir.reset();
-            base_type::tempStart();
         }
 
         inline int process(int count, complex_t* in, stereo_t* out, int& rdsOutCount, complex_t* rdsout = NULL) {
             // Demodulate
-            demod.process(count, in, demod.out.writeBuf);
+            demod.process(count, in, demodOut);
             if (_stereo) {
+                // Two complex buffers carry the whole stereo path:
+                //   rtocOut  -- the MPX as complex, later delayed and mixed
+                //               down in place into L-R
+                //   pilotOut -- first the RDS branch's translated copy, then
+                //               the filtered pilot and the PLL reference
+                // The RDS branch runs first so that rtocOut is still the
+                // undelayed MPX and pilotOut is still free. The stages keep
+                // their own state, so the order within a block changes nothing.
+
                 // Convert to complex
-                rtoc.process(count, demod.out.writeBuf, rtoc.out.writeBuf);
-
-                // Filter out pilot and run through PLL
-                pilotFir.process(count, rtoc.out.writeBuf, pilotFir.out.writeBuf);
-                pilotPLL.process(count, pilotFir.out.writeBuf, pilotPLL.out.writeBuf);
-
-                // Delay
-                lprDelay.process(count, demod.out.writeBuf, demod.out.writeBuf);
-                lmrDelay.process(count, rtoc.out.writeBuf, lmrDelay.out.writeBuf);
-                
-                // conjugate PLL output to down convert twice the L-R signal
-                math::Conjugate::process(count, pilotPLL.out.writeBuf, pilotPLL.out.writeBuf);
-                math::Multiply<dsp::complex_t>::process(count, lmrDelay.out.writeBuf, pilotPLL.out.writeBuf, lmrDelay.out.writeBuf);
-                math::Multiply<dsp::complex_t>::process(count, lmrDelay.out.writeBuf, pilotPLL.out.writeBuf, lmrDelay.out.writeBuf);
+                rtoc.process(count, demodOut, rtocOut);
 
                 // Do RDS demod
                 if (_rdsOut) {
                     // Translate to 0Hz
-                    xlator.process(count, rtoc.out.writeBuf, rtoc.out.writeBuf);
+                    xlator.process(count, rtocOut, pilotOut);
 
                     // Resample to the output samplerate
-                    rdsOutCount = rdsResamp.process(count, rtoc.out.writeBuf, rdsout);
+                    rdsOutCount = rdsResamp.process(count, pilotOut, rdsout);
                 }
 
+                // Filter out pilot and run through PLL
+                pilotFir.process(count, rtocOut, pilotOut);
+                pilotPLL.process(count, pilotOut, pilotOut);
+
+                // Delay
+                lprDelay.process(count, demodOut, demodOut);
+                lmrDelay.process(count, rtocOut, rtocOut);
+
+                // conjugate PLL output to down convert twice the L-R signal
+                math::Conjugate::process(count, pilotOut, pilotOut);
+                math::Multiply<dsp::complex_t>::process(count, rtocOut, pilotOut, rtocOut);
+                math::Multiply<dsp::complex_t>::process(count, rtocOut, pilotOut, rtocOut);
+
                 // Convert output back to real for further processing
-                convert::ComplexToReal::process(count, lmrDelay.out.writeBuf, lmr);
+                convert::ComplexToReal::process(count, rtocOut, lmr);
 
                 // Amplify by 2x
                 volk_32f_s32f_multiply_32f(lmr, lmr, 2.0f, count);
 
-                // Do L = (L+R) + (L-R), R = (L+R) - (L-R)
-                math::Add<float>::process(count, demod.out.writeBuf, lmr, l);
-                math::Subtract<float>::process(count, demod.out.writeBuf, lmr, r);
+                // Do L = (L+R) + (L-R), R = (L+R) - (L-R). R overwrites L-R,
+                // which is no longer needed once L has been formed.
+                math::Add<float>::process(count, demodOut, lmr, l);
+                math::Subtract<float>::process(count, demodOut, lmr, lmr);
+                float* r = lmr;
 
                 // Filter if needed
                 if (_lowPass) {
@@ -193,22 +246,22 @@ namespace dsp::demod {
                 // Process RDS if needed. Note: find a way to not have to copy half the code from the stereo demod
                 if (_rdsOut) {
                     // Convert to complex
-                    rtoc.process(count, demod.out.writeBuf, rtoc.out.writeBuf);
+                    rtoc.process(count, demodOut, rtocOut);
 
                     // Translate to 0Hz
-                    xlator.process(count, rtoc.out.writeBuf, rtoc.out.writeBuf);
+                    xlator.process(count, rtocOut, rtocOut);
 
                     // Resample to the output samplerate
-                    rdsOutCount = rdsResamp.process(count, rtoc.out.writeBuf, rdsout);
+                    rdsOutCount = rdsResamp.process(count, rtocOut, rdsout);
                 }
 
                 // Filter if needed
                 if (_lowPass) {
-                    alFir.process(count, demod.out.writeBuf, demod.out.writeBuf);
+                    alFir.process(count, demodOut, demodOut);
                 }
 
                 // Interleave raw MPX to stereo
-                convert::LRToStereo::process(count, demod.out.writeBuf, demod.out.writeBuf, out);
+                convert::LRToStereo::process(count, demodOut, demodOut, out);
             }
 
             return count;
@@ -232,6 +285,8 @@ namespace dsp::demod {
         stream<complex_t> rdsOut;
 
     protected:
+        int _maxBlock = STREAM_BUFFER_SIZE;
+        int _rdsMaxBlock = STREAM_BUFFER_SIZE;
         double _deviation;
         double _samplerate;
         bool _stereo;
@@ -239,21 +294,25 @@ namespace dsp::demod {
         bool _rdsOut;
 
         Quadrature demod;
-        tap<complex_t> pilotFirTaps;
         filter::FIR<complex_t, complex_t> pilotFir;
         convert::RealToComplex rtoc;
         channel::FrequencyXlator xlator;
         loop::PLL pilotPLL;
         math::Delay<float> lprDelay;
         math::Delay<complex_t> lmrDelay;
-        tap<float> audioFirTaps;
-        filter::FIR<float, float> arFir;
+        // alFir owns the audio taps and arFir borrows them, so alFir is
+        // declared first and outlives it.
         filter::FIR<float, float> alFir;
+        filter::FIR<float, float> arFir;
         multirate::RationalResampler<dsp::complex_t> rdsResamp;
 
-        float* lmr;
-        float* l;
-        float* r;
+        // Scratch for the fused stages, in place of their (unused) out streams.
+        buffer::Buffer<float> demodOut;
+        buffer::Buffer<complex_t> rtocOut;   // MPX as complex, then L-R in place
+        buffer::Buffer<complex_t> pilotOut;  // RDS translate, then pilot / PLL reference
+
+        buffer::Buffer<float> lmr;           // L-R, then R in place
+        buffer::Buffer<float> l;
         
     };
 }

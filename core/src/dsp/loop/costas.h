@@ -10,10 +10,11 @@ namespace dsp::loop {
     public:
         Costas() {}
 
-        Costas(stream<complex_t>* in, double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
-            base_type::init(in, bandwidth, initFreq, initPhase, minFreq, maxFreq);
+        Costas(double bandwidth, double initPhase = 0.0, double initFreq = 0.0, double minFreq = -FL_M_PI, double maxFreq = FL_M_PI) {
+            base_type::init(bandwidth, initPhase, initFreq, minFreq, maxFreq);
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, complex_t* in, complex_t* out) {
             for (int i = 0; i < count; i++) {
                 out[i] = in[i] * math::phasor(-pcl.phase);
@@ -28,10 +29,10 @@ namespace dsp::loop {
             if constexpr (ORDER == 2) {
                 err = val.re * val.im;
             }
-            if constexpr (ORDER == 4) {
+            else if constexpr (ORDER == 4) {
                 err = (math::step(val.re) * val.im) - (math::step(val.im) * val.re);
             }
-            if constexpr (ORDER == 8) {
+            else if constexpr (ORDER == 8) {
                 // The way this works is it compresses order 4 constellations into the quadrants
                 const float K = sqrtf(2.0) - 1.0;
                 if (fabsf(val.re) >= fabsf(val.im)) {
@@ -40,6 +41,9 @@ namespace dsp::loop {
                 else {
                     err = (math::step(val.re) * val.im * K) - (math::step(val.im) * val.re);
                 }
+            }
+            else {
+                static_assert(dependent_false_v<std::integral_constant<int, ORDER>>, "Unsupported Costas loop order");
             }
             return std::clamp<float>(err, -1.0f, 1.0f);
         }

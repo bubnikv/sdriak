@@ -57,6 +57,7 @@ short Datablock_Read::Initial(int MaxDataLen) {
 	return 0;
 }
 
+// IN-PLACE: safe (pInBuffer == pOutBuffer).
 short Datablock_Read::Data_procese(short* pInBuffer, short* pOutBuffer,int read_length,int& Out_Length){
 	if (m_derr_code < 0) return m_derr_code;
 	if (pInBuffer == NULL)return -50;

@@ -61,7 +61,7 @@ public:
         // Initialize DSP here
         decoder.init(vfo->output, INPUT_SAMPLE_RATE);
 
-        reshape.init(decoder.diagOut, 480, 0);
+        reshape.init(decoder.diagOut, 480, 0, 480);
         diagHandler.init(&reshape.out, _diagHandler, this);
 
         // Start DSO Here

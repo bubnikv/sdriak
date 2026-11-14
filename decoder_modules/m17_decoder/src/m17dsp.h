@@ -1,4 +1,5 @@
 #pragma once
+#include <dsp/buffer/history_buffer.h>
 #include <dsp/block.h>
 #include <dsp/hier_block.h>
 #include <dsp/sink/null_sink.h>
@@ -109,11 +110,10 @@ namespace dsp {
         void setInput(stream<float>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -148,13 +148,12 @@ namespace dsp {
         ~M17FrameDemux() {
             if (!block::_block_init) { return; }
             block::stop();
-            delete[] delay;
         }
 
         void init(stream<uint8_t>* in) {
             _in = in;
 
-            delay = new uint8_t[STREAM_BUFFER_SIZE];
+            delay.init(STREAM_BUFFER_SIZE, M17_SYNC_SIZE);
 
             block::registerInput(_in);
             block::registerOutput(&linkSetupOut);
@@ -167,18 +166,17 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
             int count = _in->read();
             if (count < 0) { return -1; }
 
-            memcpy(&delay[M17_SYNC_SIZE], _in->readBuf, count);
+            const uint8_t* window = delay.push(_in->readBuf, count);
 
             for (int i = 0; i < count;) {
                 if (detect) {
@@ -190,16 +188,16 @@ namespace dsp {
                         int id = M17_INTERLEAVER[outCount - M17_SYNC_SIZE];
 
                         if (type == 0) {
-                            linkSetupOut.writeBuf[id] = delay[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE];
+                            linkSetupOut.writeBuf[id] = window[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE];
                         }
                         else if ((type == 1 || type == 2) && id < M17_LICH_SIZE) {
-                            lichOut.writeBuf[id] = delay[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE];
+                            lichOut.writeBuf[id] = window[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE];
                         }
                         else if (type == 1) {
-                            streamOut.writeBuf[id - M17_LICH_SIZE] = (delay[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE]);
+                            streamOut.writeBuf[id - M17_LICH_SIZE] = (window[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE]);
                         }
                         else if (type == 2) {
-                            packetOut.writeBuf[id - M17_LICH_SIZE] = (delay[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE]);
+                            packetOut.writeBuf[id - M17_LICH_SIZE] = (window[i++] ^ M17_SCRAMBLER[outCount - M17_SYNC_SIZE]);
                         }
 
                         outCount++;
@@ -223,7 +221,7 @@ namespace dsp {
                 }
 
                 // Check for link setup syncword
-                if (!memcmp(&delay[i], M17_LSF_SYNC, M17_SYNC_SIZE)) {
+                if (!memcmp(&window[i], M17_LSF_SYNC, M17_SYNC_SIZE)) {
                     detect = true;
                     outCount = 0;
                     type = 0;
@@ -232,7 +230,7 @@ namespace dsp {
                 }
 
                 // Check for stream syncword
-                if (!memcmp(&delay[i], M17_STF_SYNC, M17_SYNC_SIZE)) {
+                if (!memcmp(&window[i], M17_STF_SYNC, M17_SYNC_SIZE)) {
                     detect = true;
                     outCount = 0;
                     type = 1;
@@ -241,7 +239,7 @@ namespace dsp {
                 }
 
                 // Check for packet syncword
-                if (!memcmp(&delay[i], M17_PKF_SYNC, M17_SYNC_SIZE)) {
+                if (!memcmp(&window[i], M17_PKF_SYNC, M17_SYNC_SIZE)) {
                     detect = true;
                     outCount = 0;
                     type = 2;
@@ -252,7 +250,7 @@ namespace dsp {
                 i++;
             }
 
-            memmove(delay, &delay[count], 16);
+            delay.advance(count);
 
             _in->flush();
 
@@ -267,7 +265,8 @@ namespace dsp {
     private:
         stream<uint8_t>* _in;
 
-        uint8_t* delay;
+        // history: M17_SYNC_SIZE + block <= STREAM_BUFFER_SIZE ]
+        dsp::buffer::HistoryBuffer<uint8_t> delay;
 
         bool detect = false;
         int type;
@@ -301,11 +300,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -378,11 +376,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {
@@ -458,11 +455,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         bool isReceiving() {
@@ -556,11 +552,10 @@ namespace dsp {
         void setInput(stream<uint8_t>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         int run() {

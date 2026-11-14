@@ -1,7 +1,8 @@
 #pragma once
 #include <dsp/processor.h>
 #include <utils/flog.h>
-#include <fftw3.h>
+#include <dsp/buffer/fftw.h>
+#include <dsp/buffer/history_buffer.h>
 #include "dab_phase_sym.h"
 
 namespace dab {
@@ -13,21 +14,26 @@ namespace dab {
         // TODO: The default AGC rate is probably way too fast, plot out the avgCorr to see how much it moves
         CyclicSync(dsp::stream<dsp::complex_t>* in, double symbolLength, double cyclicPrefixLength, double samplerate, float agcRate = 1e-3) { init(in, symbolLength, cyclicPrefixLength, samplerate, agcRate); }
 
+        ~CyclicSync() {
+            // The buffers below are members of this class, destroyed before
+            // ~block() joins the worker, so the thread has to be stopped here.
+            if (!base_type::_block_init) { return; }
+            base_type::stop();
+        }
+
         void init(dsp::stream<dsp::complex_t>* in, double symbolLength, double cyclicPrefixLength, double samplerate, float agcRate = 1e-3) {
             // Computer the number of samples for the symbol and its cyclic prefix
             symbolSamps = round(samplerate * symbolLength);
             prefixSamps = round(samplerate * cyclicPrefixLength);
 
-            // Allocate and clear the delay buffer
-            delayBuf = dsp::buffer::alloc<dsp::complex_t>(STREAM_BUFFER_SIZE + 64000);
-            dsp::buffer::clear(delayBuf, symbolSamps);
+            // Delay line: the last symbolSamps samples, so each sample can be
+            // correlated with the one a symbol earlier. The input is a stream
+            // block, bounded by STREAM_BUFFER_SIZE.
+            delayBuf.init(STREAM_BUFFER_SIZE, symbolSamps);
 
             // Allocate and clear the history buffer
-            histBuf = dsp::buffer::alloc<dsp::complex_t>(prefixSamps);
-            dsp::buffer::clear(histBuf, prefixSamps);
-
-            // Compute the delay input addresses
-            delayBufInput = &delayBuf[symbolSamps];
+            histBuf.allocate(prefixSamps);
+            dsp::buffer::clear<dsp::complex_t>(histBuf, prefixSamps);
 
             // Compute the correlation AGC configuration
             this->agcRate = agcRate;
@@ -39,17 +45,16 @@ namespace dab {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             
-            base_type::tempStart();
         }
 
         int run() {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
-            // Copy the data into the normal delay buffer
-            memcpy(delayBufInput, base_type::_in->readBuf, count * sizeof(dsp::complex_t));
+            // Copy the data into the delay line
+            const dsp::complex_t* window = delayBuf.push(base_type::_in->readBuf, count);
 
             // Flush the input stream
             base_type::_in->flush();
@@ -66,8 +71,8 @@ namespace dab {
                 corr -= *slot;
 
                 // Save input value and compute the new prodct
-                dsp::complex_t val = delayBuf[i];
-                dsp::complex_t prod = val.conj()*delayBuf[i+symbolSamps];
+                dsp::complex_t val = window[i];
+                dsp::complex_t prod = val.conj()*window[i+symbolSamps];
 
                 // Add the new value to the correlation
                 *slot = prod;
@@ -109,8 +114,7 @@ namespace dab {
                 avgCorr = agcRate*rcorr + agcRateInv*avgCorr;
             }
 
-            // Move unused data
-            memmove(delayBuf, &delayBuf[count], symbolSamps * sizeof(dsp::complex_t));
+            delayBuf.advance(count);
 
             return count;
         }
@@ -120,10 +124,10 @@ namespace dab {
         int prefixSamps;
 
         int histId = 0;
-        dsp::complex_t* histBuf;
+        dsp::buffer::Buffer<dsp::complex_t> histBuf;
 
-        dsp::complex_t* delayBuf;
-        dsp::complex_t* delayBufInput;
+        // history: symbolSamps + block <= STREAM_BUFFER_SIZE
+        dsp::buffer::HistoryBuffer<dsp::complex_t> delayBuf;
 
         dsp::complex_t corr = { 0.0f, 0.0f };
 
@@ -146,18 +150,26 @@ namespace dab {
 
         FrameFreqSync(dsp::stream<dsp::complex_t>* in, float agcRate = 0.01f) { init(in, agcRate); }
 
+        ~FrameFreqSync() {
+            // The owners below are destroyed before ~block() runs, so the
+            // worker must be joined here; they then release everything,
+            // including after an init() that threw part-way.
+            if (!base_type::_block_init) { return; }
+            base_type::stop();
+        }
+
         void init(dsp::stream<dsp::complex_t>* in, float agcRate = 0.01f) {
             // Allocate buffers
-            amps = dsp::buffer::alloc<float>(2048);
-            conjRef = dsp::buffer::alloc<dsp::complex_t>(2048);
-            corrIn = (dsp::complex_t*)fftwf_alloc_complex(2048);
-            corrOut = (dsp::complex_t*)fftwf_alloc_complex(2048);
+            amps.allocate(2048);
+            conjRef.allocate(2048);
+            corrIn.allocate(2048);
+            corrOut.allocate(2048);
 
             // Copy the phase reference
             memcpy(conjRef, DAB_PHASE_SYM_CONJ, 2048 * sizeof(dsp::complex_t));
 
             // Plan the FFT computation
-            plan = fftwf_plan_dft_1d(2048, (fftwf_complex*)corrIn, (fftwf_complex*)corrOut, FFTW_FORWARD, FFTW_ESTIMATE);
+            plan.planDFT1D(2048, (fftwf_complex*)corrIn.get(), (fftwf_complex*)corrOut.get(), FFTW_FORWARD);
 
             // Compute the correlation AGC configuration
             this->agcRate = agcRate;
@@ -169,9 +181,8 @@ namespace dab {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             
-            base_type::tempStart();
         }
 
         int run() {
@@ -213,9 +224,9 @@ namespace dab {
             // Handle phase reference
             if (sym == 1) {
                 // Output the symbols (DEBUG ONLY)
-                memcpy(corrIn, _in->readBuf, 2048 * sizeof(dsp::complex_t));
+                memcpy(corrIn.get(), _in->readBuf, 2048 * sizeof(dsp::complex_t));
                 fftwf_execute(plan);
-                volk_32fc_magnitude_32f(amps, (lv_32fc_t*)corrOut, 2048);
+                volk_32fc_magnitude_32f(amps, (lv_32fc_t*)corrOut.get(), 2048);
                 int outCount = 0;
                 dsp::complex_t pi4 = { cos(3.1415926535*0.25), sin(3.1415926535*0.25) };
                 for (int i = -767; i < 768; i++) {
@@ -227,13 +238,13 @@ namespace dab {
                 out.swap(outCount);
 
                 // Multiply the samples with the conjugated phase reference signal
-                volk_32fc_x2_multiply_32fc((lv_32fc_t*)corrIn, (lv_32fc_t*)_in->readBuf, (lv_32fc_t*)conjRef, 2048);
+                volk_32fc_x2_multiply_32fc((lv_32fc_t*)corrIn.get(), (lv_32fc_t*)_in->readBuf, (lv_32fc_t*)conjRef.get(), 2048);
             
                 // Compute the FFT of the product
                 fftwf_execute(plan);
 
                 // Compute the amplitude of the bins
-                volk_32fc_magnitude_32f(amps, (lv_32fc_t*)corrOut, 2048);
+                volk_32fc_magnitude_32f(amps, (lv_32fc_t*)corrOut.get(), 2048);
 
                 // Locate highest power bin
                 uint32_t peakId;
@@ -263,12 +274,12 @@ namespace dab {
         }
 
     protected:
-        fftwf_plan plan;
+        dsp::buffer::FFTWPlan plan;
 
-        float* amps;
-        dsp::complex_t* conjRef;
-        dsp::complex_t* corrIn;
-        dsp::complex_t* corrOut;
+        dsp::buffer::Buffer<float> amps;
+        dsp::buffer::Buffer<dsp::complex_t> conjRef;
+        dsp::buffer::FFTWBuffer<dsp::complex_t> corrIn;
+        dsp::buffer::FFTWBuffer<dsp::complex_t> corrOut;
 
         int sym;
         float offset = 0.0f;

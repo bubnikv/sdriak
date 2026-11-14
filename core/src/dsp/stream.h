@@ -26,8 +26,17 @@ namespace dsp {
     class stream : public untyped_stream {
     public:
         stream() {
+            // alloc() throws on OOM. Release the first buffer if the second
+            // fails, otherwise it leaks: a throwing constructor gets no
+            // destructor call, and we are already at the memory ceiling here.
             writeBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
-            readBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
+            try {
+                readBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
+            }
+            catch (...) {
+                buffer::free(writeBuf);
+                throw;
+            }
         }
 
         virtual ~stream() {
@@ -35,10 +44,23 @@ namespace dsp {
         }
 
         virtual void setBufferSize(int samples) {
+            // Allocate both replacements before releasing anything, so a
+            // failure leaves the stream on its existing buffers rather than
+            // empty or half-sized. Costs a transient 2x, which is acceptable:
+            // this is only called once at init time, never on a hot path.
+            T* newWrite = buffer::alloc<T>(samples);
+            T* newRead = NULL;
+            try {
+                newRead = buffer::alloc<T>(samples);
+            }
+            catch (...) {
+                buffer::free(newWrite);
+                throw;
+            }
             buffer::free(writeBuf);
             buffer::free(readBuf);
-            writeBuf = buffer::alloc<T>(samples);
-            readBuf = buffer::alloc<T>(samples);
+            writeBuf = newWrite;
+            readBuf = newRead;
         }
 
         virtual inline bool swap(int size) {

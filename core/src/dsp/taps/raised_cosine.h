@@ -16,10 +16,10 @@ namespace dsp::taps {
         for (int i = 0; i < count; i++) {
             double t = (double)i - half + 0.5;
             if (t == limit || t == -limit) {
-                taps.taps[i] = math::sinc(1.0 / (2.0*beta)) * DB_M_PI / (4.0*Ts);
+                taps[i] = math::sinc(1.0 / (2.0*beta)) * DB_M_PI / (4.0*Ts);
             }
             else {
-                taps.taps[i] = math::sinc(t / Ts) * DB_M_PI / (4.0*Ts);
+                taps[i] = math::sinc(t / Ts) * DB_M_PI / (4.0*Ts);
             }
         }
 

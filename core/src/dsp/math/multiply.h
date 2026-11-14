@@ -10,6 +10,9 @@ namespace dsp::math {
 
         Multiply(stream<T>* a, stream<T>* b) { base_type::init(a, b); }
 
+        // IN-PLACE: safe in practice (out == a and/or out == b). Element-wise
+        // VOLK kernel; GNU Radio relies on that, but VOLK does not document it
+        // as a guarantee.
         inline static int process(int count, const T* a, const T* b, T* out) {
             if constexpr (std::is_same_v<T, complex_t>) {
                 volk_32fc_x2_multiply_32fc((lv_32fc_t*)out, (lv_32fc_t*)a, (lv_32fc_t*)b, count);

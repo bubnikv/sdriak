@@ -5,7 +5,7 @@
 namespace vor {
     Decoder::Decoder(dsp::stream<dsp::complex_t>* in, double integrationTime) {
         rx.init(in);
-        reshape.init(&rx.out, round(1000.0 * integrationTime), 0);
+        reshape.init(&rx.out, round(1000.0 * integrationTime), 0, round(1000.0 * integrationTime));
         symSink.init(&reshape.out, dataHandler, this);
     }
 

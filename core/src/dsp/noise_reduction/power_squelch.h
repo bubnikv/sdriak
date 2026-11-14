@@ -1,5 +1,6 @@
 #pragma once
 // Hysteresis, unmute hold and dB level math adapted from the SDRPP fork by qrp73 (https://github.com/qrp73/SDRPP).
+#include <algorithm>
 #include "../processor.h"
 
 // TODO: Rewrite better!!!!!
@@ -14,14 +15,11 @@ namespace dsp::noise_reduction {
         ~PowerSquelch() {
             if (!base_type::_block_init) { return; }
             base_type::stop();
-            buffer::free(normBuffer);
         }
 
         void init(stream<complex_t>* in, double level) {
             _level = level;
             updateHoldSamples();
-
-            normBuffer = buffer::alloc<float>(STREAM_BUFFER_SIZE);
 
             base_type::init(in);
         }
@@ -39,13 +37,20 @@ namespace dsp::noise_reduction {
             updateHoldSamples();
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const complex_t* in, complex_t* out) {
-            // Compute the amplitude of each sample
-            volk_32fc_magnitude_32f(normBuffer, (lv_32fc_t*)in, count);
-
-            // Compute the mean amplitude
+            // Compute the mean amplitude. The magnitudes are only summed, so
+            // they go through a small stack chunk rather than a block-sized
+            // buffer; `out` cannot serve as scratch, since it may be `in`.
+            alignas(64) float norm[NORM_CHUNK];
             float sum = 0.0f;
-            volk_32f_accumulator_s32f(&sum, normBuffer, count);
+            for (int i = 0; i < count; i += NORM_CHUNK) {
+                int n = (std::min)(NORM_CHUNK, count - i);
+                volk_32fc_magnitude_32f(norm, (const lv_32fc_t*)&in[i], n);
+                float part = 0.0f;
+                volk_32f_accumulator_s32f(&part, norm, n);
+                sum += part;
+            }
             sum /= (float)count;
 
             float level = 20.0f * log10f(sum);
@@ -65,7 +70,7 @@ namespace dsp::noise_reduction {
             }
 
             if (!_muted) {
-                memcpy(out, in, count * sizeof(complex_t));
+                if (out != in) { memcpy(out, in, count * sizeof(complex_t)); }
             }
             else {
                 memset(out, 0, count * sizeof(complex_t));
@@ -91,7 +96,8 @@ namespace dsp::noise_reduction {
         static constexpr float HYSTERESIS = 1.0f;   // dB
         static constexpr double HOLD_TIME = 0.1;    // seconds above threshold before unmuting
 
-        float* normBuffer;
+        static constexpr int NORM_CHUNK = 1024;     // 4 KB of stack in process()
+
         float _level = -50.0f;
         double _samplerate = 48000.0;
         int _holdSamples = 4800;

@@ -19,7 +19,6 @@ namespace dsp::demod {
         ~FM() {
             if (!base_type::_block_init) { return; }
             base_type::stop();
-            dsp::taps::free(filterTaps);
         }
 
         void init(dsp::stream<dsp::complex_t>* in, double samplerate, double bandwidth, bool lowPass) {
@@ -27,17 +26,17 @@ namespace dsp::demod {
             _bandwidth = bandwidth;
             _lowPass = lowPass;
 
-            demod.init(NULL, bandwidth / 2.0, _samplerate);
-            loadDummyTaps();
-            fir.init(NULL, filterTaps);
+            demod.init(bandwidth / 2.0, _samplerate);
+            fir.init(dummyTaps());
 
             // Initialize taps
             updateFilter(lowPass);
 
-            if constexpr (std::is_same_v<T, float>) {
-                demod.out.free();
+            // Only the stereo path needs a demod scratch buffer; the float path
+            // demodulates straight into the caller's output.
+            if constexpr (std::is_same_v<T, stereo_t>) {
+                demodOut.allocate(STREAM_BUFFER_SIZE);
             }
-            fir.out.free();
 
             base_type::init(in);
         }
@@ -45,11 +44,10 @@ namespace dsp::demod {
         void setSamplerate(double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _samplerate = samplerate;
             demod.setDeviation(_bandwidth / 2.0, _samplerate);
             updateFilter(_lowPass);
-            base_type::tempStart();
         }
 
         void setBandwidth(double bandwidth) {
@@ -70,10 +68,9 @@ namespace dsp::demod {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             demod.reset();
             fir.reset();
-            base_type::tempStart();
         }
 
         inline int process(int count, dsp::complex_t* in, T* out) {
@@ -84,13 +81,16 @@ namespace dsp::demod {
                     fir.process(count, out, out);
                 }
             }
-            if constexpr (std::is_same_v<T, stereo_t>) {
-                demod.process(count, in, demod.out.writeBuf);
+            else if constexpr (std::is_same_v<T, stereo_t>) {
+                demod.process(count, in, demodOut);
                 if (_lowPass) {
                     std::lock_guard<std::mutex> lck(filterMtx);
-                    fir.process(count, demod.out.writeBuf, demod.out.writeBuf);
+                    fir.process(count, demodOut, demodOut);
                 }
-                convert::MonoToStereo::process(count, demod.out.writeBuf, out);
+                convert::MonoToStereo::process(count, demodOut, out);
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
             return count;
         }
@@ -113,25 +113,19 @@ namespace dsp::demod {
             // Update values
             _lowPass = lowPass;
 
-            // Free filter taps
-            dsp::taps::free(filterTaps);
-
             // Generate filter depending on the low pass settings
             if (_lowPass) {
-                filterTaps = dsp::taps::lowPass(_bandwidth / 2.0, (_bandwidth / 2.0) * 0.1, _samplerate);
+                fir.setTaps(dsp::taps::lowPass(_bandwidth / 2.0, (_bandwidth / 2.0) * 0.1, _samplerate));
             }
             else {
-                loadDummyTaps();
+                fir.setTaps(dummyTaps());
             }
-
-            // Set filter to use new taps
-            fir.setTaps(filterTaps);
             fir.reset();
         }
 
-        void loadDummyTaps() {
+        static tap<float> dummyTaps() {
             float dummyTap = 1.0f;
-            filterTaps = dsp::taps::fromArray<float>(1, &dummyTap);
+            return dsp::taps::fromArray<float>(1, &dummyTap);
         }
 
         double _samplerate;
@@ -140,7 +134,7 @@ namespace dsp::demod {
         bool filtering;
 
         Quadrature demod;
-        tap<float> filterTaps;
+        buffer::Buffer<float> demodOut;   // scratch, stereo path only
         filter::FIR<float, float> fir;
         std::mutex filterMtx;
     };

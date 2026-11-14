@@ -21,16 +21,30 @@ namespace dsp::demod {
 
         SSB(stream<complex_t>* in, Mode mode, double bandwidth, double samplerate, double agcAttack, double agcDecay) { init(in, mode, bandwidth, samplerate, agcAttack, agcDecay); }
 
+        ~SSB() {
+            // Not redundant despite the RAII buffers: ~block() joins the
+            // worker, but it runs *after* this class's members are destroyed.
+            // The thread has to be stopped here, before that happens.
+            if (!base_type::_block_init) { return; }
+            base_type::stop();
+        }
+
         void init(stream<complex_t>* in, Mode mode, double bandwidth, double samplerate, double agcAttack, double agcDecay) {
             _mode = mode;
             _bandwidth = bandwidth;
             _samplerate = samplerate;
 
-            xlator.init(NULL, getTranslation(), _samplerate);
-            agc.init(NULL, 1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
+            xlator.init(getTranslation(), _samplerate);
+            agc.init(1.0, agcAttack, agcDecay, 10e6, 10.0, INFINITY);
 
+            // The float path needs a complex scratch for the translator; the
+            // stereo path translates into the caller's output instead (see
+            // process()) and only needs the mono AGC scratch.
             if constexpr (std::is_same_v<T, float>) {
-                agc.out.free();
+                xlatorOut.allocate(STREAM_BUFFER_SIZE);
+            }
+            else if constexpr (std::is_same_v<T, stereo_t>) {
+                agcOut.allocate(STREAM_BUFFER_SIZE);
             }
 
             base_type::init(in);
@@ -39,28 +53,25 @@ namespace dsp::demod {
         void setMode(Mode mode) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _mode = mode;
             xlator.setOffset(getTranslation(), _samplerate);
-            base_type::tempStart();
         }
 
         void setBandwidth(double bandwidth) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _bandwidth = bandwidth;
             xlator.setOffset(getTranslation(), _samplerate);
-            base_type::tempStart();
         }
 
         void setSamplerate(double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             _samplerate = samplerate;
             xlator.setOffset(getTranslation(), _samplerate);
-            base_type::tempStart();
         }
 
         void setAGCEnabled(bool enabled) {
@@ -93,17 +104,34 @@ namespace dsp::demod {
         }
 
         int process(int count, const complex_t* in, T* out) {
-            // Move back sideband
-            xlator.process(count, in, xlator.out.writeBuf);
-
             if constexpr (std::is_same_v<T, float>) {
-                convert::ComplexToReal::process(count, xlator.out.writeBuf, out);
+                // Move back sideband
+                xlator.process(count, in, xlatorOut);
+                convert::ComplexToReal::process(count, xlatorOut, out);
                 agc.process(count, out, out);
             }
-            if constexpr (std::is_same_v<T, stereo_t>) {
-                convert::ComplexToReal::process(count, xlator.out.writeBuf, agc.out.writeBuf);
-                agc.process(count, agc.out.writeBuf, agc.out.writeBuf);
-                convert::MonoToStereo::process(count, agc.out.writeBuf, out);
+            else if constexpr (std::is_same_v<T, stereo_t>) {
+                // `out` holds `count` stereo samples, which is exactly the room
+                // `count` complex samples need, and nothing else writes it until
+                // MonoToStereo at the end. So the translator borrows it as scratch.
+                // No sample is read or written through complex_t here: the
+                // translator, ComplexToReal and MonoToStereo all touch this
+                // memory only inside VOLK, as lv_32fc_t, the same way
+                // MonoToStereo has always written the stereo output. Keep it
+                // that way: a plain C++ loop over `xlated` would break strict
+                // aliasing.
+                static_assert(sizeof(stereo_t) == sizeof(complex_t) && alignof(stereo_t) == alignof(complex_t),
+                              "SSB borrows the stereo output as complex scratch");
+                complex_t* xlated = reinterpret_cast<complex_t*>(out);
+
+                // Move back sideband
+                xlator.process(count, in, xlated);
+                convert::ComplexToReal::process(count, xlated, agcOut);
+                agc.process(count, agcOut, agcOut);
+                convert::MonoToStereo::process(count, agcOut, out);
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
 
             return count;
@@ -137,7 +165,9 @@ namespace dsp::demod {
         double _bandwidth;
         double _samplerate;
         channel::FrequencyXlator xlator;
+        buffer::Buffer<complex_t> xlatorOut;   // scratch, float path only
         loop::AGC<float> agc;
+        buffer::Buffer<float> agcOut;   // scratch, stereo path only
 
     };
 };

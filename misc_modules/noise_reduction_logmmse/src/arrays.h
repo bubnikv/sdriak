@@ -2,8 +2,8 @@
 #include <memory>
 #include <vector>
 #include <math.h>
-
-#include "dsp/block.h"
+#include <dsp/buffer/fftw.h>
+#include <dsp/block.h>
 
 namespace dsp {
 
@@ -135,19 +135,34 @@ namespace dsp {
         // centered moving average, only even window sizes
         FloatArray npmavg(const FloatArray& v, int windowSize);
 
-        struct FFTPlan {
-            // Runs the transform on in (zero-padded / truncated to the plan
-            // size) and returns the plan's internal output buffer; the
-            // reference stays valid but is overwritten by the next call.
-            virtual const ComplexArray& npfftfft(const ComplexArray& in) = 0;
-            virtual const ComplexArray& getOutput() = 0;
-            virtual ~FFTPlan() {
-
+        class ZeroPaddedFFTW {
+        public:
+            ZeroPaddedFFTW(bool backward, int buckets) : nbuckets(buckets), reverse(backward) {
+                m_input.assign(buckets, dsp::complex_t{ 0, 0 });
+                m_output.assign(buckets, dsp::complex_t{ 0, 0 });
+                m_plan.planDFT1D(buckets, (fftwf_complex*)m_input.data(), (fftwf_complex*)m_output.data(), backward ? FFTW_BACKWARD : FFTW_FORWARD);
             }
+            const ComplexArray& getOutput() { return m_output; }
+
+            const ComplexArray& npfftfft(const ComplexArray& in) {
+                // Zero-pad / truncate in into the plan-bound m_input buffer.
+                auto limit = std::min(in.size(), (size_t)nbuckets);
+                std::copy(in.begin(), in.begin() + limit, m_input.begin());
+                std::fill(m_input.begin() + limit, m_input.end(), dsp::complex_t{ 0, 0 });
+                fftwf_execute(m_plan);
+                if (reverse)
+                    volk_32fc_s32fc_multiply_32fc((lv_32fc_t*)m_output.data(), (lv_32fc_t*)m_output.data(), lv_32fc_t(1.0f / nbuckets, 0.0f), m_output.size());
+                return m_output;
+            }
+
+            private:
+                // Fixed-size working buffers the FFTW plan is bound to; they must never reallocate.
+                ComplexArray m_input;
+                ComplexArray m_output;
+                dsp::buffer::FFTWPlan m_plan;
+
+                int nbuckets;
+                bool reverse;
         };
-
-        std::shared_ptr<FFTPlan> allocateFFTWPlan(bool backward, int buckets);
-
-        void npfftfft(const ComplexArray& in, const std::shared_ptr<FFTPlan>& plan);
-    }
-}
+   } // namespace arrays
+} // namespace dsp

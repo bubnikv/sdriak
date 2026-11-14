@@ -17,11 +17,14 @@ namespace dsp::taps {
         for (int i = 0; i < count; i++) {
             double t = (double)i - half + 0.5;
             if constexpr (std::is_same_v<T, float>) {
-                taps.taps[i] = math::sinc(t * omega) * window(t - half, count) * corr;
+                taps[i] = math::sinc(t * omega) * window(t - half, count) * corr;
             }
-            if constexpr (std::is_same_v<T, complex_t>) {
+            else if constexpr (std::is_same_v<T, complex_t>) {
                 complex_t cplx = { (float)math::sinc(t * omega), 0.0f };
-                taps.taps[i] = cplx * window(t - half, count) * corr;
+                taps[i] = cplx * window(t - half, count) * corr;
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
         }
 

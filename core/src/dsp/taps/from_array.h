@@ -11,7 +11,7 @@ namespace dsp::taps {
         tap<T> _taps = taps::alloc<T>(count);
         
         // Copy data
-        memcpy(_taps.taps, taps, count * sizeof(T));
+        memcpy(_taps.taps(), taps, count * sizeof(T));
 
         return _taps;
     }

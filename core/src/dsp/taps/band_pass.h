@@ -17,9 +17,12 @@ namespace dsp::taps {
             if constexpr (std::is_same_v<T, float>) {
                 return 2.0f * cosf(offsetOmega * (float)n) * window::nuttall(n, N);
             }
-            if constexpr (std::is_same_v<T, complex_t>) {
+            else if constexpr (std::is_same_v<T, complex_t>) {
                 // The offset is negative to flip the taps. Complex bandpass are asymetric
                 return math::phasor(-offsetOmega * (float)n) * window::nuttall(n, N);
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
         });
     }

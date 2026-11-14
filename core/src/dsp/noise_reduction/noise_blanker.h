@@ -35,6 +35,7 @@ namespace dsp::noise_reduction {
             amp = 1.0f;
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, complex_t* in, complex_t* out) {
             for (int i = 0; i < count; i++) {
                 // Get signal amplitude

@@ -34,6 +34,8 @@ namespace dsp::audio {
             return _muted;
         }
 
+        // IN-PLACE: safe in practice (in == out). Element-wise VOLK kernel; GNU
+        // Radio relies on that, but VOLK does not document it as a guarantee.
         inline int process(int count, const stereo_t* in, stereo_t* out) {
             volk_32f_s32f_multiply_32f((float*)out, (float*)in, _muted ? 0.0f : _volume, count * 2);
             return count;

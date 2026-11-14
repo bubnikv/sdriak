@@ -58,7 +58,7 @@ public:
         // Initialize DSP here
         decoder.init(vfo->output, INPUT_SAMPLE_RATE, lsfHandler, this);
         resamp.init(decoder.out, 8000, audioSampRate);
-        reshape.init(decoder.diagOut, 480, 0);
+        reshape.init(decoder.diagOut, 480, 0, 480);
         diagHandler.init(&reshape.out, _diagHandler, this);
 
         // Start DSO Here
@@ -248,9 +248,8 @@ private:
         M17DecoderModule* _this = (M17DecoderModule*)ctx;
         // TODO: If too slow, change all demods here and not when setting
         _this->audioSampRate = sampleRate;
-        _this->resamp.tempStop();
+        dsp::block::TempStop guard(&_this->resamp);
         _this->resamp.setOutSamplerate(sampleRate);
-        _this->resamp.tempStart();
     }
 
     static void lsfHandler(M17LSF& lsf, void* ctx) {
@@ -270,7 +269,7 @@ private:
 
     dsp::buffer::Reshaper<float> reshape;
     dsp::sink::Handler<float> diagHandler;
-    dsp::multirate::RationalResampler<dsp::stereo_t> resamp;
+    dsp::multirate::RationalResamplerBlock<dsp::stereo_t> resamp;
 
     ImGui::SymbolDiagram diag;
 

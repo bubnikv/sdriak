@@ -1,36 +1,38 @@
 #pragma once
-#include "../processor.h"
+#include <assert.h>
+#include <volk/volk.h>
+#include "../types.h"
 #include "../math/hz_to_rads.h"
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 
 namespace dsp::channel {
-    class FrequencyXlator : public Processor<complex_t, complex_t> {
-        using base_type = Processor<complex_t, complex_t>;
+    // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
+    // The lock-free phaseDelta publish is kept: setOffset() is still called from
+    // control threads while the *containing* block's worker runs process().
+    class FrequencyXlator {
     public:
         FrequencyXlator() {}
 
-        FrequencyXlator(stream<complex_t>* in, double offset) { init(in, offset); }
+        FrequencyXlator(double offset) { init(offset); }
 
-        FrequencyXlator(stream<complex_t>* in, double offset, double samplerate) { init(in, offset, samplerate); }
+        FrequencyXlator(double offset, double samplerate) { init(offset, samplerate); }
 
-        void init(stream<complex_t>* in, double offset) {
+        void init(double offset) {
             phase = lv_cmake(1.0f, 0.0f);
             phaseDeltaBits.store(packDelta(lv_cmake((float)cos(offset), (float)sin(offset))), std::memory_order_relaxed);
-            base_type::init(in);
+            _init = true;
         }
 
-        void init(stream<complex_t>* in, double offset, double samplerate) {
-            init(in, math::hzToRads(offset, samplerate));
+        void init(double offset, double samplerate) {
+            init(math::hzToRads(offset, samplerate));
         }
 
         void setOffset(double offset) {
-            assert(base_type::_block_init);
-            // Lock-free publish to the worker: the store is self-synchronizing and
-            // setOffset touches no other shared state, so no ctrlMtx is needed. (It
-            // couldn't help anyway: the worker runs process() without ctrlMtx,
-            // which is held across the join in tempStop/doStop.)
+            assert(_init);
+            // Lock-free publish to the worker of the containing block: the store
+            // is self-synchronizing and setOffset touches no other shared state.
             phaseDeltaBits.store(packDelta(lv_cmake((float)cos(offset), (float)sin(offset))), std::memory_order_relaxed);
         }
 
@@ -38,14 +40,15 @@ namespace dsp::channel {
             setOffset(math::hzToRads(offset, samplerate));
         }
 
+        // The caller must have stopped the containing block's worker first.
         void reset() {
-            assert(base_type::_block_init);
-            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            tempStop();
+            assert(_init);
             phase = lv_cmake(1.0f, 0.0f);
-            tempStart();
         }
 
+        // IN-PLACE: safe in practice (in == out). The VOLK rotator is
+        // element-wise (it loads and stores the same index), and GNU Radio
+        // relies on that, but VOLK does not document it as a guarantee.
         inline int process(int count, const complex_t* in, complex_t* out) {
             // Snapshot the atomically-published phaseDelta once per buffer. The
             // rotator only reads the increment (it advances 'phase'), so a local
@@ -59,18 +62,10 @@ namespace dsp::channel {
             return count;
         }
 
-        virtual int run() {
-            int count = base_type::_in->read();
-            if (count < 0) { return -1; }
-
-            process(count, base_type::_in->readBuf, base_type::out.writeBuf);
-
-            base_type::_in->flush();
-            if (!base_type::out.swap(count)) { return -1; }
-            return count;
-        }
 
     protected:
+        bool _init = false;
+
         // Pack/unpack the 8-byte lv_32fc_t phase increment into a uint64_t so it
         // can be published to the lock-free worker via a single atomic store/load.
         static_assert(sizeof(lv_32fc_t) == sizeof(uint64_t), "lv_32fc_t must be two contiguous 32-bit floats to pack into a uint64_t");

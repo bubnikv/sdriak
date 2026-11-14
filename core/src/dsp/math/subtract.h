@@ -10,6 +10,9 @@ namespace dsp::math {
 
         Subtract(stream<T>* a, stream<T>* b) { init(a, b); }
 
+        // IN-PLACE: safe in practice (out == a and/or out == b). Element-wise
+        // VOLK kernel; GNU Radio relies on that, but VOLK does not document it
+        // as a guarantee.
         inline static int process(int count, const T* a, const T* b, T* out) {
             if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
                 volk_32f_x2_subtract_32f((float*)out, (float*)a, (float*)b, count * 2);

@@ -74,6 +74,10 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_executable(theme_load_tests tests/theme_load_tests.cpp)
     target_link_libraries(theme_load_tests PRIVATE sdrpp_core)
     add_test(NAME theme_load_tests COMMAND theme_load_tests)
+
+    add_executable(rational_resampler_tests tests/rational_resampler_tests.cpp)
+    target_link_libraries(rational_resampler_tests PRIVATE sdrpp_core)
+    add_test(NAME rational_resampler_tests COMMAND rational_resampler_tests)
 endif ()
 
 target_compile_definitions(sdrpp_core PRIVATE

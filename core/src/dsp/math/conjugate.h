@@ -9,6 +9,8 @@ namespace dsp::math {
 
         Conjugate(stream<complex_t>* in) { base_type::init(in); }
 
+        // IN-PLACE: safe in practice (in == out). Element-wise VOLK kernel; GNU
+        // Radio relies on that, but VOLK does not document it as a guarantee.
         inline static int process(int count, const complex_t* in, complex_t* out) {
             volk_32fc_conjugate_32fc((lv_32fc_t*)out, (lv_32fc_t*)in, count);
             return count;

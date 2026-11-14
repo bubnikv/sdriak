@@ -17,8 +17,11 @@ namespace dsp::correction {
             if constexpr (std::is_same_v<T, float>) {
                 offset = 0.0f;
             }
-            if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
                 offset = { 0.0f, 0.0f };
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
             base_type::init(in);
         }
@@ -40,17 +43,20 @@ namespace dsp::correction {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             if constexpr (std::is_same_v<T, float>) {
                 offset = 0.0f;
             }
-            if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, complex_t> || std::is_same_v<T, stereo_t>) {
                 offset = { 0.0f, 0.0f };
             }
-            base_type::tempStart();
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
+            }
         }
 
         // TODO: Add back the const
+        // IN-PLACE: safe (in == out).
         int process(int count, T* in, T* out) {
             for (int i = 0; i < count; i++) {
                 out[i] = in[i] - offset;

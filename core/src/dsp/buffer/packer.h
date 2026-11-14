@@ -20,19 +20,17 @@ namespace dsp::buffer {
         void setInput(stream<T>* in) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             block::unregisterInput(_in);
             _in = in;
             block::registerInput(_in);
-            block::tempStart();
         }
 
         void setSampleCount(int count) {
             assert(block::_block_init);
             std::lock_guard<std::recursive_mutex> lck(block::ctrlMtx);
-            block::tempStop();
+            dsp::block::TempStop guard(this);
             samples = count;
-            block::tempStart();
         }
 
         int run() {

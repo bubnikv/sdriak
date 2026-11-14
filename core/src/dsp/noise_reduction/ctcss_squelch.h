@@ -1,4 +1,6 @@
 #pragma once
+#include <cmath>
+#include <algorithm>
 #include "../channel/rx_vfo.h"
 #include "../demod/quadrature.h"
 #include "../filter/fir.h"
@@ -147,19 +149,35 @@ namespace dsp::noise_reduction {
 
             // Stop the DSP thread
             base_type::stop();
+
         }
 
-        void init(stream<stereo_t>* in, double samplerate) {
+        // Largest block the decode branch can carry. The DDC drops the AF rate
+        // to CTCSS_DECODE_SAMPLERATE -- 100:1 from NFM's 50 kHz -- so sizing
+        // these for a full block pays a hundred times over. + 64 for the
+        // resampler's retained phase state.
+        // [RATE-SIZED] ASSUMED ratio: CTCSS_DECODE_SAMPLERATE / samplerate.
+        // ddcOut and fmOut are sized from this and written by process() with no
+        // bound check. see doc/design/buffer-size-requirements.md 2.6
+        static int decodeBlockFor(int maxBlock, double samplerate) {
+            if (!(samplerate > 0.0) || maxBlock <= 0) { return maxBlock; }
+            double n = std::ceil((double)maxBlock * CTCSS_DECODE_SAMPLERATE / samplerate) + 64.0;
+            return (int)(std::max)(1.0, n);
+        }
+
+        void init(stream<stereo_t>* in, double samplerate, int maxBlock = STREAM_BUFFER_SIZE) {
             // Save settings
             _samplerate = samplerate;
-
-            // Create dummy taps just for initialization
-            float dummy[1] = { 1.0f };
-            auto dummyTaps = dsp::taps::fromArray(1, dummy);
+            _maxBlock = maxBlock;
 
             // Initialize the DDC and FM demod
-            ddc.init(NULL, samplerate, CTCSS_DECODE_SAMPLERATE, CTCSS_DECODE_BANDWIDTH, CTCSS_DECODE_OFFSET);
-            fm.init(NULL, 1.0, CTCSS_DECODE_SAMPLERATE);
+            ddc.init(samplerate, CTCSS_DECODE_SAMPLERATE, CTCSS_DECODE_BANDWIDTH, CTCSS_DECODE_OFFSET, _maxBlock);
+            fm.init(1.0, CTCSS_DECODE_SAMPLERATE);
+            // [RATE-SIZED] Neither of these is STREAM_BUFFER_SIZE any more:
+            // 100:1 below the AF rate on NFM. see doc/design/buffer-size-requirements.md 2.6
+            _decodeMaxBlock = decodeBlockFor(_maxBlock, samplerate);
+            ddcOut.allocate(_decodeMaxBlock);
+            fmOut.allocate(_decodeMaxBlock);
 
             // Initilize the base block class
             base_type::init(in);
@@ -168,10 +186,37 @@ namespace dsp::noise_reduction {
         void setSamplerate(double samplerate) {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
+
+            // A lower AF rate means more decode samples per block. Both buffers
+            // are internal to this block and the worker is stopped, so unlike a
+            // stream they can simply be resized.
+            // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
+            //
+            // Both buffers are acquired before either is committed, and the DDC
+            // -- the producer -- is reconfigured on the safe side of the resize:
+            // grow the buffers before telling it to emit more, shrink them only
+            // once it is emitting less. Retuning first and then failing to
+            // allocate would restart the worker with a DDC sized for a block the
+            // buffers cannot hold, and process() writes it with no bound check.
+            auto resizeTo = [&](int n) {
+                buffer::Buffer<complex_t> newDdcOut(n);
+                buffer::Buffer<float> newFmOut(n);
+                ddcOut = std::move(newDdcOut);
+                fmOut = std::move(newFmOut);
+                _decodeMaxBlock = n;
+            };
+            const int wanted = decodeBlockFor(_maxBlock, samplerate);
+            if (wanted > _decodeMaxBlock) {
+                resizeTo(wanted);
+                ddc.setInSamplerate(samplerate);
+            }
+            else {
+                ddc.setInSamplerate(samplerate);
+                if (wanted < _decodeMaxBlock) { resizeTo(wanted); }
+            }
+
             _samplerate = samplerate;
-            ddc.setInSamplerate(samplerate);
-            base_type::tempStart();
         }
 
         void setRequiredTone(CTCSSTone tone) {
@@ -184,12 +229,13 @@ namespace dsp::noise_reduction {
             return currentTone;
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const stereo_t* in, stereo_t* out) {
             // Shift and resample to the correct samplerate
-            int ddcOutCount = ddc.process(count, (complex_t*)in, ddc.out.writeBuf);
+            int ddcOutCount = ddc.process(count, (complex_t*)in, ddcOut);
 
             // FM Demod the CTCSS tone
-            fm.process(ddcOutCount, ddc.out.writeBuf, fm.out.writeBuf);
+            fm.process(ddcOutCount, ddcOut, fmOut);
 
             // Get the required tone
             const CTCSSTone rtone = requiredTone;
@@ -197,7 +243,7 @@ namespace dsp::noise_reduction {
             // Detect the tone frequency
             for (int i = 0; i < ddcOutCount; i++) {
                 // Compute the running mean
-                const float val = fm.out.writeBuf[i];
+                const float val = fmOut[i];
                 mean = 0.95f*mean + 0.05f*val;
 
                 // Compute the running variance
@@ -268,7 +314,7 @@ namespace dsp::noise_reduction {
                 memset(out, 0, count * sizeof(stereo_t));
             }
             else {
-                memcpy(out, in, count * sizeof(stereo_t));
+                if (out != in) { memcpy(out, in, count * sizeof(stereo_t)); }
             }
 
             return count;
@@ -297,7 +343,11 @@ namespace dsp::noise_reduction {
         bool mute = true;
         std::atomic<CTCSSTone> currentTone = CTCSS_TONE_NONE;
 
-        channel::RxVFO ddc;
+        int _maxBlock = STREAM_BUFFER_SIZE;
+        int _decodeMaxBlock = STREAM_BUFFER_SIZE;
+        channel::RxVFOKernel ddc;
+        buffer::Buffer<complex_t> ddcOut;   // scratch, in place of its old out stream
         demod::Quadrature fm;
+        buffer::Buffer<float> fmOut;   // scratch, in place of fm's old out stream
     };
 }

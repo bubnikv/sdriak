@@ -8,7 +8,7 @@
 #include "../dsp/channel/rx_vfo.h"
 #include "../dsp/sink/handler_sink.h"
 #include "../dsp/math/conjugate.h"
-#include <fftw3.h>
+#include "../dsp/buffer/fftw.h"
 
 class IQFrontEnd {
 public:
@@ -60,7 +60,9 @@ public:
 
 protected:
     static void handler(dsp::complex_t* data, int count, void* ctx);
-    void updateFFTPath(bool updateWaterfall = false);
+    // newFFTSize > 0 replaces _fftSize, which is committed at the same point as
+    // the buffers and the plan built for it -- see the definition.
+    void updateFFTPath(bool updateWaterfall = false, int newFFTSize = -1);
     void genFFTWindow(float* buf, int size);
 
     static inline double genDCBlockRate(double sampleRate) {
@@ -77,7 +79,7 @@ protected:
     dsp::buffer::SampleFrameBuffer<dsp::complex_t> inBuf;
 
     // Pre-processing chain
-    dsp::multirate::PowerDecimator<dsp::complex_t> decim;
+    dsp::multirate::PowerDecimatorBlock<dsp::complex_t> decim;
     dsp::math::Conjugate conjugate;
     dsp::correction::DCBlocker<dsp::complex_t> dcBlock;
     dsp::chain<dsp::complex_t> preproc;
@@ -106,10 +108,10 @@ protected:
 
     // Processing data
     int _nzFFTSize;
-    float* fftWindowBuf;
-    fftwf_complex *fftInBuf, *fftOutBuf;
-    fftwf_plan fftwPlan;
-    float* fftDbOut;
+    dsp::buffer::Buffer<float> fftWindowBuf;
+    dsp::buffer::FFTWBuffer<fftwf_complex> fftInBuf, fftOutBuf;
+    dsp::buffer::FFTWPlan fftwPlan;
+    float* fftDbOut = NULL;
 
     double effectiveSr;
 

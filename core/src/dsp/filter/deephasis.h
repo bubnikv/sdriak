@@ -21,8 +21,11 @@ namespace dsp::filter {
             if constexpr (std::is_same_v<T, float>) {
                 lastOut = 0;
             }
-            if constexpr (std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, stereo_t>) {
                 lastOut = { 0, 0 };
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
 
             base_type::init(in);
@@ -45,16 +48,19 @@ namespace dsp::filter {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             if constexpr (std::is_same_v<T, float>) {
                 lastOut = 0;
             }
-            if constexpr (std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, stereo_t>) {
                 lastOut = { 0, 0 };
             }
-            base_type::tempStart();
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
+            }
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const T* in, T* out) {
             if constexpr (std::is_same_v<T, float>) {
                 out[0] = (alpha * in[0]) + ((1 - alpha) * lastOut);
@@ -63,7 +69,7 @@ namespace dsp::filter {
                 }
                 lastOut = out[count - 1];
             }
-            if constexpr (std::is_same_v<T, stereo_t>) {
+            else if constexpr (std::is_same_v<T, stereo_t>) {
                 out[0].l = (alpha * in[0].l) + ((1 - alpha) * lastOut.l);
                 out[0].r = (alpha * in[0].r) + ((1 - alpha) * lastOut.r);
                 for (int i = 1; i < count; i++) {
@@ -72,6 +78,9 @@ namespace dsp::filter {
                 }
                 lastOut.l = out[count - 1].l;
                 lastOut.r = out[count - 1].r;
+            }
+            else {
+                static_assert(dependent_false_v<T>, "Unsupported sample type");
             }
             return count;
         }

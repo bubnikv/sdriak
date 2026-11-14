@@ -1,5 +1,4 @@
 #include "arrays.h"
-#include <fftw3.h>
 
 #include <algorithm>
 #include <array>
@@ -364,54 +363,5 @@ namespace dsp {
             }
             return retval;
         }
-
-        struct fftwPlanImplFFTW : public FFTPlan {
-            int nbuckets;
-            bool reverse;
-            fftwf_plan_s* p;
-            // Fixed-size working buffers the FFTW plan is bound to; they must
-            // never reallocate.
-            ComplexArray input;
-            ComplexArray output;
-
-            fftwPlanImplFFTW(bool backward, int buckets) : FFTPlan() {
-                nbuckets = buckets;
-                reverse = backward;
-                // assign, not resize: the default-init allocator leaves
-                // resized elements uninitialized, and output is readable
-                // via getOutput() before the first execute.
-                input.assign(buckets, dsp::complex_t{ 0, 0 });
-                output.assign(buckets, dsp::complex_t{ 0, 0 });
-                p = fftwf_plan_dft_1d(buckets, (fftwf_complex*)input.data(), (fftwf_complex*)output.data(), backward ? FFTW_BACKWARD : FFTW_FORWARD, FFTW_ESTIMATE);
-            }
-
-            const ComplexArray& getOutput() override {
-                return output;
-            }
-
-            const ComplexArray& npfftfft(const ComplexArray& in) override {
-                // Zero-pad / truncate in into the plan-bound input buffer.
-                auto limit = std::min(in.size(), (size_t)nbuckets);
-                std::copy(in.begin(), in.begin() + limit, input.begin());
-                std::fill(input.begin() + limit, input.end(), dsp::complex_t{ 0, 0 });
-                fftwf_execute(p);
-                if (reverse) {
-                    volk_32fc_s32fc_multiply_32fc((lv_32fc_t*)output.data(), (lv_32fc_t*)output.data(), lv_32fc_t(1.0f / nbuckets, 0.0f), output.size());
-                }
-                return output;
-            }
-
-            virtual ~fftwPlanImplFFTW() {
-                fftwf_destroy_plan(p);
-            }
-        };
-
-        std::shared_ptr<FFTPlan> allocateFFTWPlan(bool backward, int buckets) {
-            return std::make_shared<fftwPlanImplFFTW>(backward, buckets);
-        }
-
-        void npfftfft(const ComplexArray& in, const std::shared_ptr<FFTPlan>& plan) {
-            plan->npfftfft(in);
-        }
-    }
-}
+    } // namespace arrays
+} // namespace dsp

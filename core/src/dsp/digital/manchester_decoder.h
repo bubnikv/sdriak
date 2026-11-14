@@ -12,11 +12,11 @@ namespace dsp::digital {
         void reset() {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
-            base_type::tempStop();
+            dsp::block::TempStop guard(this);
             offset = 0;
-            base_type::tempStart();
         }
 
+        // IN-PLACE: safe (in == out).
         inline int process(int count, const uint8_t* in, uint8_t* out) {
             // TODO: NOT THIS BULLSHIT
             int outCount = 0;

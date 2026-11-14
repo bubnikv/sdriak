@@ -14,10 +14,11 @@ namespace dsp {
         return 3*dtr->m_wlen15;
     }
 
+    // IN-PLACE: safe (in == out).
     bool omlsa_mcra::process(short *in, int incount, short *out, int &outcount) {
         if (!dtr) {
             flog::info("ERROR omlsa_mcra: !dtr");
-            memcpy(out, in, incount*sizeof(short));
+            if (out != in) { memcpy(out, in, incount*sizeof(short)); }
             outcount = incount;
             return true;
         }
