@@ -506,22 +506,6 @@ namespace ImGui {
                 }
             }
 
-            // Next, the scroll buttons at either end of the frequency scale.
-            // They must be tested before the drag below, or the press on them
-            // would start a ruler drag instead.
-            if (!targetFound && mouseInFreq) {
-                if (IS_IN_AREA(mousePos, freqScrollLeftMin, freqScrollLeftMax)) {
-                    // Same sign convention as the drag: panning the view down in
-                    // frequency slides the spectrum right, revealing what is left of it.
-                    panView(-FREQ_SCROLL_FRACTION * viewBandwidth, true);
-                    targetFound = true;
-                }
-                else if (IS_IN_AREA(mousePos, freqScrollRightMin, freqScrollRightMax)) {
-                    panView(FREQ_SCROLL_FRACTION * viewBandwidth, true);
-                    targetFound = true;
-                }
-            }
-
             // Now, check frequency scale
             if (!targetFound && mouseInFreq) {
                 freqScaleSelect = true;
@@ -864,58 +848,6 @@ namespace ImGui {
         }
     }
 
-    // Arrow tabs pinned to the ends of the frequency ruler, each one panning the
-    // view by FREQ_SCROLL_FRACTION of its width (see processInputs). Drawn over
-    // the scale, so the opaque backing keeps them readable where a tick label
-    // falls underneath.
-    void WaterFall::drawFreqScrollButtons() {
-        // onResize() bails out on a too-small widget, leaving the rects empty
-        if (freqScrollLeftMax.x <= freqScrollLeftMin.x) { return; }
-
-        ImVec2 mPos = ImGui::GetMousePos();
-        // Match the gate the click handler runs behind, so a button never
-        // highlights while it cannot be pressed.
-        bool live = ImGui::IsWindowHovered(ImGuiHoveredFlags_None) &&
-                    !gui::mainWindow.lockWaterfallControls && !inputHandled && !vfoSelect;
-        bool held = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-
-        ImU32 text = ImGui::GetColorU32(ImGuiCol_Text);
-        float rounding = style::dp(3.0f);
-
-        const struct {
-            const ImVec2& min;
-            const ImVec2& max;
-            bool left;
-        } buttons[2] = {
-            { freqScrollLeftMin, freqScrollLeftMax, true },
-            { freqScrollRightMin, freqScrollRightMax, false }
-        };
-
-        for (const auto& btn : buttons) {
-            bool hovered = live && IS_IN_AREA(mPos, btn.min, btn.max);
-            if (hovered) { ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); }
-            ImU32 bg = hovered ? (held ? IM_COL32(100, 100, 100, 235) : IM_COL32(75, 75, 75, 210))
-                               : IM_COL32(35, 35, 35, 170);
-            window->DrawList->AddRectFilled(btn.min, btn.max, bg, rounding);
-            window->DrawList->AddRect(btn.min, btn.max, IM_COL32(90, 90, 90, 220), rounding, 0, style::lineWidth());
-
-            float cx = roundf((btn.min.x + btn.max.x) * 0.5f);
-            float cy = roundf((btn.min.y + btn.max.y) * 0.5f);
-            // Both half-extents come from the button width: the tab is taller
-            // than it is wide, and scaling the arrow to its height would stretch it.
-            float hw = std::max(2.0f, roundf((btn.max.x - btn.min.x) * 0.24f));
-            float hh = roundf(hw * 1.2f);
-            // Vertex order as in ImGui's own RenderArrowPointingAt(), so the
-            // antialiased fringe lands outside the triangle.
-            if (btn.left) {
-                window->DrawList->AddTriangleFilled(ImVec2(cx + hw, cy - hh), ImVec2(cx + hw, cy + hh), ImVec2(cx - hw, cy), text);
-            }
-            else {
-                window->DrawList->AddTriangleFilled(ImVec2(cx - hw, cy + hh), ImVec2(cx - hw, cy - hh), ImVec2(cx + hw, cy), text);
-            }
-        }
-    }
-
     void WaterFall::updateWaterfallTexture() {
         std::lock_guard<std::mutex> lck(texMtx);
         glBindTexture(GL_TEXTURE_2D, textureId);
@@ -1018,20 +950,6 @@ namespace ImGui {
 
         freqAreaMin = ImVec2(fftAreaMin.x, fftAreaMax.y + 1);
         freqAreaMax = ImVec2(fftAreaMax.x, fftAreaMax.y + (float)style::scale(40.0f));
-
-        // Scroll buttons inset into either end of the frequency scale. Narrowed
-        // on a narrow widget so the pair never eats a third of the ruler.
-        {
-            float btnW = std::min<float>(style::dp(style::touchStyle ? 24.0f : 18.0f), (float)dataWidth / 6.0f);
-            float btnH = std::min<float>(style::dp(26.0f), (freqAreaMax.y - freqAreaMin.y) - style::dp(4.0f));
-            float pad = style::dp(3.0f);
-            float top = roundf(((freqAreaMin.y + freqAreaMax.y) - btnH) * 0.5f);
-            float bottom = top + roundf(btnH);
-            freqScrollLeftMin = ImVec2(roundf(freqAreaMin.x + pad), top);
-            freqScrollLeftMax = ImVec2(roundf(freqAreaMin.x + pad + btnW), bottom);
-            freqScrollRightMax = ImVec2(roundf(freqAreaMax.x - pad), bottom);
-            freqScrollRightMin = ImVec2(roundf(freqAreaMax.x - pad - btnW), top);
-        }
 
         wfMin = ImVec2(fftAreaMin.x, freqAreaMax.y + 1);
         wfMax = ImVec2(fftAreaMin.x + dataWidth, wfMin.y + waterfallHeight);
@@ -1153,7 +1071,6 @@ namespace ImGui {
         if (bandplan != NULL && bandplanVisible) {
             drawBandPlan();
         }
-        drawFreqScrollButtons();
 
         // FFT/waterfall divider drag handle: the fat touch target that grabs on
         // touch-down (see processInputs). Drawn last so it sits on top of the
