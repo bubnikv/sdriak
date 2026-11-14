@@ -1,4 +1,3 @@
-#include <cmath>
 #include <algorithm>
 #include <dsp/sink.h>
 #include <dsp/types.h>
@@ -49,33 +48,26 @@ namespace vor {
             amr2cOut.allocate(_maxBlock);
             fmxOut.allocate(_maxBlock);
 
-            // The two 30 Hz detectors decimate 25:1, and everything from their
-            // output onward -- including this block's own output stream -- runs
-            // at VOR_OUT_SR. Sized at init(), before anything is started, so no
-            // reader can be holding the old buffer; VOR_IN_SR is a constant, so
-            // there is no reconfiguration path that would have to resize it.
+            // The two 30 Hz detectors decimate 25:1. Their final outputs and
+            // this block's output stream run at VOR_OUT_SR, but each fused
+            // RxVFOKernel first writes the full-rate translated input into its
+            // destination and therefore needs a larger workspace. Sized at
+            // init(), before anything is started, so no reader can be holding
+            // the old buffer; the rates are constant and never reconfigured.
             amv.init(VOR_IN_SR, VOR_OUT_SR, 30, 30, _maxBlock);
             fmv.init(VOR_IN_SR, VOR_OUT_SR, 30, 30, _maxBlock);
-            // [RATE-SIZED] None of these three is STREAM_BUFFER_SIZE any
-            // more; they hold 1/25 of a block. see doc/design/buffer-size-requirements.md 2.6
-            _outMaxBlock = outBlockFor(_maxBlock);
-            amvOut.allocate(_outMaxBlock);
-            fmvOut.allocate(_outMaxBlock);
+            // [RATE-SIZED] The published output holds about 1/25 of a block;
+            // the two internal workspaces follow the producers' exact maximum
+            // write spans. see doc/design/buffer-size-requirements.md 2.6
+            _outMaxBlock = (std::max)(amv.maxOutputBlock(), fmv.maxOutputBlock());
+            _workMaxBlock = (std::max)(amv.maxOutputBuffer(), fmv.maxOutputBuffer());
+            amvOut.allocate(_workMaxBlock);
+            fmvOut.allocate(_workMaxBlock);
             base_type::out.setBufferSize(_outMaxBlock);
 
             base_type::init(in);
         }
 
-        // [RATE-SIZED] ASSUMED ratio: VOR_OUT_SR / VOR_IN_SR. Both are
-        // compile-time constants here, which is why the output stream can be
-        // sized once at init() and never resized. + 64 for the resamplers'
-        // retained phase state. see doc/design/buffer-size-requirements.md 2.6
-        static int outBlockFor(int maxBlock) {
-            if (maxBlock <= 0) { return maxBlock; }
-            double n = std::ceil((double)maxBlock * VOR_OUT_SR / VOR_IN_SR) + 64.0;
-            return (int)(std::max)(1.0, n);
-        }
-        
         int process(dsp::complex_t* in, float* out, int count) {
             // Demodulate the AM outer modulation
             volk_32fc_magnitude_32f(magOut, (lv_32fc_t*)in, count);
@@ -130,6 +122,7 @@ namespace vor {
     private:
         int _maxBlock = STREAM_BUFFER_SIZE;
         int _outMaxBlock = STREAM_BUFFER_SIZE;
+        int _workMaxBlock = STREAM_BUFFER_SIZE;
         dsp::buffer::Buffer<float> magOut;   // AM envelope, in place of a whole AM demod; later reused for the FM discriminator output
         dsp::convert::RealToComplex amr2c;
         dsp::convert::RealToComplex fmr2c;

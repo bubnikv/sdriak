@@ -46,38 +46,74 @@ namespace dsp::channel {
             // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
             filter.init(generateTaps(), filterMaxBlock());
 
+            _ratesValid = true;
             _init = true;
         }
 
         void setInSamplerate(double inSamplerate) {
             assert(_init);
+            if (_ratesValid && inSamplerate == _inSamplerate) { return; }
+
+            // The post-resampler FIR always runs at _outSamplerate. Changing
+            // only the source rate changes its required block capacity, not
+            // the time spacing of the samples already in its history. The
+            // containing worker is stopped, and unlike a stream this delay
+            // line has no external reader. While bypassed, resizing is deferred
+            // until setBandwidth() enables the filter again.
+            // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
+            const int wantedFilterMax = maxOutputBlockForInSamplerate(inSamplerate);
+            if (filterNeeded && wantedFilterMax != filter.maxBlock()) {
+                filter.setMaxBlock(wantedFilterMax);
+            }
+
             _inSamplerate = inSamplerate;
             xlator.setOffset(-_offset, _inSamplerate);
+            _ratesValid = false;
             resamp.setInSamplerate(_inSamplerate);
-            // [RATE-SIZED] The decimation ratio moved, so the filter's block
-            // bound moved with it. Safe to resize here: the caller has stopped
-            // the worker, and unlike a stream this delay line has no external
-            // reader. see doc/design/buffer-size-requirements.md 2.6
-            // While the filter is bypassed the resize is deferred to
-            // setBandwidth(), which switches it back on.
-            if (filterNeeded) { filter.setMaxBlock(filterMaxBlock()); }
+            _ratesValid = true;
         }
 
         void setOutSamplerate(double outSamplerate, double bandwidth) {
             assert(_init);
+            if (_ratesValid && outSamplerate == _outSamplerate) {
+                setBandwidth(bandwidth);
+                return;
+            }
+
+            const bool newFilterNeeded = (bandwidth != outSamplerate);
+            const int wantedFilterMax = multirate::RationalResampler<complex_t>::maxOutputBlockForRates(
+                _inSamplerate, outSamplerate, _maxBlock);
+            tap<float> newTaps;
+            if (newFilterNeeded) {
+                newTaps = generateTaps(bandwidth, outSamplerate);
+                // Publish all throwing FIR state while the old resampler is
+                // still coherent. If the resampler rebuild then fails it enters
+                // its no-output mode, and a later rate setter retries because
+                // _ratesValid remains false.
+                filter.setTaps(std::move(newTaps), wantedFilterMax);
+            }
+
+            // The FIR consumes the resampler's output. Its retained samples
+            // use the old output sample spacing and cannot be mixed with the
+            // new domain, even when the numerical block bound happens to stay
+            // the same. No fade: restart the FIR from zero history. Do this
+            // before the resampler rebuild so every failure/retry path also
+            // carries coherent zero history into the pending output domain.
+            filter.reset();
+
             _outSamplerate = outSamplerate;
             _bandwidth = bandwidth;
-            filterNeeded = (_bandwidth != _outSamplerate);
+            filterNeeded = newFilterNeeded;
+            _ratesValid = false;
             resamp.setOutSamplerate(_outSamplerate);
-            if (filterNeeded) {
-                // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
-                filter.setTaps(generateTaps(), filterMaxBlock());
-            }
+            _ratesValid = true;
         }
 
         void setBandwidth(double bandwidth) {
             assert(_init);
+            if (bandwidth == _bandwidth) { return; }
             std::lock_guard<std::mutex> lck(filterMtx);
+            const bool wasFilterNeeded = filterNeeded;
             _bandwidth = bandwidth;
             filterNeeded = (_bandwidth != _outSamplerate);
             if (filterNeeded) {
@@ -89,6 +125,10 @@ namespace dsp::channel {
                 // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
                 filter.setTaps(generateTaps(), filterMaxBlock());
             }
+            // A bypassed filter does not consume samples, so any history it
+            // retained before the bypass is stale when it is enabled again.
+            // Continuously active bandwidth-only changes preserve history.
+            if (wasFilterNeeded != filterNeeded) { filter.reset(); }
         }
 
         void setOffset(double offset) {
@@ -102,6 +142,37 @@ namespace dsp::channel {
             xlator.reset();
             resamp.reset();
             filter.reset();
+        }
+
+        // Exact bound selected by the rational resampler, including capped
+        // ratio approximation and retained polyphase phase.
+        int maxOutputBlock() const {
+            assert(_init);
+            return resamp.maxOutputBlock();
+        }
+
+        int maxOutputBuffer() const {
+            assert(_init);
+            // xlator writes a full-rate block into the caller's destination
+            // before the resampler reduces it, so the whole fused VFO needs at
+            // least the input bound even when the final output is tiny.
+            return (std::max)(_maxBlock, resamp.maxOutputBuffer());
+        }
+
+        // Preview a new input rate without mutating this live producer. Owners
+        // use this to grow their destination before setInSamplerate() can make
+        // the producer emit a larger block.
+        int maxOutputBlockForInSamplerate(double inSamplerate) const {
+            assert(_init);
+            return multirate::RationalResampler<complex_t>::maxOutputBlockForRates(
+                inSamplerate, _outSamplerate, _maxBlock);
+        }
+
+        int maxOutputBufferForInSamplerate(double inSamplerate) const {
+            assert(_init);
+            return (std::max)(_maxBlock,
+                multirate::RationalResampler<complex_t>::maxOutputBufferForRates(
+                    inSamplerate, _outSamplerate, _maxBlock));
         }
 
         // IN-PLACE: safe in practice (in == out). FrequencyXlator relies on
@@ -122,8 +193,12 @@ namespace dsp::channel {
 
     protected:
         tap<float> generateTaps() const {
-            double filterWidth = _bandwidth / 2.0;
-            return taps::lowPass(filterWidth, filterWidth * 0.1, _outSamplerate);
+            return generateTaps(_bandwidth, _outSamplerate);
+        }
+
+        static tap<float> generateTaps(double bandwidth, double outSamplerate) {
+            double filterWidth = bandwidth / 2.0;
+            return taps::lowPass(filterWidth, filterWidth * 0.1, outSamplerate);
         }
 
         // Largest block the filter can be handed: the bound computed from the
@@ -132,10 +207,14 @@ namespace dsp::channel {
         // select passthrough for a near-unity ratio.
         // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
         int filterMaxBlock() const {
-            return resamp.maxOutputBlock();
+            return maxOutputBlock();
         }
 
         bool _init = false;
+        // False only after a throwing resampler rebuild. Its failure mode emits
+        // no samples; the members retain the pending rates, and the next rate
+        // setter must retry even when it requests those same values.
+        bool _ratesValid = false;
         int _maxBlock = STREAM_BUFFER_SIZE;
 
         FrequencyXlator xlator;

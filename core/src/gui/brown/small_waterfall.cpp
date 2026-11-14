@@ -145,7 +145,11 @@ void SubWaterfall::draw() {
 }
 
 void SubWaterfall::addAudioSamples(dsp::stereo_t* samples, int count, int sampleRate) {
-    int newSize = 1000 + (pvt->outputSampleRate * count / sampleRate);
+    // RationalResampler uses its destination for intermediate power-decimator
+    // stages, which can be larger than the final returned count. Size from the
+    // selected plan rather than the requested flat rate ratio.
+    int newSize = dsp::multirate::RationalResampler<dsp::stereo_t>::maxOutputBufferForRates(
+        sampleRate, pvt->outputSampleRate, count);
     if (pvt->resampledV.size() < newSize) {
         pvt->resampledV.resize(newSize);
     }

@@ -1,6 +1,4 @@
 #pragma once
-#include <cmath>
-#include <algorithm>
 #include <dsp/stream.h>
 #include <dsp/buffer/reshaper.h>
 #include <dsp/multirate/rational_resampler.h>
@@ -26,16 +24,6 @@ public:
         base_type::stop();
     }
 
-    // Largest block the symbol-rate side can carry: the clock recovery emits
-    // one sample per symbol, so 1/10 of the input at the configured 24 kHz for
-    // 2400 baud. + 64 for the recovery loop's retained phase.
-    // [RATE-SIZED] ASSUMED ratio: baudrate / samplerate. see doc/design/buffer-size-requirements.md 2.6
-    static int symbolBlockFor(int maxBlock, double samplerate, double baudrate) {
-        if (!(samplerate > 0.0) || maxBlock <= 0) { return maxBlock; }
-        double n = std::ceil((double)maxBlock * baudrate / samplerate) + 64.0;
-        return (int)(std::max)(1.0, n);
-    }
-
     void init(dsp::stream<dsp::complex_t>* in, double samplerate, double baudrate, int maxBlock = STREAM_BUFFER_SIZE) {
         // Save settings
         _samplerate = samplerate;
@@ -48,10 +36,13 @@ public:
         fir.init(dsp::taps::fromArray<float>(10, taps), _maxBlock);
         recov.init(samplerate/baudrate, 1e-4, 1.0, 0.05, 128, 8, _maxBlock);
 
-        // [RATE-SIZED] Both output streams carry symbols, not samples, and
-        // neither is STREAM_BUFFER_SIZE any more. Sized before anything is
-        // started, so no reader can be holding the old buffer. see doc/design/buffer-size-requirements.md 2.6
-        _symbolMaxBlock = symbolBlockFor(_maxBlock, samplerate, baudrate);
+        // [RATE-SIZED] Both output streams carry recovered symbols, not input
+        // samples. Use the recovery loop's derived worst-case bound rather than
+        // the nominal baud/sample ratio: its frequency and phase-error terms
+        // can legally make it emit faster than one sample per nominal symbol.
+        // Sized before anything is started, so no reader can be holding the
+        // old buffer. see doc/design/buffer-size-requirements.md 2.6
+        _symbolMaxBlock = recov.maxOutputBlock();
         soft.setBufferSize(_symbolMaxBlock);
         base_type::out.setBufferSize(_symbolMaxBlock);
 

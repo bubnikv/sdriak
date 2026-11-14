@@ -1,5 +1,8 @@
 #pragma once
 #include <assert.h>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include "../types.h"
 #include "../buffer/history_buffer.h"
 #include "../stream.h"
@@ -20,7 +23,9 @@ namespace dsp::clock_recovery {
         MM(double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8, int maxBlock = STREAM_BUFFER_SIZE) { init(omega, omegaGain, muGain, omegaRelLimit, interpPhaseCount, interpTapCount, maxBlock); }
 
         void init(double omega, double omegaGain, double muGain, double omegaRelLimit, int interpPhaseCount = 128, int interpTapCount = 8, int maxBlock = STREAM_BUFFER_SIZE) {
+            const int maxOutputBlock = calculateMaxOutputBlock(maxBlock, omega, muGain, omegaRelLimit);
             _maxBlock = maxBlock;
+            _maxOutputBlock = maxOutputBlock;
             _omega = omega;
             _omegaGain = omegaGain;
             _muGain = muGain;
@@ -41,7 +46,9 @@ namespace dsp::clock_recovery {
 
         void setOmega(double omega) {
             assert(_init);
+            const int maxOutputBlock = calculateMaxOutputBlock(_maxBlock, omega, _muGain, _omegaRelLimit);
             _omega = omega;
+            _maxOutputBlock = maxOutputBlock;
             offset = 0;
             pcl.phase = 0.0f;
             pcl.freq = _omega;
@@ -56,14 +63,35 @@ namespace dsp::clock_recovery {
 
         void setMuGain(double muGain) {
             assert(_init);
+            const int maxOutputBlock = calculateMaxOutputBlock(_maxBlock, _omega, muGain, _omegaRelLimit);
             _muGain = muGain;
+            _maxOutputBlock = maxOutputBlock;
             pcl.setCoefficients(_muGain, _omegaGain);
         }
 
         void setOmegaRelLimit(double omegaRelLimit) {
             assert(_init);
+            const int maxOutputBlock = calculateMaxOutputBlock(_maxBlock, _omega, _muGain, omegaRelLimit);
             _omegaRelLimit = omegaRelLimit;
+            _maxOutputBlock = maxOutputBlock;
             pcl.setFreqLimits(_omega * (1.0 - _omegaRelLimit), _omega * (1.0 + _omegaRelLimit));
+        }
+
+        // Largest number of samples process() can emit for the maxBlock passed
+        // to init(). The phase error is clamped to [-1, 1], and the PCL clamps
+        // its frequency before adding `freq + muGain * error` to the phase.
+        // Consequently the least legal phase advance is
+        //
+        //     omega * (1 - omegaRelLimit) - abs(muGain)
+        //
+        // (calculated as float below, matching PhaseControlLoop<float>). After
+        // each output, process() removes the integer part of the phase and
+        // carries a non-negative fractional phase and input offset into the
+        // next iteration/block. ceil(maxBlock / minAdvance) therefore bounds
+        // the number of output samples, including retained phase.
+        int maxOutputBlock() const {
+            assert(_init);
+            return _maxOutputBlock;
         }
 
         void setInterpParams(int interpPhaseCount, int interpTapCount) {
@@ -158,6 +186,31 @@ namespace dsp::clock_recovery {
     protected:
         bool _init = false;
         int _maxBlock = STREAM_BUFFER_SIZE;
+        int _maxOutputBlock = STREAM_BUFFER_SIZE;
+
+        static int calculateMaxOutputBlock(int maxBlock, double omega, double muGain, double omegaRelLimit) {
+            if (maxBlock < 0 || !std::isfinite(omega) || !std::isfinite(muGain) ||
+                !std::isfinite(omegaRelLimit) || !(omega > 0.0) || omegaRelLimit < 0.0) {
+                throw std::invalid_argument("MM clock recovery has invalid block/rate parameters");
+            }
+
+            // PhaseControlLoop stores these values as float. Do the limiting
+            // arithmetic in the same type so the bound includes its rounding.
+            const float minFreq = (float)(omega * (1.0 - omegaRelLimit));
+            const float alpha = (float)muGain;
+            const float minAdvance = minFreq - std::fabs(alpha);
+            if (!std::isfinite(minAdvance) || !(minAdvance > 0.0f)) {
+                throw std::invalid_argument("MM clock recovery has no finite output bound");
+            }
+            if (maxBlock == 0) { return 0; }
+
+            const double output = std::ceil((double)maxBlock / (double)minAdvance);
+            if (output > (double)(std::numeric_limits<int>::max)()) {
+                throw std::overflow_error("MM clock recovery output block size exceeds INT_MAX");
+            }
+            return (int)output;
+        }
+
         // Returns the bank instead of assigning it, so callers can build the
         // replacement before committing anything. lp owns its taps: if the bank
         // allocation throws, the windowed sinc is released on the way out.

@@ -78,6 +78,18 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_executable(rational_resampler_tests tests/rational_resampler_tests.cpp)
     target_link_libraries(rational_resampler_tests PRIVATE sdrpp_core)
     add_test(NAME rational_resampler_tests COMMAND rational_resampler_tests)
+
+    add_executable(clock_recovery_mm_tests tests/clock_recovery_mm_tests.cpp)
+    target_link_libraries(clock_recovery_mm_tests PRIVATE sdrpp_core)
+    add_test(NAME clock_recovery_mm_tests COMMAND clock_recovery_mm_tests)
+
+    add_executable(fir_history_tests tests/fir_history_tests.cpp)
+    target_link_libraries(fir_history_tests PRIVATE sdrpp_core)
+    add_test(NAME fir_history_tests COMMAND fir_history_tests)
+
+    add_executable(fftw_lifetime_tests tests/fftw_lifetime_tests.cpp)
+    target_link_libraries(fftw_lifetime_tests PRIVATE sdrpp_core)
+    add_test(NAME fftw_lifetime_tests COMMAND fftw_lifetime_tests)
 endif ()
 
 target_compile_definitions(sdrpp_core PRIVATE

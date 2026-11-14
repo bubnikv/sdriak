@@ -1,5 +1,10 @@
 #pragma once
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #include "../filter/decimating_fir.h"
 #include "../taps/from_array.h"
@@ -25,6 +30,28 @@ namespace dsp::multirate {
 
         static inline unsigned int getMaxRatio() {
             return 1 << decim::plans_len;
+        }
+
+        // Final count returned by process() for the configured input bound.
+        int maxOutputBlock() const {
+            assert(_init);
+            return _maxOutputBlock;
+        }
+
+        // Capacity required by the caller-provided `out` buffer. Multi-stage
+        // plans write the first stage's larger intermediate result there before
+        // later stages reduce it to maxOutputBlock().
+        int maxOutputBuffer() const {
+            assert(_init);
+            return _maxOutputBuffer;
+        }
+
+        static int maxOutputBlockForRatio(unsigned int ratio, int maxBlock) {
+            return calculateBlockBounds(ratio, maxBlock).outputMax;
+        }
+
+        static int maxOutputBufferForRatio(unsigned int ratio, int maxBlock) {
+            return calculateBlockBounds(ratio, maxBlock).bufferMax;
         }
 
         void setRatio(unsigned int ratio) {
@@ -54,7 +81,6 @@ namespace dsp::multirate {
             
             // Process data through each stage
             const T* data = in;
-            int last = stageCount - 1;
             for (int i = 0; i < stageCount; i++) {
                 count = decimFirs[i]->process(count, data, out);
                 data = out;
@@ -66,6 +92,39 @@ namespace dsp::multirate {
     protected:
         bool _init = false;
         int _maxBlock = STREAM_BUFFER_SIZE;
+        int _maxOutputBlock = STREAM_BUFFER_SIZE;
+        int _maxOutputBuffer = STREAM_BUFFER_SIZE;
+
+        struct BlockBounds {
+            int outputMax;
+            int bufferMax;
+        };
+
+        static int stageOutputBound(int input, int decimation) {
+            if (input <= 0) { return input; }
+            const int64_t output = ((int64_t)input + decimation - 1) / decimation;
+            if (output > (int64_t)(std::numeric_limits<int>::max)()) {
+                throw std::overflow_error("PowerDecimator output block size exceeds INT_MAX");
+            }
+            return (int)output;
+        }
+
+        static BlockBounds calculateBlockBounds(unsigned int ratio, int maxBlock) {
+            if (!checkRatio(ratio)) {
+                throw std::invalid_argument("PowerDecimator ratio must be a supported power of two");
+            }
+            if (ratio == 1 || maxBlock <= 0) { return { maxBlock, maxBlock }; }
+
+            const int planId = (int)log2(ratio) - 1;
+            const decim::plan plan = decim::plans[planId];
+            int stageMax = maxBlock;
+            int bufferMax = 0;
+            for (unsigned int i = 0; i < plan.stageCount; i++) {
+                stageMax = stageOutputBound(stageMax, plan.stages[i].decimation);
+                bufferMax = (std::max)(bufferMax, stageMax);
+            }
+            return { stageMax, bufferMax };
+        }
 
         // Build the replacement stages into locals and commit only once every
         // allocation has succeeded. Doing it in place would (a) discard a
@@ -74,6 +133,7 @@ namespace dsp::multirate {
         // first init() the destructor guard could not clean up either, because
         // _init is still false at that point.
         void reconfigure(unsigned int ratio) {
+            const BlockBounds bounds = calculateBlockBounds(ratio, _maxBlock);
             std::vector<std::unique_ptr<filter::DecimatingFIR<T, float>>> newFirs;
             int newStageCount = 0;
 
@@ -96,16 +156,18 @@ namespace dsp::multirate {
                     // The FIR adopts the tap set; if its allocation throws,
                     // the temporary releases it.
                     newFirs.emplace_back(new filter::DecimatingFIR<T, float>(taps::fromArray<float>(plan.stages[i].tapcount, plan.stages[i].taps), dec, stageMax));
-                    stageMax = (stageMax + dec - 1) / dec;
+                    stageMax = stageOutputBound(stageMax, dec);
                 }
             }
 
             decimFirs = std::move(newFirs);
             stageCount = newStageCount;
             _ratio = ratio;
+            _maxOutputBlock = bounds.outputMax;
+            _maxOutputBuffer = bounds.bufferMax;
         }
 
-        bool checkRatio(unsigned int ratio) {
+        static bool checkRatio(unsigned int ratio) {
             // Make sure ratio is a power of two, non-zero and lower or equal to maximum
             return ((ratio & (ratio - 1)) == 0) && ratio && ratio <= getMaxRatio();
         }

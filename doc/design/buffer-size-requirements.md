@@ -492,22 +492,25 @@ changes, all local:
 
     change                                                   saved
     ------------------------------------------------------   -------
-    RDS branch sized for RDS_SAMPLERATE (5 kHz)               61.9 MB
+    RDS branch sized for RDS_SAMPLERATE (5 kHz)               60.2 MB
     PowerDecimator stages sized by cumulative decimation      14.5 MB
     PolyphaseResampler sized for its post-decimation input     7.8 MB
     RealToComplex::nullBuf deleted                             4.0 MB
                                                              -------
-                                                              88.2 MB
+                                                              86.5 MB
 
-**199.4 MB -> 111.2 MB**, and construction is unchanged at 50 MB.
+**199.4 MB -> 112.9 MB**, and construction is unchanged at 50 MB.
 
 The RDS number is the interesting one. `BroadcastFM::rdsResamp` is 250 kHz ->
-5 kHz, so `rdsOut` and everything behind it can only ever carry `maxBlock / 50`
-samples — 20 064 with the slack for the resampler's retained phase. Sized for
-that, `rdsOut` is 0.32 MB instead of 16, RDSDemod's two complex scratch buffers
-0.32 instead of 16, its `soft` stream 0.16 instead of 8, its FIR delay line 0.67
-instead of 8.5. `BroadcastFM::getRDSMaxBlock()` publishes the bound and
-`RDSDemod::init()` takes it.
+5 kHz, so it publishes at most 20 001 samples from a one-million-sample input
+block, including retained phase. Its destination is also working storage,
+though: the first stage of the 32:1 power decimator writes 125 000 intermediate
+samples there before later stages reduce them. `rdsOut` therefore needs 2.00 MB
+instead of 16 MB, while the count it swaps is still at most 20 001. Everything
+behind it uses that final bound: RDSDemod's two complex scratch buffers total
+0.32 MB instead of 16, its `soft` stream is 0.16 instead of 8, and its FIR
+delay line is 0.67 instead of 8.5. `BroadcastFM::getRDSMaxBlock()` publishes
+the final bound and `RDSDemod::init()` takes it.
 
 `RealToComplex` is a different kind of waste: it kept `maxBlock` zero-valued
 floats purely to hand `volk_32f_x2_interleave_32fc()` an imaginary part, and
@@ -531,7 +534,7 @@ be reading, and `TempStop` stops a block but not its reader:
 What is left is now genuinely full-rate, and shrinks only when a producer's
 block size becomes knowable (§7 items 1-2). At the ~16 000-sample blocks §1.3
 observes in practice rather than the 1 000 000 the buffers are built for, the
-remaining ~111 MB would fall by a similar factor.
+remaining ~113 MB would fall by a similar factor.
 
 ### 2.5 The same two patterns elsewhere
 
@@ -543,18 +546,18 @@ Both generalise, and the survey found them throughout. Applied:
       filter delay line               not the input rate
       - demod VFO, 2.4 M -> 250 k                           8.5 MB   1.35 MB
       - ctcss.ddc, 50 k -> 500                              8.5 MB   0.59 MB
-    CTCSSSquelch ddcOut + fmOut     500 Hz (100:1 on NFM)   12.0 MB  0.12 MB
+    CTCSSSquelch ddcOut + fmOut     500 Hz (100:1 on NFM)   12.0 MB  8.04 MB
     IQFrontEnd reshape.out          one _nzFFTSize block    16.0 MB  1.05 MB
     7 decoder-module Reshapers      a fixed `keep`          8-16 MB  ~0.02 MB
-    VOR amvOut + fmvOut + out       1 kHz (25:1)            24.0 MB  0.96 MB
+    VOR amvOut + fmvOut + out       1 kHz (25:1)            24.0 MB 16.32 MB
     VOR amd -> magOut               an envelope buffer,
                                       not a demodulator     20.3 MB  4.00 MB
-    POCSAG soft + out               2400 baud (10:1)        10.0 MB  1.00 MB
+    POCSAG soft + out               MM minimum phase step   10.0 MB  1.18 MB
 
-VOR and POCSAG are per-module and only pay when that decoder is loaded, but
-they are the largest single reductions in the table: **39 MB** and **9 MB**.
+VOR and POCSAG are per-module and only pay when that decoder is loaded. The two
+VOR rows together save about **24 MB**; POCSAG saves **8.82 MB**.
 
-The VOR one is not a sizing question at all. `amd` was a complete
+The VOR `amd -> magOut` row is not a sizing question at all. `amd` was a complete
 `dsp::demod::AM<float>` -- its own output stream, a carrier-AGC buffer, a
 `DCBlocker` and an LPF delay line -- that was never `start()`ed and never
 `process()`ed. The receiver called `volk_32fc_magnitude_32f()` into
@@ -564,9 +567,12 @@ sibling-stream-as-scratch pattern the kernel split removed everywhere else.
 
 The `RxVFOKernel` one is the most widely shared: its filter runs *after* the
 resampler, so it sees the output rate, and every VFO in the application owns
-one. `IQFrontEnd` can use `Reshaper::setKeepBound()` where `iq_exporter` cannot,
-because `updateFFTPath()` holds a `TempStop` on both the reshaper and its sink
-and so satisfies the precondition.
+one. Its caller-provided output buffer is different: the fused kernel first
+writes the full-rate frequency-translator result there, so that buffer cannot
+shrink to the final resampler count. `IQFrontEnd` can use
+`Reshaper::setKeepBound()` where `iq_exporter` cannot, because `updateFFTPath()`
+holds a `TempStop` on both the reshaper and its sink and so satisfies the
+precondition.
 
 Not applied, and why:
 
@@ -590,65 +596,68 @@ Not applied, and why:
 ### 2.6 Rate-derived buffer sizes — review index
 
 **Every allocation below used to be `STREAM_BUFFER_SIZE` and is now derived
-from a sample-rate ratio.** Each is marked in the source with `[RATE-SIZED]`:
+from the producer that writes it.** Each is marked in the source with
+`[RATE-SIZED]`:
 
     grep -rn '\[RATE-SIZED\]' core/src decoder_modules
 
 None of these buffers is bound-checked at the point of writing — that is §1 and
 §7 item 1, and it has not changed. What *has* changed is that their capacity is
-now an argument rather than a constant, so a wrong ratio is a silent heap
-overflow instead of dead space. **This section is the list a human should
-re-derive**, ideally against §7's capacity tracking once it exists.
+now an argument rather than a constant, so a wrong bound is a silent heap
+overflow instead of dead space. The bounds are structural: each is calculated
+from the same plan or loop limits that govern the producer's data path.
 
-Two kinds, and the distinction matters:
-
-**Exact** — the ratio is structural, taken from something that also governs the
-data path, so the bound cannot disagree with reality unless the code below it is
-wrong:
+There are two distinct contracts. `maxOutputBlock()` is the largest count a
+producer returns or publishes. `maxOutputBuffer()` is the largest span it may
+write in the caller's destination while producing that count; fused and
+multi-stage kernels can require much more workspace than their final output.
 
     site                                      bound derived from
     ---------------------------------------   -------------------------------
     PowerDecimator::reconfigure() stageMax    the decimation plan's own
                                                 per-stage ratios
+    PowerDecimator::maxOutputBlock()           the final cumulative decimation
+    PowerDecimator::maxOutputBuffer()          the largest intermediate stage
+                                                output
     RationalResampler::reconfigure()          predecRatio, the power of two
       resampMax                                 the decimator above applies
     RationalResampler::maxOutputBlock()       predecRatio plus the selected
                                                 resampInterp / resampDecim
+    RationalResampler::maxOutputBuffer()      the larger of the final output
+                                                and power-decimator workspace
     RxVFOKernel::filterMaxBlock()             RationalResampler's actual
                                                 configured output bound
+    RxVFOKernel::maxOutputBuffer()            full-rate xlator output or the
+                                                resampler workspace, whichever
+                                                is larger
+    BroadcastFM RDS stream storage            rdsResamp.maxOutputBuffer()
+    BroadcastFM RDS published count          rdsResamp.maxOutputBlock()
+    CTCSSSquelch ddcOut                       RxVFOKernel::maxOutputBuffer()
+    CTCSSSquelch fmOut                        RxVFOKernel::maxOutputBlock()
+    vor::Receiver amvOut/fmvOut               RxVFOKernel::maxOutputBuffer()
+    vor::Receiver output stream              RxVFOKernel::maxOutputBlock()
+    MM::maxOutputBlock()                      the loop's minimum legal phase
+                                                advance after frequency/error
+                                                clamping
+    POCSAGDSP symbol streams                  MM::maxOutputBlock()
     Reshaper::init() maxKeep                  `keep`; bufferWorker() publishes
                                                 exactly that many samples
 
-**Assumed** — the ratio is computed from configured sample rates. If a rate
-changes without the bound following it, or the resampler emits more than the
-flat ratio predicts, these overflow:
+Four properties worth checking explicitly when this is reviewed:
 
-    site                          ratio                        writes into
-    ---------------------------   --------------------------   ------------------
-    BroadcastFM::rdsBlockFor      RDS_SAMPLERATE / samplerate  rdsOut, and every
-                                                                 buffer in RDSDemod
-    CTCSSSquelch::decodeBlockFor  CTCSS_DECODE_SAMPLERATE /    ddcOut, fmOut
-                                    samplerate
-    vor::Receiver::outBlockFor    VOR_OUT_SR / VOR_IN_SR       amvOut, fmvOut, out
-    POCSAGDSP::symbolBlockFor     baudrate / samplerate        soft, out
-
-Each remaining assumed bound adds **64 samples of slack** over the flat ratio,
-for the phase state a polyphase resampler or a clock-recovery loop retains
-across blocks. That figure is a guess that has not been derived from the loops'
-actual behaviour, and it is the single most likely thing in this section to be
-wrong.
-
-Three properties worth checking explicitly when this is reviewed:
-
-1. **`RxVFOKernel::filterMaxBlock()` now follows the resampler's selected
-   ratio**, including upward approximation and near-unity passthrough.
-   `setInSamplerate()` and `setOutSamplerate()` both reconfigure the resampler
-   before resizing the filter delay line.
-2. **`BroadcastFM::rdsBlockFor()` leaves the object.** `getRDSMaxBlock()` hands
-   it to `RDSDemod::init()`, which sizes two streams and four buffers from it.
-   It is the only one of these bounds that crosses a module boundary, and
-   nothing re-checks it on the other side.
-3. **None of them clamps down when the ratio exceeds 1.** A VFO or resampler
+1. **Final output and workspace are deliberately separate.** A 250 kHz ->
+   5 kHz RDS resampler returns at most 20 001 samples but writes a 125 000-sample
+   first-stage intermediate. `RxVFOKernel` needs still more because its xlator
+   writes the full input block before the resampler runs.
+2. **Preview APIs and live configuration use the same pure rate plan.** This
+   includes upward approximation and near-unity passthrough, and lets owners
+   grow a destination before changing a live producer. Reconfiguration paths
+   retain a larger old allocation rather than shrink before a throwing setter.
+3. **`BroadcastFM` publishes the selected RDS final-output bound.**
+   `getRDSMaxBlock()` hands it to `RDSDemod::init()`, which sizes two streams
+   and four buffers from it. It is the only one of these bounds that crosses a
+   module boundary, and nothing re-checks it on the other side.
+4. **None of the bounds clamps down when the ratio exceeds 1.** A VFO or resampler
    configured to interpolate produces *more* samples than it consumes, and
    clamping to `maxBlock` there would under-size rather than merely waste. The
    code deliberately returns the larger figure; §1.2 notes that nothing rejects
@@ -1077,10 +1086,11 @@ hands a FIR by lvalue.
 9. **Fix the constants that do not track `STREAM_BUFFER_SIZE`** — the
    `+ 64000` working-buffer headroom and `RING_BUF_SZ` (§5.3). They are 8.35 MB
    of the WFM total at any capacity, which is 55 % of it at 65 536.
-11. **Re-derive every `[RATE-SIZED]` bound** (§2.6), in particular the 64-sample
-   slack each of them adds for retained resampler and clock-recovery phase.
-   These are the allocations that stopped being constant, and none of them is
-   bound-checked at the point of writing.
+11. **Re-derive every `[RATE-SIZED]` bound — done** (§2.6). POCSAG uses
+   `MM::maxOutputBlock()`; BroadcastFM, CTCSS and VOR use the rational
+   resampler's selected final-output and workspace bounds. Canary tests cover
+   both spans. The allocations are still not generically bound-checked at the
+   point of writing; that remains item 1.
 10. **Make a failed reconfiguration leave a coherent block** (§5.2): `TempStop`
    restarts the worker while the exception is still unwinding, so every
    reconfiguration has to be transactional -- acquire everything into locals,

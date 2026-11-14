@@ -7,14 +7,25 @@
 
 // RAII owners for FFTW plans and buffers.
 
+// Same rule as SDRPP_CPP_EXPORT in module.h, repeated here so this DSP header
+// does not have to pull in module.h (and with it Windows.h and json.hpp).
+#ifdef _WIN32
+#ifdef SDRPP_IS_CORE
+#define SDRPP_FFTW_EXPORT __declspec(dllexport)
+#else
+#define SDRPP_FFTW_EXPORT __declspec(dllimport)
+#endif
+#else
+#define SDRPP_FFTW_EXPORT
+#endif
+
 namespace dsp::buffer {
-    // Guards every FFTW entry point except fftwf_execute(). Function-local
-    // static so the ordering is defined however the owners are constructed.
-    // Everything in FFTW but the fftwf_execute() needs to be serialized.
-    inline std::mutex& fftwMutex() {
-        static std::mutex mtx;
-        return mtx;
-    }
+    // Guards every FFTW entry point except fftwf_execute(); the FFTW planner
+    // is not thread-safe. Defined once, in core (fftw_mutex.cpp), and exported:
+    // as an inline function each module DLL would get its own copy of the
+    // static, and planning in dab_decoder or logmmse would not be serialized
+    // against planning in core.
+    SDRPP_FFTW_EXPORT std::mutex& fftwMutex();
 
     [[noreturn]] inline void throwFFTWAllocFailure(size_t bytes) {
         flog::error("fftwf_malloc failed to allocate {0} bytes", (uint64_t)bytes);

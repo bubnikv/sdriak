@@ -57,6 +57,26 @@ namespace dsp::multirate {
             return _maxOutputBlock;
         }
 
+        // Capacity required by the caller-provided `out` buffer. This can be
+        // larger than maxOutputBlock(): a multi-stage power decimator writes an
+        // intermediate block into `out` before later stages reduce it.
+        int maxOutputBuffer() const {
+            assert(_init);
+            return _maxOutputBuffer;
+        }
+
+        // Preview the bound without constructing or reconfiguring a resampler.
+        // Callers that own a rate-sized destination use this to allocate before
+        // mutating a live producer, while sharing the exact same ratio-selection
+        // logic as reconfigure().
+        static int maxOutputBlockForRates(double inSamplerate, double outSamplerate, int maxBlock = STREAM_BUFFER_SIZE) {
+            return calculateRatePlan(inSamplerate, outSamplerate, maxBlock).outputMax;
+        }
+
+        static int maxOutputBufferForRates(double inSamplerate, double outSamplerate, int maxBlock = STREAM_BUFFER_SIZE) {
+            return calculateRatePlan(inSamplerate, outSamplerate, maxBlock).bufferMax;
+        }
+
         void setInSamplerate(double inSamplerate) {
             assert(_init);
             _inSamplerate = inSamplerate;
@@ -93,6 +113,12 @@ namespace dsp::multirate {
                     // ones included.
                     if (out != in) { memcpy(out, in, count * sizeof(T)); }
                     return count;
+                case Mode::DROP:
+                    // A reconfiguration failed after partially mutating the
+                    // internal stages. Emit nothing until a later successful
+                    // configuration rather than copying a full input block into
+                    // a rate-sized destination that may be much smaller.
+                    return 0;
             }
             return count;
         }
@@ -105,7 +131,8 @@ namespace dsp::multirate {
             BOTH,
             DECIM_ONLY,
             RESAMP_ONLY,
-            NONE
+            NONE,
+            DROP
         };
 
         // Largest polyphase bank we are willing to build. The bank costs
@@ -187,47 +214,97 @@ namespace dsp::multirate {
             return (int)output;
         }
 
+        struct RatePlan {
+            bool validRates = false;
+            bool useDecim = false;
+            bool useResamp = false;
+            int predecRatio = 1;
+            double intSamplerate = 0.0;
+            int resampInterp = 1;
+            int resampDecim = 1;
+            int resampMax = 0;
+            int outputMax = 0;
+            int bufferMax = 0;
+            double error = 0.0;
+        };
+
+        // Pure rate arithmetic shared by the live reconfiguration path and by
+        // owners that must size their destination before changing the producer.
+        // Keeping it in one place is essential: MAX_INTERP approximation may
+        // round upward or select passthrough, so the requested rate ratio is not
+        // itself an output-capacity bound.
+        static RatePlan calculateRatePlan(double inSamplerate, double outSamplerate, int maxBlock) {
+            RatePlan plan;
+            plan.intSamplerate = inSamplerate;
+            plan.outputMax = maxBlock;
+            plan.bufferMax = maxBlock;
+            if (!(inSamplerate > 0.0) || !(outSamplerate > 0.0)) { return plan; }
+            plan.validRates = true;
+
+            const int maxPredecPower = (int)log2((double)PowerDecimator<T>::getMaxRatio());
+            int predecPower = 0;
+            if (inSamplerate > outSamplerate) {
+                predecPower = std::min<int>((int)floor(log2(inSamplerate / outSamplerate)), maxPredecPower);
+            }
+            plan.predecRatio = std::min<int>(1 << predecPower, PowerDecimator<T>::getMaxRatio());
+            plan.useDecim = (inSamplerate > outSamplerate && predecPower > 0);
+            if (plan.useDecim) {
+                plan.intSamplerate = inSamplerate / (double)plan.predecRatio;
+            }
+
+            const int64_t ratioNum = (int64_t)llround(outSamplerate) * (int64_t)plan.predecRatio;
+            const int64_t ratioDen = (int64_t)llround(inSamplerate);
+            const int64_t g = std::gcd(ratioNum, ratioDen);
+            approxRatio(g ? (ratioNum / g) : ratioNum, g ? (ratioDen / g) : ratioDen,
+                        MAX_INTERP, plan.resampInterp, plan.resampDecim);
+
+            const double actualOutSR = plan.intSamplerate * (double)plan.resampInterp / (double)plan.resampDecim;
+            plan.error = fabs((actualOutSR - outSamplerate) / outSamplerate) * 100.0;
+            plan.resampMax = plan.useDecim
+                ? PowerDecimator<T>::maxOutputBlockForRatio(plan.predecRatio, maxBlock)
+                : maxBlock;
+            plan.useResamp = (plan.resampInterp != plan.resampDecim);
+            plan.outputMax = plan.useResamp
+                ? boundedOutput(plan.resampMax, plan.resampInterp, plan.resampDecim, 1)
+                : plan.resampMax;
+            const int decimBufferMax = plan.useDecim
+                ? PowerDecimator<T>::maxOutputBufferForRatio(plan.predecRatio, maxBlock)
+                : 0;
+            plan.bufferMax = (std::max)(decimBufferMax, plan.outputMax);
+            return plan;
+        }
+
         void reconfigure() {
+            const RatePlan plan = calculateRatePlan(_inSamplerate, _outSamplerate, _maxBlock);
+
             // A non-positive rate yields interp == 0, which reaches
             // buildPolyphaseBank() as a zero phase count: a division by zero
             // computing tapsPerPhase, and a zero-sized allocation. Stay in
             // passthrough instead.
-            if (!(_inSamplerate > 0.0) || !(_outSamplerate > 0.0)) {
+            if (!plan.validRates) {
                 flog::warn("Resampler configured with a non-positive rate ({0} -> {1}), passing through",
                            _inSamplerate, _outSamplerate);
                 mode = Mode::NONE;
-                _maxOutputBlock = _maxBlock;
+                _maxOutputBlock = plan.outputMax;
+                _maxOutputBuffer = plan.bufferMax;
                 return;
             }
-
-            // Calculate highest power-of-two decimation for the power decimator.
-            // Only meaningful when decimating: when upsampling, log2() is negative
-            // and shifting by a negative count is undefined behaviour. Cap the
-            // power, not the ratio -- shifting by getMaxRatio() would itself be
-            // undefined behaviour.
-            const int maxPredecPower = (int)log2((double)PowerDecimator<T>::getMaxRatio());
-            int predecPower = 0;
-            if (_inSamplerate > _outSamplerate) {
-                predecPower = std::min<int>((int)floor(log2(_inSamplerate / _outSamplerate)), maxPredecPower);
-            }
-            int predecRatio = std::min<int>(1 << predecPower, PowerDecimator<T>::getMaxRatio());
-            double intSamplerate = _inSamplerate;
 
             // Configure the DDC.
             //
             // From here on the sub-blocks are mutated one at a time and any of
             // them can throw on OOM, so there is no way to keep decim, resamp
-            // and mode consistent through a failure. Drop to passthrough first:
-            // a wrong output rate is recoverable and audible, whereas a stale
-            // mode running new phase arithmetic against an old bank indexes out
-            // of bounds. mode is committed again at each exit below.
-            mode = Mode::NONE;
-            _maxOutputBlock = _maxBlock;
+            // and mode consistent through a failure. Stop emitting first: a
+            // silent branch is recoverable, whereas passthrough could overrun a
+            // rate-sized destination and a stale mode could run new phase
+            // arithmetic against an old bank. mode is committed again at each
+            // successful exit below.
+            mode = Mode::DROP;
+            _maxOutputBlock = 0;
+            _maxOutputBuffer = 0;
 
-            bool useDecim = (_inSamplerate > _outSamplerate && predecPower > 0);
-            if (useDecim) {
-                intSamplerate = _inSamplerate / (double)predecRatio;
-                decim.setRatio(predecRatio);
+            if (plan.useDecim) {
+                decim.setRatio(plan.predecRatio);
             }
 
             // Calculate interpolation and decimation for the polyphase resampler.
@@ -245,58 +322,48 @@ namespace dsp::multirate {
             // polyphase side is `resampInterp`/`resampDecim`. The old code
             // declared a local `decim` here that shadowed the member, and only
             // worked because decim.setRatio() happens to sit above it.
-            const int64_t ratioNum = (int64_t)llround(_outSamplerate) * (int64_t)predecRatio;
-            const int64_t ratioDen = (int64_t)llround(_inSamplerate);
-            const int64_t g = std::gcd(ratioNum, ratioDen);
-            int resampInterp = 1;
-            int resampDecim = 1;
-            approxRatio(g ? (ratioNum / g) : ratioNum, g ? (ratioDen / g) : ratioDen, MAX_INTERP, resampInterp, resampDecim);
-
             // Check for excessive error
-            double actualOutSR = intSamplerate * (double)resampInterp / (double)resampDecim;
-            double error = fabs((actualOutSR - _outSamplerate) / _outSamplerate) * 100.0;
-            if (error > 0.01) {
+            if (plan.error > 0.01) {
                 flog::warn("Resampling error is over 0.01%: {0}% ({1} -> {2}, interp {3}, decim {4})",
-                           error, _inSamplerate, _outSamplerate, resampInterp, resampDecim);
+                           plan.error, _inSamplerate, _outSamplerate, plan.resampInterp, plan.resampDecim);
             }
 
             // If the power decimator already did all the work, don't use the resampler
-            if (resampInterp == resampDecim) {
-                _maxOutputBlock = useDecim ? boundedOutput(_maxBlock, 1, predecRatio) : _maxBlock;
-                mode = useDecim ? Mode::DECIM_ONLY : Mode::NONE;
+            if (!plan.useResamp) {
+                _maxOutputBlock = plan.outputMax;
+                _maxOutputBuffer = plan.bufferMax;
+                mode = plan.useDecim ? Mode::DECIM_ONLY : Mode::NONE;
                 return;
             }
 
             // Configure the polyphase resampler
-            double tapSamplerate = intSamplerate * (double)resampInterp;
+            double tapSamplerate = plan.intSamplerate * (double)plan.resampInterp;
             double tapBandwidth = std::min<double>(_inSamplerate, _outSamplerate) / 2.0;
             double tapTransWidth = tapBandwidth * 0.1;
             // Local: the resampler builds its phase bank from it and keeps no reference.
             tap<float> rtaps = taps::lowPass(tapBandwidth, tapTransWidth, tapSamplerate);
             // Interpolating by N spreads the energy over N phases; restore the gain.
-            rtaps.scale((float)resampInterp);
+            rtaps.scale((float)plan.resampInterp);
             // The polyphase stage only ever sees what the power decimator in
             // front of it emits, so its delay line is sized for that and not
             // for the block the owner was configured with.
             // [RATE-SIZED] Exact: predecRatio is a power of two applied by
             // the decimator above, so this is its true output bound. see doc/design/buffer-size-requirements.md 2.6
-            const int resampMax = useDecim ? boundedOutput(_maxBlock, 1, predecRatio) : _maxBlock;
-            // At an arbitrary retained phase a block can produce one sample
-            // beyond the flat ceil(input * interp / decim) ratio.
-            const int outputMax = boundedOutput(resampMax, resampInterp, resampDecim, 1);
-            resamp.setRatio(resampInterp, resampDecim, rtaps, resampMax);
+            resamp.setRatio(plan.resampInterp, plan.resampDecim, rtaps, plan.resampMax);
 
             flog::debug("[Resamp] predec: {0}, interp: {1}, decim: {2}, inacc: {3}%, taps: {4}",
-                        predecRatio, resampInterp, resampDecim, error, rtaps.size());
+                        plan.predecRatio, plan.resampInterp, plan.resampDecim, plan.error, rtaps.size());
 
-            _maxOutputBlock = outputMax;
-            mode = useDecim ? Mode::BOTH : Mode::RESAMP_ONLY;
+            _maxOutputBlock = plan.outputMax;
+            _maxOutputBuffer = plan.bufferMax;
+            mode = plan.useDecim ? Mode::BOTH : Mode::RESAMP_ONLY;
         }
         
         PowerDecimator<T> decim;
         PolyphaseResampler<T> resamp;
         int _maxBlock = STREAM_BUFFER_SIZE;
         int _maxOutputBlock = STREAM_BUFFER_SIZE;
+        int _maxOutputBuffer = STREAM_BUFFER_SIZE;
         double _inSamplerate;
         double _outSamplerate;
         Mode mode = Mode::NONE;

@@ -1,6 +1,4 @@
 #pragma once
-#include <cmath>
-#include <algorithm>
 #include "quadrature.h"
 #include "../taps/low_pass.h"
 #include "../taps/band_pass.h"
@@ -34,23 +32,10 @@ namespace dsp::demod {
         // getRDSMaxBlock(). At the usual 250 kHz IF that is a 50:1 reduction.
         static constexpr double RDS_SAMPLERATE = 5000.0;
 
-        // Largest block the RDS output can carry, for a given input bound.
-        // Deliberately not clamped to maxBlock: if someone configures an input
-        // rate below RDS_SAMPLERATE the branch interpolates, and under-sizing
-        // it would overflow rather than merely waste.
-        // [RATE-SIZED] ASSUMED ratio: RDS_SAMPLERATE / samplerate. This bound
-        // leaves the object -- getRDSMaxBlock() hands it to RDSDemod, which
-        // sizes its own streams and buffers from it -- so an error here
-        // propagates across a module boundary. see doc/design/buffer-size-requirements.md 2.6
-        static int rdsBlockFor(int maxBlock, double samplerate) {
-            if (!(samplerate > 0.0) || maxBlock <= 0) { return maxBlock; }
-            // + 64 for the resampler's retained phase state, which can emit one
-            // extra sample beyond the flat ratio on any given block.
-            double n = std::ceil((double)maxBlock * RDS_SAMPLERATE / samplerate) + 64.0;
-            return (int)(std::max)(1.0, n);
-        }
-
-        // Valid after init(). Hand this to whatever consumes rdsOut.
+        // Valid after init(). This is the selected resampler bound, including
+        // capped ratio approximation and retained phase. Hand it to whatever
+        // consumes rdsOut; the same capacity must propagate across the module
+        // boundary into RDSDemod.
         int getRDSMaxBlock() const { return _rdsMaxBlock; }
 
         virtual void init(stream<complex_t>* in, double deviation, double samplerate, bool stereo = true, bool lowPass = true, bool rdsOut = false, int maxBlock = STREAM_BUFFER_SIZE) {
@@ -78,13 +63,19 @@ namespace dsp::demod {
             xlator.init(-57000.0, samplerate);
             rdsResamp.init(samplerate, RDS_SAMPLERATE, _maxBlock);
 
-            // [RATE-SIZED] rdsOut is no longer STREAM_BUFFER_SIZE; it holds
-            // ~1/50 of a block at the usual 250 kHz IF. Nothing is started yet,
-            // so no reader can hold the old buffer. see doc/design/buffer-size-requirements.md 2.6
-            _rdsMaxBlock = rdsBlockFor(_maxBlock, samplerate);
+            // [RATE-SIZED] rdsOut publishes ~1/50 of a block at the usual
+            // 250 kHz IF, but its backing storage is also the resampler's
+            // workspace. The first stage of the 32:1 power decimator writes a
+            // larger intermediate block there. Query both bounds from the
+            // producer rather than recomputing the requested rate ratio:
+            // MAX_INTERP approximation can round upward or select passthrough.
+            // Nothing is started yet, so no reader can hold the old buffer.
+            // see doc/design/buffer-size-requirements.md 2.6
+            _rdsMaxBlock = rdsResamp.maxOutputBlock();
+            _rdsWorkMaxBlock = rdsResamp.maxOutputBuffer();
             // this-> because init()'s `bool rdsOut` parameter shadows the
             // stream member of the same name.
-            this->rdsOut.setBufferSize(_rdsMaxBlock);
+            this->rdsOut.setBufferSize(_rdsWorkMaxBlock);
 
             // Scratch for the fused stages. Every stage that can runs in place
             // on a buffer owned by an earlier one; see process() for who holds
@@ -109,6 +100,28 @@ namespace dsp::demod {
             assert(base_type::_block_init);
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
             dsp::block::TempStop guard(this);
+
+            // Preview the producer's selected ratio and grow its destination
+            // before reconfiguring it. If allocation throws, the old producer
+            // and capacity still agree; if a later setter throws, the excess
+            // capacity is harmless.
+            //
+            // PRECONDITION: the caller must have stopped whatever consumes
+            // rdsOut. TempStop above stops this block, not the reader, and
+            // setBufferSize() frees the buffer that reader may still hold.
+            // Grow-only, so a rate that needs less keeps the larger buffer
+            // until the next init() -- memory, never correctness. (No caller
+            // today: WFM's IF rate is the constant 250 kHz.)
+            // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
+            const int wantedOutput = multirate::RationalResampler<complex_t>::maxOutputBlockForRates(
+                samplerate, RDS_SAMPLERATE, _maxBlock);
+            const int wantedWork = multirate::RationalResampler<complex_t>::maxOutputBufferForRates(
+                samplerate, RDS_SAMPLERATE, _maxBlock);
+            if (wantedWork > _rdsWorkMaxBlock) {
+                rdsOut.setBufferSize(wantedWork);
+                _rdsWorkMaxBlock = wantedWork;
+            }
+
             _samplerate = samplerate;
 
             demod.setDeviation(_deviation, _samplerate);
@@ -126,22 +139,9 @@ namespace dsp::demod {
 
             xlator.setOffset(-57000.0, samplerate);
             rdsResamp.setInSamplerate(samplerate);
-
-            // Keep the RDS branch sized for the new rate; a lower IF rate
-            // means *more* RDS samples per block.
-            //
-            // PRECONDITION: the caller must have stopped whatever consumes
-            // rdsOut. TempStop above stops this block, not the reader, and
-            // setBufferSize() frees the buffer that reader may still hold.
-            // Grow-only, so a rate that needs less keeps the larger buffer
-            // until the next init() -- memory, never correctness. (No caller
-            // today: WFM's IF rate is the constant 250 kHz.)
-            // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
-            int wanted = rdsBlockFor(_maxBlock, samplerate);
-            if (wanted > _rdsMaxBlock) {
-                _rdsMaxBlock = wanted;
-                rdsOut.setBufferSize(_rdsMaxBlock);
-            }
+            _rdsMaxBlock = wantedOutput;
+            assert(rdsResamp.maxOutputBlock() == _rdsMaxBlock);
+            assert(rdsResamp.maxOutputBuffer() <= _rdsWorkMaxBlock);
 
             reset();
         }
@@ -287,6 +287,7 @@ namespace dsp::demod {
     protected:
         int _maxBlock = STREAM_BUFFER_SIZE;
         int _rdsMaxBlock = STREAM_BUFFER_SIZE;
+        int _rdsWorkMaxBlock = STREAM_BUFFER_SIZE;
         double _deviation;
         double _samplerate;
         bool _stereo;

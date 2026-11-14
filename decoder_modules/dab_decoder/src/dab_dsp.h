@@ -193,7 +193,7 @@ namespace dab {
             lv_32fc_t phase = lv_cmake(1.0f, 0.0f);
             lv_32fc_t phaseDelta = lv_cmake(cos(offset), sin(offset));
 #if VOLK_VERSION >= 030100
-            volk_32fc_s32fc_x2_rotator2_32fc((lv_32fc_t*)_in->readBuf, (lv_32fc_t*)_in->readBuf, phaseDelta, &phase, count);
+            volk_32fc_s32fc_x2_rotator2_32fc((lv_32fc_t*)_in->readBuf, (lv_32fc_t*)_in->readBuf, &phaseDelta, &phase, count);
 #else
             volk_32fc_s32fc_x2_rotator_32fc((lv_32fc_t*)_in->readBuf, (lv_32fc_t*)_in->readBuf, phaseDelta, &phase, count);
 #endif

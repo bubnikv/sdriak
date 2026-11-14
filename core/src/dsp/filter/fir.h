@@ -40,8 +40,9 @@ namespace dsp::filter {
         // maxBlock defaults to -1, meaning "keep the current delay line".
         // Pass a value when the caller's block bound has changed -- a filter
         // that runs after a resampler sees a fraction of the block its owner
-        // was sized for, and the delay line is the expensive part. Resizing
-        // discards the history, so only do it while reconfiguring a rate.
+        // was sized for, and the delay line is the expensive part. Capacity
+        // changes preserve the newest history; callers whose sample domain
+        // changed must reset explicitly after publishing the new taps.
         //
         // The previous set, if owned, is freed only after the new one is
         // published, so the FIR never points at freed taps.
@@ -55,13 +56,16 @@ namespace dsp::filter {
             m_ownedTaps.release();
         }
 
-        // Resize the delay line for a new block bound, keeping the taps.
-        // Discards the history when the bound actually changes.
+        // Resize the delay line for a new block bound, keeping both the taps
+        // and retained samples. A capacity change by itself is not a signal
+        // discontinuity.
         void setMaxBlock(int maxBlock) {
-            applyTaps(m_taps, maxBlock);
+            assert(m_init);
+            m_hist.setMaxBlock(maxBlock);
         }
 
         int tapCount() const { return m_taps.size(); }
+        int maxBlock() const { return m_hist.maxBlock(); }
         bool ownsTaps() const { return m_ownedTaps.taps() != NULL; }
 
         // The set this FIR owns, for another FIR to borrow. The borrower must
@@ -116,21 +120,23 @@ namespace dsp::filter {
         // Publishes a new active tap set and, if maxBlock > 0, a new block
         // bound. Overridden by DecimatingFIR to reset its phase.
         //
-        // The delay line is reshaped before the taps are committed, and both
-        // HistoryBuffer calls give the strong guarantee, so a throw leaves the
-        // FIR on its old taps, bound and delay line.
+        // The delay line is reshaped before the taps are committed. Each
+        // HistoryBuffer operation has the strong guarantee. If growing the
+        // history fails after a successful capacity change, the FIR retains
+        // its old taps and history with only harmless extra block capacity.
         virtual void applyTaps(TapView<T> taps, int maxBlock) {
             assert(m_init);
             if (maxBlock > 0 && maxBlock != m_hist.maxBlock()) {
                 // [RATE-SIZED] Same contract as init(): the new bound comes
-                // from the caller's rate arithmetic. Discards the history.
+                // from the caller's rate arithmetic. This changes capacity,
+                // not the sample domain, so keep the retained samples.
                 // see doc/design/buffer-size-requirements.md 2.6
-                m_hist.resize(maxBlock, taps.size() - 1);
+                m_hist.setMaxBlock(maxBlock);
             }
-            else {
-                // Keeps the history, so a tap change is seamless.
-                m_hist.setHistory(taps.size() - 1);
-            }
+            // Keeps the newest samples when the tap count changes, matching
+            // the pre-kernel FIR behavior. A caller changing sample domains is
+            // responsible for an explicit reset after the new taps commit.
+            m_hist.setHistory(taps.size() - 1);
             m_taps = taps;
         }
 

@@ -1,6 +1,4 @@
 #pragma once
-#include <cmath>
-#include <algorithm>
 #include "../channel/rx_vfo.h"
 #include "../demod/quadrature.h"
 #include "../filter/fir.h"
@@ -152,19 +150,6 @@ namespace dsp::noise_reduction {
 
         }
 
-        // Largest block the decode branch can carry. The DDC drops the AF rate
-        // to CTCSS_DECODE_SAMPLERATE -- 100:1 from NFM's 50 kHz -- so sizing
-        // these for a full block pays a hundred times over. + 64 for the
-        // resampler's retained phase state.
-        // [RATE-SIZED] ASSUMED ratio: CTCSS_DECODE_SAMPLERATE / samplerate.
-        // ddcOut and fmOut are sized from this and written by process() with no
-        // bound check. see doc/design/buffer-size-requirements.md 2.6
-        static int decodeBlockFor(int maxBlock, double samplerate) {
-            if (!(samplerate > 0.0) || maxBlock <= 0) { return maxBlock; }
-            double n = std::ceil((double)maxBlock * CTCSS_DECODE_SAMPLERATE / samplerate) + 64.0;
-            return (int)(std::max)(1.0, n);
-        }
-
         void init(stream<stereo_t>* in, double samplerate, int maxBlock = STREAM_BUFFER_SIZE) {
             // Save settings
             _samplerate = samplerate;
@@ -173,10 +158,16 @@ namespace dsp::noise_reduction {
             // Initialize the DDC and FM demod
             ddc.init(samplerate, CTCSS_DECODE_SAMPLERATE, CTCSS_DECODE_BANDWIDTH, CTCSS_DECODE_OFFSET, _maxBlock);
             fm.init(1.0, CTCSS_DECODE_SAMPLERATE);
-            // [RATE-SIZED] Neither of these is STREAM_BUFFER_SIZE any more:
-            // 100:1 below the AF rate on NFM. see doc/design/buffer-size-requirements.md 2.6
-            _decodeMaxBlock = decodeBlockFor(_maxBlock, samplerate);
-            ddcOut.allocate(_decodeMaxBlock);
+            // [RATE-SIZED] fmOut follows the final 500 Hz output bound. ddcOut
+            // is larger because the fused DDC first translates a full-rate
+            // block into it, then uses it for intermediate decimator stages.
+            // Query both bounds from the producer rather than the requested
+            // rate ratio, since the capped approximation may round upward or
+            // choose passthrough.
+            // see doc/design/buffer-size-requirements.md 2.6
+            _decodeMaxBlock = ddc.maxOutputBlock();
+            _ddcWorkMaxBlock = ddc.maxOutputBuffer();
+            ddcOut.allocate(_ddcWorkMaxBlock);
             fmOut.allocate(_decodeMaxBlock);
 
             // Initilize the base block class
@@ -188,33 +179,34 @@ namespace dsp::noise_reduction {
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
             dsp::block::TempStop guard(this);
 
-            // A lower AF rate means more decode samples per block. Both buffers
-            // are internal to this block and the worker is stopped, so unlike a
-            // stream they can simply be resized.
+            // Both buffers are internal to this block and the worker is stopped.
+            // ddcOut is sized for the largest write made anywhere in the fused
+            // VFO (including its full-rate xlator); fmOut only needs the final
+            // returned sample count.
             // [RATE-SIZED] see doc/design/buffer-size-requirements.md 2.6
             //
-            // Both buffers are acquired before either is committed, and the DDC
-            // -- the producer -- is reconfigured on the safe side of the resize:
-            // grow the buffers before telling it to emit more, shrink them only
-            // once it is emitting less. Retuning first and then failing to
-            // allocate would restart the worker with a DDC sized for a block the
-            // buffers cannot hold, and process() writes it with no bound check.
-            auto resizeTo = [&](int n) {
-                buffer::Buffer<complex_t> newDdcOut(n);
-                buffer::Buffer<float> newFmOut(n);
-                ddcOut = std::move(newDdcOut);
-                fmOut = std::move(newFmOut);
-                _decodeMaxBlock = n;
-            };
-            const int wanted = decodeBlockFor(_maxBlock, samplerate);
-            if (wanted > _decodeMaxBlock) {
-                resizeTo(wanted);
-                ddc.setInSamplerate(samplerate);
+            // Grow every destination before mutating the DDC, and never shrink
+            // it here. This covers every failure point: a preview/allocation
+            // failure leaves the old producer and capacities together; a DDC
+            // failure either leaves the old producer or switches its resampler
+            // into the no-output failure mode; and a failure after its
+            // resampler commits still has the requested larger buffers. A later
+            // lower rate may retain excess capacity, which costs memory but not
+            // correctness.
+            const int wantedOutput = ddc.maxOutputBlockForInSamplerate(samplerate);
+            const int wantedWork = ddc.maxOutputBufferForInSamplerate(samplerate);
+            if (wantedWork > _ddcWorkMaxBlock) {
+                ddcOut.allocate(wantedWork);
+                _ddcWorkMaxBlock = wantedWork;
             }
-            else {
-                ddc.setInSamplerate(samplerate);
-                if (wanted < _decodeMaxBlock) { resizeTo(wanted); }
+            if (wantedOutput > _decodeMaxBlock) {
+                fmOut.allocate(wantedOutput);
+                _decodeMaxBlock = wantedOutput;
             }
+
+            ddc.setInSamplerate(samplerate);
+            assert(ddc.maxOutputBlock() <= _decodeMaxBlock);
+            assert(ddc.maxOutputBuffer() <= _ddcWorkMaxBlock);
 
             _samplerate = samplerate;
         }
@@ -345,6 +337,7 @@ namespace dsp::noise_reduction {
 
         int _maxBlock = STREAM_BUFFER_SIZE;
         int _decodeMaxBlock = STREAM_BUFFER_SIZE;
+        int _ddcWorkMaxBlock = STREAM_BUFFER_SIZE;
         channel::RxVFOKernel ddc;
         buffer::Buffer<complex_t> ddcOut;   // scratch, in place of its old out stream
         demod::Quadrature fm;

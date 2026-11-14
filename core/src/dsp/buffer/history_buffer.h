@@ -60,6 +60,27 @@ namespace dsp::buffer {
             clear();
         }
 
+        // Change only the largest block push() may receive, preserving every
+        // retained history sample. The history lives before the current block,
+        // so changing the amount of room after it does not change its sample
+        // domain or invalidate it. Acquire first and commit second: allocation
+        // failure leaves both the old capacity and history intact.
+        void setMaxBlock(int maxBlock) {
+            assert(maxBlock >= 0);
+            if (maxBlock == m_maxBlock) { return; }
+            if (!m_buf.get()) {
+                init(maxBlock, m_history);
+                return;
+            }
+
+            Buffer<T> fresh(capacityFor(maxBlock, m_room));
+            if (m_history > 0) {
+                memcpy(fresh.get(), m_buf.get(), (size_t)m_history * sizeof(T));
+            }
+            m_buf = std::move(fresh);
+            m_maxBlock = maxBlock;
+        }
+
         // New history length, keeping the newest samples: they stay right
         // before the block, and the slots entering on the left are zero (or
         // the oldest ones drop off when it shrinks), so a filter changing its
