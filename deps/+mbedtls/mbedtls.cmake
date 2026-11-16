@@ -24,6 +24,11 @@ add_cmake_project(mbedtls
         -DENABLE_PROGRAMS=OFF
         -DENABLE_TESTING=OFF
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        # Bionic is not glibc, so Mbed TLS 3.6.7 does not compile its Linux
+        # getrandom() path on Android. Its fallback is /dev/random, which can
+        # block on pre-5.6 kernels whenever blocking-pool entropy accounting is
+        # low, even after the kernel CSPRNG has been initialized.
+        -DMBEDTLS_USER_CONFIG_FILE:FILEPATH=${CMAKE_CURRENT_LIST_DIR}/sdriak_user_config.h
 )
 
 sdrpp_validate_dep(mbedtls

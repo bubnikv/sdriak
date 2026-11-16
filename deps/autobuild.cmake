@@ -121,7 +121,8 @@ set(_deps_install_prefix "${_build_dir}/destdir/usr/local")
 # being restored via restore-keys after a recipe edit.
 #
 # Hash inputs are every file the deps sub-build's configure or compile
-# pipeline can read: each recipe (deps/+<name>/*.cmake), each patch
+# pipeline can read: each recipe (deps/+<name>/*.cmake), user configuration
+# header (deps/+<name>/*.h), each patch
 # (deps/+<name>/patches/* and deps/+<name>/*.patch — some recipes keep a
 # single patch flat next to the recipe), the shared cmake helpers
 # (deps/cmake/*.cmake),
@@ -136,6 +137,7 @@ set(_deps_marker "${_deps_install_prefix}/share/sdrpp-deps/recipe-hash")
 file(GLOB_RECURSE _recipe_hash_inputs
     LIST_DIRECTORIES FALSE
     "${_deps_src_dir}/+*/*.cmake"
+    "${_deps_src_dir}/+*/*.h"
     "${_deps_src_dir}/+*/*.patch"
     "${_deps_src_dir}/+*/patches/*"
     "${_deps_src_dir}/cmake/*.cmake")
