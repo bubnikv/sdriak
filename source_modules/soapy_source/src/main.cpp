@@ -469,7 +469,9 @@ private:
     }
 
     static void _worker(SoapyModule* _this) {
-        int blockSize = _this->sampleRate / 200.0f;
+        // readStream() treats this count as the capacity of writeBuf, and the
+        // maximum rate is whatever the backend reports.
+        int blockSize = dsp::sourceBlockSize(_this->sampleRate, _this->stream);
         int flags = 0;
         long long timeMs = 0;
 

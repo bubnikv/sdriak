@@ -133,7 +133,7 @@ namespace rfspace {
         std::lock_guard<std::mutex> lck(bufferMtx);
 
         // Update block size
-        blockSize = sampleRate / 200;
+        blockSize = dsp::sourceBlockSize(sampleRate, *output);
 
         // Send samplerate to device
         setControlItemWithChanID(RFSPACE_CTRL_ITEM_IQ_SAMP_RATE, 0, &sampleRate, sizeof(sampleRate));
@@ -189,12 +189,28 @@ namespace rfspace {
 
             // Decode header
             uint8_t type = header >> 13;
-            uint16_t size = header & 0b1111111111111;
+            int size = header & 0b1111111111111;
 
-            // Receive data
-            if (tcp->recv(buffer, size - 2, true, RFSPACE_TIMEOUT_MS) <= 0) { break; }
-            
-            // Check for a device ID
+            // In the NetSDR protocol a data item with length 0 means 8194
+            // bytes; its 8192-byte payload exactly fills the buffer.
+            if (size == 0 && type >= RFSPACE_MSG_TYPE_T2H_DATA_ITEM_0) { size = RFSPACE_MAX_ITEM_SIZE; }
+
+            // The length comes from the peer and includes the 2-byte header.
+            // Anything shorter is malformed: size - 2 would go negative, and
+            // recv() takes a size_t, so it became a near-unbounded read into
+            // this 8 KB buffer.
+            if (size < 2 || size - 2 > RFSPACE_MAX_SIZE) {
+                flog::error("RFspace: invalid control message length {0}, disconnecting", size);
+                break;
+            }
+            const int payloadSize = size - 2;
+
+            // Receive data. A header-only message has no payload, and a
+            // zero-length recv() would read as a disconnect.
+            if (payloadSize > 0 && tcp->recv(buffer, payloadSize, true, RFSPACE_TIMEOUT_MS) <= 0) { break; }
+
+            // Check for a device ID: a 2-byte control item plus a 4-byte ID.
+            if (payloadSize < 6) { continue; }
             uint16_t* controlItem = (uint16_t*)&buffer[0];
             if (type == RFSPACE_MSG_TYPE_T2H_SET_CTRL_ITEM_RESP && *controlItem == RFSPACE_CTRL_ITEM_PROD_ID) {
                 {
@@ -212,18 +228,28 @@ namespace rfspace {
 
     void Client::udpWorker() {
         // Allocate receive buffer
-        uint8_t* buffer = new uint8_t[RFSPACE_MAX_SIZE];
+        uint8_t* buffer = new uint8_t[RFSPACE_UDP_RECV_SIZE];
         uint16_t* header = (uint16_t*)&buffer[0];
 
         // Receive loop
         while (true) {
             // Receive datagram
-            int rsize = udp->recv(buffer, RFSPACE_MAX_SIZE);
-            if (rsize <= 0) { break; } 
+            int rsize = udp->recv(buffer, RFSPACE_UDP_RECV_SIZE);
+            if (rsize <= 0) { break; }
+
+            // Too short to carry a header, or longer than any legal item:
+            // drop it. The socket is unconnected, so this can be anyone's.
+            if (rsize < 4 || rsize > RFSPACE_MAX_ITEM_SIZE) {
+                flog::error("Dropping RFspace datagram of {} bytes", rsize);
+                continue;
+            }
 
             // Decode header
             uint8_t type = (*header) >> 13;
-            uint16_t size = (*header) & 0b1111111111111;
+            int size = (*header) & 0b1111111111111;
+
+            // A data item with length 0 is the 8194-byte maximum.
+            if (size == 0 && type >= RFSPACE_MSG_TYPE_T2H_DATA_ITEM_0) { size = RFSPACE_MAX_ITEM_SIZE; }
 
             if (rsize != size) {
                 flog::error("Datagram size mismatch: {} vs {}", rsize, size);
@@ -235,9 +261,15 @@ namespace rfspace {
                 // Acquire the buffer variables
                 std::lock_guard<std::mutex> lck(bufferMtx);
 
-                // Convert samples to complex float
+                // Convert samples to complex float. Packets accumulate in
+                // writeBuf until blockSize is reached; publish what is there
+                // first if this packet would not fit behind it.
                 int16_t* samples = (int16_t*)&buffer[4];
                 int sampCount = (size - 4) / (2 * sizeof(int16_t));
+                if (inBuffer > 0 && inBuffer + sampCount > output->capacity()) {
+                    if (!output->swap(inBuffer)) { break; }
+                    inBuffer = 0;
+                }
                 volk_16i_s32f_convert_32f((float*)&output->writeBuf[inBuffer], samples, 32768.0f, sampCount * 2);
                 inBuffer += sampCount;
 

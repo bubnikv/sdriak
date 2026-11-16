@@ -37,9 +37,9 @@ namespace dsp::buffer {
     // RAII owner for a volk-aligned scratch buffer.
     //
     // The point is exception safety on the OOM path. alloc() throws, and a
-    // block's destructor bails on `if (!_block_init) { return; }` -- so an
-    // init() that throws half-way used to leak everything it had allocated so
-    // far, at exactly the moment memory is scarce. Member destructors run
+    // block's destructor bails on `if (!_block_init) { return; }` -- so raw
+    // allocations made by an init() that throws half-way would leak, at
+    // exactly the moment memory is scarce. Member destructors run
     // regardless of that guard (and even when the owning constructor throws),
     // so a Buffer member is always released.
     //

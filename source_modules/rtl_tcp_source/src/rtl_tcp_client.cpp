@@ -32,7 +32,7 @@ namespace rtltcp {
 
     void Client::setSampleRate(double sr) {
         sendCommand(2, sr);
-        bufferSize = sr / 200.0;
+        bufferSize = dsp::sourceBlockSize(sr, *stream);
     }
 
     void Client::setGainMode(int mode) {
@@ -73,7 +73,8 @@ namespace rtltcp {
     }
 
     void Client::worker() {
-        uint8_t* buffer = dsp::buffer::alloc<uint8_t>(STREAM_BUFFER_SIZE*2);
+        // Two bytes per IQ sample; bufferSize is bounded by the stream.
+        uint8_t* buffer = dsp::buffer::alloc<uint8_t>((size_t)stream->capacity() * 2);
 
         while (true) {
             // Read data

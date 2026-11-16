@@ -39,11 +39,10 @@ namespace vor {
 
             // Full-rate scratch, at VOR_IN_SR.
             //
-            // magOut replaces what used to be a complete dsp::demod::AM<float>
-            // -- an output stream, a carrier-AGC buffer and an LPF delay line,
-            // about 20 MB -- that was never start()ed and never process()ed.
-            // It existed so that one volk_32fc_magnitude_32f() call had
-            // somewhere to write. It needed a buffer, not a demodulator.
+            // magOut is where volk_32fc_magnitude_32f() writes the envelope.
+            // A plain buffer is all it needs; a dsp::demod::AM<float> would
+            // bring an output stream, a carrier-AGC buffer and an LPF delay
+            // line, about 20 MB, none of which the receiver uses.
             magOut.allocate(_maxBlock);
             amr2cOut.allocate(_maxBlock);
             fmxOut.allocate(_maxBlock);

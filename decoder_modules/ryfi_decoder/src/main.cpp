@@ -6,9 +6,6 @@
 #include <signal_path/signal_path.h>
 #include <module.h>
 #include <filesystem>
-#include <dsp/routing/splitter.h>
-#include <dsp/buffer/reshaper.h>
-#include <dsp/sink/handler_sink.h>
 #include <gui/widgets/folder_select.h>
 #include <gui/widgets/constellation_diagram.h>
 #include "ryfi/receiver.h"
@@ -37,21 +34,16 @@ public:
 
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, INPUT_BANDWIDTH, INPUT_SAMPLE_RATE, INPUT_BANDWIDTH, INPUT_BANDWIDTH, true);
         rx.init(vfo->output, INPUT_BAUDRATE, INPUT_SAMPLE_RATE);
-        reshape.init(rx.softOut, SYMBOL_DIAG_COUNT, (INPUT_BAUDRATE / SYMBOL_DIAG_RATE) - SYMBOL_DIAG_COUNT, SYMBOL_DIAG_COUNT);
-        symSink.init(&reshape.out, symSinkHandler, this);
+        rx.softTap->init(SYMBOL_DIAG_COUNT, (int)(INPUT_BAUDRATE / SYMBOL_DIAG_RATE), symTapHandler, this);
         rx.onPacket.bind(&RyFiDecoderModule::packetHandler, this);
 
         rx.start();
-        reshape.start();
-        symSink.start();
 
         gui::menu.registerEntry(name, menuHandler, this, this);
     }
 
     ~RyFiDecoderModule() {
         rx.stop();
-        reshape.stop();
-        symSink.stop();
         sigpath::vfoManager.deleteVFO(vfo);
         gui::menu.removeEntry(name);
     }
@@ -65,16 +57,12 @@ public:
         rx.setInput(vfo->output);
 
         rx.start();
-        reshape.start();
-        symSink.start();
 
         enabled = true;
     }
 
     void disable() {
         rx.stop();
-        reshape.stop();
-        symSink.stop();
 
         sigpath::vfoManager.deleteVFO(vfo);
         enabled = false;
@@ -102,12 +90,11 @@ private:
         if (!_this->enabled) { style::endDisabled(); }
     }
 
-    static void symSinkHandler(dsp::complex_t* data, int count, void* ctx) {
+    // Runs on the deframer's thread; tryWrite() drops the frame rather than
+    // wait for the GUI.
+    static void symTapHandler(const dsp::complex_t* data, int count, void* ctx) {
         RyFiDecoderModule* _this = (RyFiDecoderModule*)ctx;
-
-        dsp::complex_t* buf = _this->constDiagram.acquireBuffer();
-        memcpy(buf, data, 1024 * sizeof(dsp::complex_t));
-        _this->constDiagram.releaseBuffer();
+        _this->constDiagram.tryWrite(data, count);
     }
 
     std::string name;
@@ -116,8 +103,6 @@ private:
     // DSP Chain
     VFOManager::VFO* vfo;
     ryfi::Receiver rx;
-    dsp::buffer::Reshaper<dsp::complex_t> reshape;
-    dsp::sink::Handler<dsp::complex_t> symSink;
 
     ImGui::ConstellationDiagram constDiagram;
 };

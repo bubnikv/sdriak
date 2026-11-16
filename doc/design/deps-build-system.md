@@ -68,10 +68,11 @@ The important pattern is that the application build owns the high-level linkage
 policy, while the `deps/` build owns source-vs-system selection and recipe-level
 exceptions.
 
-### 2.2 What SDRIAK used to do
+### 2.2 SDRIAK's coarse switches
 
-SDRIAK already had a usable `deps/` build, but it was controlled by a small set
-of coarse switches:
+Dependencies that `deps/cmake/DepClassification.cmake` does not classify fall
+back to a small set of coarse switches (`deps/cmake/DepPolicy.cmake`, with
+`SDRPP_DEP_POLICY_STRICT=OFF`):
 
 - global `BUILD_SHARED_LIBS`
 - package include/exclude selection
@@ -85,8 +86,8 @@ Relevant files:
 - `deps/cmake/ValidateDep.cmake`
 - `cmake/sdrpp_find_dep.cmake`
 
-That was enough for "build most things here" versus "skip some host-provided
-packages", but not enough for the full matrix required by SDRIAK packaging.
+That is enough for "build most things here" versus "skip some host-provided
+packages", but not for the full matrix required by SDRIAK packaging.
 
 ## 3. Main Gaps in the Current SDRIAK Design
 

@@ -14,6 +14,7 @@
 #include <dsp/processing.h>
 #include <dsp/routing.h>
 #include <dsp/sink.h>
+#include <dsp/buffer/frame_tap.h>
 #include <gui/widgets/folder_select.h>
 #include <gui/widgets/symbol_diagram.h>
 #include <fstream>
@@ -61,12 +62,13 @@ public:
         // Initialize DSP here
         decoder.init(vfo->output, INPUT_SAMPLE_RATE);
 
-        reshape.init(decoder.diagOut, 480, 0, 480);
-        diagHandler.init(&reshape.out, _diagHandler, this);
+        // Contiguous 480-symbol frames, cut by diagTap inside diagHandler's
+        // handler.
+        diagTap.init(480, 480, _diagTapHandler, this);
+        diagHandler.init(decoder.diagOut, _diagHandler, this);
 
         // Start DSO Here
         decoder.start();
-        reshape.start();
         diagHandler.start();
 
         //stream.start();
@@ -79,7 +81,6 @@ public:
         // Stop DSP Here
         if (enabled) {
             decoder.stop();
-            reshape.stop();
             diagHandler.stop();
             sigpath::vfoManager.deleteVFO(vfo);
         }
@@ -99,7 +100,6 @@ public:
 
         // Start DSP here
         decoder.start();
-        reshape.start();
         diagHandler.start();
 
         enabled = true;
@@ -108,7 +108,6 @@ public:
     void disable() {
         // Stop DSP here
         decoder.stop();
-        reshape.stop();
         diagHandler.stop();
 
         sigpath::vfoManager.deleteVFO(vfo);
@@ -147,10 +146,12 @@ private:
     }
 
     static void _diagHandler(float* data, int count, void* ctx) {
-        M17DecoderModule* _this = (M17DecoderModule*)ctx;
-        float* buf = _this->diag.acquireBuffer();
-        memcpy(buf, data, count * sizeof(float));
-        _this->diag.releaseBuffer();
+        ((M17DecoderModule*)ctx)->diagTap.push(data, count);
+    }
+
+    // tryWrite() drops the frame rather than wait for the GUI.
+    static void _diagTapHandler(const float* data, int count, void* ctx) {
+        ((M17DecoderModule*)ctx)->diag.tryWrite(data, count);
     }
 
     std::string name;
@@ -160,7 +161,8 @@ private:
     VFOManager::VFO* vfo;
     kgsstv::Decoder decoder;
 
-    dsp::Reshaper<float> reshape;
+    // Declared before diagHandler so it outlives the sink that feeds it.
+    dsp::buffer::FrameTap<float> diagTap;
     dsp::HandlerSink<float> diagHandler;
     dsp::stream<float> dummy;
 

@@ -41,13 +41,16 @@ itself belongs in `design/` or `todo/`. Fork surveys live in
 - [build-windows.md](build-windows.md) — MSVC x64 build, presets, configurations
 
 **Design**
-- [dsp-pipeline.md](design/dsp-pipeline.md) — source → front end → VFO → decoder → sink: threading, buffers, latency
-- [dsp-pipeline-codex-review.md](design/dsp-pipeline-codex-review.md) — independent second read of the same path
+- [dsp-pipeline.md](design/dsp-pipeline.md) — source → front end → VFO → decoder → sink: threading, buffers, latency budget per mode
+- [volk.md](design/volk.md) — exact input/output aliasing policy, implementation audit, and verification requirements
+- [buffer-size-requirements-current.md](design/buffer-size-requirements-current.md) — short current-state summary of the one below: costs, open overflow risks, sizing rules, what blocks lowering the constant
+- [buffer-size-requirements.md](design/buffer-size-requirements.md) — what `STREAM_BUFFER_SIZE` must satisfy, producer block sizes, and what it costs (preliminary; audit incomplete)
+- [input-source.md](design/input-source.md) — every source module's sample rates, block sizes, wire rates and driver buffers; the front end's input ring (`SampleFrameBuffer`), stall tolerance per driver, and what should replace the ring
 - [deps-build-system.md](design/deps-build-system.md) — third-party dependency build
 - [iq-file-formats.md](design/iq-file-formats.md) — IQ/baseband record, playback and interchange formats
 - [libcurl-integration.md](design/libcurl-integration.md) — libcurl is core-owned; plugins must not link it
 - [config-access.md](design/config-access.md) — config access lifetimes and
-  porting modules from the old API
+  porting modules from upstream SDR++
 
 **Research**
 - [band-stacking.md](research/band-stacking.md) — what a band-stack register contains, when it is written, what a band boundary is

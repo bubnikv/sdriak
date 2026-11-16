@@ -81,9 +81,9 @@ void WaterfallAutoRange::drawButton(float side, const ImVec4& tint) {
     // ImageButton: the frame, rounding and hover/active states then come from
     // the same path as the mode-grid buttons, and the latched state can use the
     // shared toggle look. ImageButton's bg_col only covers the area inside the
-    // frame padding, so the old latched fill was a small square painted in
-    // ButtonActive -- i.e. the colour a button shows while being pressed, which
-    // read as "idle" rather than "on".
+    // frame padding, so a latched fill there would be a small square, and in
+    // ButtonActive -- the colour a button shows while being pressed, which
+    // reads as "idle" rather than "on".
     //
     // The toggle colours are only derived while latched -- the idle button uses
     // the plain theme colours and the caller's tint.

@@ -1549,10 +1549,9 @@ namespace ImGui {
 
     void WaterFall::setFFTSmoothing(bool enabled) {
         // Lock order must match pushFFT(): latestFFTMtx first, then
-        // smoothingBufMtx. Taking them the other way round -- which this used to
-        // do, acquiring latestFFTMtx only for the copy below -- deadlocks
-        // against an FFT frame that is already holding latestFFTMtx and waiting
-        // on smoothingBufMtx.
+        // smoothingBufMtx. Taking them the other way round -- latestFFTMtx
+        // only for the copy below -- would deadlock against an FFT frame that
+        // already holds latestFFTMtx and waits on smoothingBufMtx.
         std::lock_guard<std::recursive_mutex> lck(latestFFTMtx);
         std::lock_guard<std::mutex> lck2(smoothingBufMtx);
         fftSmoothing = enabled;

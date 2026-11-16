@@ -90,6 +90,18 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_executable(fftw_lifetime_tests tests/fftw_lifetime_tests.cpp)
     target_link_libraries(fftw_lifetime_tests PRIVATE sdrpp_core)
     add_test(NAME fftw_lifetime_tests COMMAND fftw_lifetime_tests)
+
+    add_executable(block_restart_tests tests/block_restart_tests.cpp)
+    target_link_libraries(block_restart_tests PRIVATE sdrpp_core)
+    add_test(NAME block_restart_tests COMMAND block_restart_tests)
+
+    add_executable(stream_capacity_tests tests/stream_capacity_tests.cpp)
+    target_link_libraries(stream_capacity_tests PRIVATE sdrpp_core)
+    add_test(NAME stream_capacity_tests COMMAND stream_capacity_tests)
+
+    add_executable(frame_tap_tests tests/frame_tap_tests.cpp)
+    target_link_libraries(frame_tap_tests PRIVATE sdrpp_core)
+    add_test(NAME frame_tap_tests COMMAND frame_tap_tests)
 endif ()
 
 target_compile_definitions(sdrpp_core PRIVATE

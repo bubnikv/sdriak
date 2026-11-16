@@ -1,5 +1,6 @@
 #pragma once
 #include "dsp/processor.h"
+#include "dsp/buffer/frame_tap.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -52,6 +53,10 @@ namespace ryfi {
          * @param in Input stream.
         */
         Deframer(dsp::stream<dsp::complex_t> *in = NULL);
+
+        // Received symbols for the constellation display, fed inline before
+        // deframing. Initialise it before start().
+        dsp::buffer::FrameTap<dsp::complex_t> tap;
 
     private:
         int run();

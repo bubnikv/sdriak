@@ -1,15 +1,36 @@
 #pragma once
 #include <string.h>
+#include <cstdlib>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
 #include <volk/volk.h>
 #include "buffer/buffer.h"
+#include "../utils/flog.h"
 
-// 1MSample buffer
+// Default capacity of every dsp::stream, in elements, and the implicit block
+// bound of everything derived from it. 32-bit Android uses 262144: the largest
+// block any source loaded there writes is HackRF's 131072 (2x margin), and the
+// fixed 48 kHz audio sink never needs more than a few thousand samples per
+// block. Everything else keeps 1000000. Remote sources whose block size is set
+// by the server (SpyServer, the SDRIAK server client) split their output to
+// the stream's capacity() rather than assuming this value.
+// see doc/design/buffer-size-requirements-current.md
+#if defined(__ANDROID__) && !defined(__LP64__)
+#define STREAM_BUFFER_SIZE 262144
+#else
 #define STREAM_BUFFER_SIZE 1000000
+#endif
 
 namespace dsp {
+    // A swap() larger than the buffer means the producer has already written
+    // past the end of it: the heap is corrupt. Stop here, with a message naming
+    // the sizes, instead of continuing into a crash somewhere unrelated.
+    [[noreturn]] inline void streamOverflow(int size, int capacity) {
+        flog::error("dsp::stream overflow: swap({0}) on a stream of capacity {1}", size, capacity);
+        std::abort();
+    }
+
     class untyped_stream {
     public:
         virtual ~untyped_stream() {}
@@ -37,6 +58,7 @@ namespace dsp {
                 buffer::free(writeBuf);
                 throw;
             }
+            _capacity = STREAM_BUFFER_SIZE;
         }
 
         virtual ~stream() {
@@ -61,9 +83,19 @@ namespace dsp {
             buffer::free(readBuf);
             writeBuf = newWrite;
             readBuf = newRead;
+            _capacity = samples;
         }
 
+        // Elements each of writeBuf and readBuf holds. A producer whose block
+        // size is not structurally bounded (a network peer, a library callback)
+        // must split its output to this, not to STREAM_BUFFER_SIZE: streams
+        // can be resized.
+        int capacity() const { return _capacity; }
+
         virtual inline bool swap(int size) {
+            // Secondary detection only: the write has already happened. It
+            // turns silent heap corruption into an immediate, named failure.
+            if (size < 0 || size > _capacity) { streamOverflow(size, _capacity); }
             {
                 // Wait to either swap or stop
                 std::unique_lock<std::mutex> lck(swapMtx);
@@ -154,6 +186,7 @@ namespace dsp {
             if (readBuf) { buffer::free(readBuf); }
             writeBuf = NULL;
             readBuf = NULL;
+            _capacity = 0;
         }
 
         T* writeBuf;
@@ -172,5 +205,19 @@ namespace dsp {
         bool writerStop = false;
 
         int dataSize = 0;
+        int _capacity = 0;
     };
+
+    // Block size for a source that delivers samplerate/divisor samples per
+    // call (sr/200 is 5 ms), bounded by what the destination stream actually
+    // holds. Use it instead of a bare sr/200: drivers such as UHD, SoapySDR
+    // and LMS treat the count as the caller's buffer capacity, so an unbounded
+    // rate becomes a heap overflow. Clamped in double so a huge rate cannot
+    // overflow the int.
+    template <class T>
+    inline int sourceBlockSize(double samplerate, const stream<T>& out, int divisor = 200) {
+        const double block = samplerate / (double)divisor;
+        if (!(block >= 1.0)) { return 1; }
+        return (block >= (double)out.capacity()) ? out.capacity() : (int)block;
+    }
 }

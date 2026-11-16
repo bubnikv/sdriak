@@ -63,22 +63,41 @@ namespace dsp::buffer {
         // Change only the largest block push() may receive, preserving every
         // retained history sample. The history lives before the current block,
         // so changing the amount of room after it does not change its sample
-        // domain or invalidate it. Acquire first and commit second: allocation
-        // failure leaves both the old capacity and history intact.
+        // domain or invalidate it.
         void setMaxBlock(int maxBlock) {
-            assert(maxBlock >= 0);
-            if (maxBlock == m_maxBlock) { return; }
+            reshape(maxBlock, m_history);
+        }
+
+        // New block bound and history length together, keeping the newest
+        // samples exactly as setHistory() does. One allocation, committed only
+        // once it has succeeded, so a throw leaves the old bound *and* history
+        // in place. Doing it as setMaxBlock() followed by setHistory() is not
+        // equivalent: if the second allocation fails, the first has already
+        // committed a smaller bound while the producer still emits blocks
+        // sized for the old one.
+        void reshape(int maxBlock, int history) {
+            assert(maxBlock >= 0 && history >= 0);
             if (!m_buf.get()) {
-                init(maxBlock, m_history);
+                init(maxBlock, history);
+                return;
+            }
+            if (maxBlock == m_maxBlock) {
+                setHistory(history);
                 return;
             }
 
-            Buffer<T> fresh(capacityFor(maxBlock, m_room));
-            if (m_history > 0) {
-                memcpy(fresh.get(), m_buf.get(), (size_t)m_history * sizeof(T));
+            const int room = (std::max)(history, m_room);
+            Buffer<T> fresh(capacityFor(maxBlock, room));
+            const int keep = (std::min)(history, m_history);
+            const int pad = history - keep;
+            if (pad > 0) { memset(fresh.get(), 0, (size_t)pad * sizeof(T)); }
+            if (keep > 0) {
+                memcpy(fresh.get() + pad, m_buf.get() + (m_history - keep), (size_t)keep * sizeof(T));
             }
             m_buf = std::move(fresh);
             m_maxBlock = maxBlock;
+            m_history = history;
+            m_room = room;
         }
 
         // New history length, keeping the newest samples: they stay right

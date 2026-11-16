@@ -524,19 +524,38 @@ namespace net::http {
     }
 
     int Client::recvChunkHeader(ChunkHeader& chdr, int timeout) {
+        // The chunk-size line comes from the peer. Bound it: recvline() with
+        // a max of 0 reads without limit, so a server that never sends '\n'
+        // could grow this string until the process runs out of memory. A
+        // chunk size is at most 16 hex digits; the cap leaves room for chunk
+        // extensions.
+        constexpr int MAX_CHUNK_LINE = 4096;
         std::string respData;
-        int err = sock->recvline(respData, 0, timeout);
+        int err = sock->recvline(respData, MAX_CHUNK_LINE, timeout);
         if (err <= 0) { return err; }
+        // recvline() counts the '\n' but does not store it, so a full read
+        // with nothing dropped means the line hit the cap unterminated.
+        if (err == MAX_CHUNK_LINE && (int)respData.size() == err) { return -1; }
         if (!respData.empty() && respData[respData.size()-1] == '\r') {
             respData.pop_back();
         }
         if (respData.empty()) { return -1; }
-        chdr.deserialize(respData);
+        // deserialize() throws on a malformed or out-of-range size. Callers
+        // run this on worker threads, where an escaping exception terminates
+        // the process, so report it as a protocol error instead.
+        try {
+            chdr.deserialize(respData);
+        }
+        catch (const std::exception&) {
+            return -1;
+        }
         return 0;
     }
 
     int Client::recvHeader(std::string& data, int timeout) {
-        // Per-call timeout, no size cap, no line-length cap.
+        // Per-call timeout, with the same 64 KiB total / 8 KiB line caps as
+        // recvResponseHeader(): the header is peer data, and an unterminated
+        // or endless one would otherwise grow `data` without limit.
         //   helper rc == 1   saw terminator → API success (0)
         //   helper rc <  0   hard recvline error → pass through
         //   helper rc == 0   recvline returned 0 mid-headers (timeout /
@@ -544,8 +563,16 @@ namespace net::http {
         //                    failure (-1) so the caller's `if (err)` check
         //                    rejects the partial header instead of feeding
         //                    truncated bytes to deserialize().
-        const int rc = recvHeaderBytes(*sock, data, [timeout] { return timeout; },
-                                       SIZE_MAX, 0);
+        //   helper throws    header too large → hard failure (-1); callers
+        //                    run on worker threads and expect an error code.
+        int rc;
+        try {
+            rc = recvHeaderBytes(*sock, data, [timeout] { return timeout; },
+                                 64 * 1024, 8192);
+        }
+        catch (const std::exception&) {
+            return -1;
+        }
         if (rc == 1) { return 0; }
         if (rc < 0)  { return rc; }
         return -1;

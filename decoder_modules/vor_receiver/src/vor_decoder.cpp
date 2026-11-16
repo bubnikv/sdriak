@@ -5,8 +5,11 @@
 namespace vor {
     Decoder::Decoder(dsp::stream<dsp::complex_t>* in, double integrationTime) {
         rx.init(in);
-        reshape.init(&rx.out, round(1000.0 * integrationTime), 0, round(1000.0 * integrationTime));
-        symSink.init(&reshape.out, dataHandler, this);
+        // rx.out runs at 1 kHz: contiguous, non-overlapping windows of
+        // integrationTime seconds.
+        int windowSize = (std::max)(1, (int)round(1000.0 * integrationTime));
+        window.init(windowSize, windowSize, windowHandler, this);
+        symSink.init(&rx.out, dataHandler, this);
     }
 
     Decoder::~Decoder() {
@@ -19,17 +22,19 @@ namespace vor {
 
     void Decoder::start() {
         rx.start();
-        reshape.start();
         symSink.start();
     }
 
     void Decoder::stop() {
         rx.stop();
-        reshape.stop();
         symSink.stop();
     }
 
     void Decoder::dataHandler(float* data, int count, void* ctx) {
+        ((Decoder*)ctx)->window.push(data, count);
+    }
+
+    void Decoder::windowHandler(const float* data, int count, void* ctx) {
         // Get the instance from context
         Decoder* _this = (Decoder*)ctx;
 

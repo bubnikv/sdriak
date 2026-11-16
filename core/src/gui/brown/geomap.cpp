@@ -484,7 +484,7 @@ namespace geomap {
             if (wheel != 0.0f) {
                 const ImVec2 mouseRel = ImGui::GetMousePos() - recentCanvasPos;
                 // powf so magnitude matters: a desktop notch (wheel = ±1)
-                // still gives the old ×1.2, while a continuous pinch delta
+                // gives ×1.2, while a continuous pinch delta
                 // zooms smoothly instead of snapping.
                 zoomAround(mouseRel, std::pow(1.2f, wheel));
             }

@@ -60,6 +60,29 @@ void testCapacityChangePreservesFIRHistory() {
                "explicit FIR reset did not clear its history");
 }
 
+// A smaller block bound and a longer tap set in one call: the single reshape
+// must keep the newest sample and zero-pad on the left.
+void testShrinkWithMoreTapsKeepsNewestHistory() {
+    const float two[] = { 1.0f, 1.0f };
+    dsp::filter::FIR<float, float> fir(dsp::taps::fromArray<float>(2, two), 4);
+    const float first[] = { 1.0f, 2.0f };
+    float firstOut[2]{};
+    fir.process(2, first, firstOut);                       // history: [2]
+
+    const float three[] = { 1.0f, 1.0f, 1.0f };
+    fir.setTaps(dsp::taps::fromArray<float>(3, three), 1);  // shrink + grow
+    expect(fir.maxBlock() == 1, "FIR did not shrink its block capacity");
+
+    const float a[] = { 3.0f };
+    float aOut[1]{};
+    fir.process(1, a, aOut);                               // [0, 2] + 3
+    expectNear(aOut[0], 5.0f, "reshape lost the newest sample or its padding");
+    const float b[] = { 4.0f };
+    float bOut[1]{};
+    fir.process(1, b, bOut);                               // [2, 3] + 4
+    expectNear(bOut[0], 9.0f, "reshape broke the history advance");
+}
+
 void seedFilter(InspectableRxVFO& vfo) {
     dsp::complex_t input[8];
     dsp::complex_t output[8];
@@ -161,6 +184,7 @@ void testUnchangedOutputRateIsANoOp() {
 int main() {
     return test_support::run("fir_history_tests", [] {
         testCapacityChangePreservesFIRHistory();
+        testShrinkWithMoreTapsKeepsNewestHistory();
         testInputRateChangePreservesPostResamplerHistory();
         testOutputRateChangeClearsPostResamplerHistory();
         testBandwidthOnlyChangePreservesHistory();

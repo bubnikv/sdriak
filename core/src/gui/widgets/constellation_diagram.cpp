@@ -1,4 +1,6 @@
 #include <gui/widgets/constellation_diagram.h>
+#include <algorithm>
+#include <string.h>
 
 namespace ImGui {
     ConstellationDiagram::ConstellationDiagram() {
@@ -34,6 +36,12 @@ namespace ImGui {
 
     void ConstellationDiagram::releaseBuffer() {
         bufferMtx.unlock();
+    }
+
+    void ConstellationDiagram::tryWrite(const dsp::complex_t* data, int count) {
+        std::unique_lock<std::mutex> lck(bufferMtx, std::try_to_lock);
+        if (!lck.owns_lock()) { return; }
+        memcpy(buffer, data, std::min<int>(count, 1024) * sizeof(dsp::complex_t));
     }
 
 }

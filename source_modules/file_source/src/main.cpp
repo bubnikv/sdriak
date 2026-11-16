@@ -282,7 +282,7 @@ private:
         FileSourceModule* _this = (FileSourceModule*)ctx;
         SampleReader* reader = _this->reader;
         uint32_t sampleRate = std::max(reader->getSampleRate(), (uint32_t)1);
-        int blockSize = std::clamp((int)(sampleRate / 200), 1, (int)STREAM_BUFFER_SIZE);
+        int blockSize = dsp::sourceBlockSize(sampleRate, _this->stream);
         int channels = reader->getChannelCount();
         int blockAlign = reader->getBlockAlign();
         int bytesPerChan = reader->getBitDepth() / 8;

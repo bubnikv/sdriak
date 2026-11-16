@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utils/net.h>
 #include <utils/flog.h>
 #include <module.h>
@@ -256,13 +257,17 @@ private:
     }
 
     void worker() {
-        // Compute sizes
-        int blockSize = samplerate / 200;
+        // Compute sizes. The samplerate is a user-entered field clamped only
+        // from below, so sr/200 alone can exceed the stream: above 200 MS/s at
+        // the desktop constant, above ~52 MS/s on 32-bit Android. Bound the
+        // block to what the stream actually holds.
+        int blockSize = std::clamp(samplerate / 200, 1, stream.capacity());
         int sampleSize = SAMPLE_TYPE_SIZE[sampType];
 
-        // Chose amount of bytes to attempt to read
+        // Chose amount of bytes to attempt to read. Every read is at most one
+        // stream buffer's worth of samples, so a conversion never overruns it.
         bool forceSize = (proto != PROTOCOL_UDP);
-        int frameSize = sampleSize * (forceSize ? blockSize : STREAM_BUFFER_SIZE);
+        int frameSize = sampleSize * (forceSize ? blockSize : stream.capacity());
 
         // Allocate receive buffer
         uint8_t* buffer = dsp::buffer::alloc<uint8_t>(frameSize);

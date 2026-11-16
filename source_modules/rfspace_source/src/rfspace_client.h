@@ -8,6 +8,13 @@
 #include <chrono>
 
 #define RFSPACE_MAX_SIZE                8192
+// Largest legal message, header included: a data item whose 13-bit length
+// field is 0 is 8194 bytes (NetSDR Interface Specification).
+#define RFSPACE_MAX_ITEM_SIZE           (RFSPACE_MAX_SIZE + 2)
+// UDP receive buffer: the largest possible datagram, so an oversized one is
+// read whole and rejected instead of truncated. On Windows a truncated
+// datagram is a recvfrom() error, which would close the socket.
+#define RFSPACE_UDP_RECV_SIZE           65536
 #define RFSPACE_HEARTBEAT_INTERVAL_MS   1000
 #define RFSPACE_TIMEOUT_MS              3000
 

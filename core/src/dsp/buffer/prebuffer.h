@@ -78,7 +78,7 @@ namespace dsp::buffer {
                     int count = 0;
                     {
                         std::lock_guard lck(bufferMtx);
-                        count = (int)popLocked(out.writeBuf, std::min(bufferedSamples, (size_t)STREAM_BUFFER_SIZE));
+                        count = (int)popLocked(out.writeBuf, std::min(bufferedSamples, (size_t)out.capacity()));
                     }
                     if (count > 0) {
                         if (!out.swap(count)) { return -1; }
@@ -103,7 +103,7 @@ namespace dsp::buffer {
                 double sampleRateSnapshot = 1.0;
                 {
                     std::lock_guard lck(bufferMtx);
-                    count = (int)popLocked(out.writeBuf, std::min({ bufferedSamples, slice, (size_t)STREAM_BUFFER_SIZE }));
+                    count = (int)popLocked(out.writeBuf, std::min({ bufferedSamples, slice, (size_t)out.capacity() }));
                     sampleRateSnapshot = sampleRate;
                     if (bufferedSamples < slice) { primed = false; }
                 }

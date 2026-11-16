@@ -94,13 +94,10 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     split.init(preproc.out);
 
     // TODO: Do something to avoid basically repeating this code twice
-    int skip;
-    genReshapeParams(effectiveSr, _fftSize, _fftRate, skip, _nzFFTSize);
-    // `out` carries exactly one reshaped block, which updateFFTPath() then
-    // narrows to _nzFFTSize -- a fraction of the default stream in every
-    // configuration.
-    reshape.init(&fftIn, fftSize, skip, fftSize);
-    fftSink.init(&reshape.out, handler, this);
+    genFrameParams(effectiveSr, _fftSize, _fftRate, _fftSkip, _nzFFTSize);
+    _fftFill = 0;
+    _fftSkipLeft = 0;
+    fftSink.init(&fftIn, this);
 
     fftWindowBuf.allocate(_nzFFTSize);
     genFFTWindow(fftWindowBuf, _nzFFTSize);
@@ -326,7 +323,6 @@ void IQFrontEnd::start() {
     }
 
     // Start FFT chain
-    reshape.start();
     fftSink.start();
 }
 
@@ -346,7 +342,6 @@ void IQFrontEnd::stop() {
     }
 
     // Stop FFT chain
-    reshape.stop();
     fftSink.stop();
 }
 
@@ -354,26 +349,61 @@ double IQFrontEnd::getEffectiveSamplerate() {
     return effectiveSr;
 }
 
-void IQFrontEnd::handler(dsp::complex_t* data, int count, void* ctx) {
-    IQFrontEnd* _this = (IQFrontEnd*)ctx;
+int IQFrontEnd::FFTSink::run() {
+    int count = _in->read();
+    if (count < 0) { return -1; }
+    _owner->processFFTInput(_in->readBuf, count);
+    _in->flush();
+    return count;
+}
 
-    // Apply window
-    volk_32fc_32f_multiply_32fc((lv_32fc_t*)_this->fftInBuf.get(), (lv_32fc_t*)data, _this->fftWindowBuf, _this->_nzFFTSize);
+void IQFrontEnd::processFFTInput(const dsp::complex_t* data, int count) {
+    // An FFT rate above the sample rate rounds the frame interval to zero;
+    // there is no frame to fill, and the loop below would never advance.
+    if (_nzFFTSize <= 0) { return; }
 
-    // Execute FFT
-    fftwf_execute(_this->fftwPlan);
+    while (count > 0) {
+        // Drop the samples between frames. No copy: at a high sample rate and
+        // the default 20 fps this is nearly all of the input.
+        if (_fftSkipLeft > 0) {
+            int n = std::min<int>(count, _fftSkipLeft);
+            _fftSkipLeft -= n;
+            data += n;
+            count -= n;
+            continue;
+        }
+
+        // Window straight into the FFT input -- the only copy of the samples
+        // on this path. A frame may span any number of input blocks.
+        int n = std::min<int>(count, _nzFFTSize - _fftFill);
+        volk_32fc_32f_multiply_32fc((lv_32fc_t*)(fftInBuf.get() + _fftFill), (const lv_32fc_t*)data, fftWindowBuf.get() + _fftFill, n);
+        _fftFill += n;
+        data += n;
+        count -= n;
+
+        if (_fftFill == _nzFFTSize) {
+            runFFT();
+            _fftFill = 0;
+            _fftSkipLeft = _fftSkip;
+        }
+    }
+}
+
+void IQFrontEnd::runFFT() {
+    // Execute FFT. fftInBuf past _nzFFTSize stays zero (see updateFFTPath()).
+    fftwf_execute(fftwPlan);
 
     // Aquire buffer
-    float* fftBuf = _this->_acquireFFTBuffer(_this->_fftCtx);
+    float* fftBuf = _acquireFFTBuffer(_fftCtx);
 
     // Convert the complex output of the FFT to dB amplitude. The window is
     // normalized to unity coherent gain, so no 1/N normalization here.
     if (fftBuf) {
-        volk_32fc_s32f_power_spectrum_32f(fftBuf, (lv_32fc_t*)_this->fftOutBuf.get(), 1.0f, _this->_fftSize);
+        volk_32fc_s32f_power_spectrum_32f(fftBuf, (lv_32fc_t*)fftOutBuf.get(), 1.0f, _fftSize);
     }
 
     // Release buffer
-    _this->_releaseFFTBuffer(_this->_fftCtx);
+    _releaseFFTBuffer(_fftCtx);
 }
 
 void IQFrontEnd::genFFTWindow(float* buf, int size) {
@@ -407,31 +437,22 @@ void IQFrontEnd::updateFFTPath(bool updateWaterfall, int newFFTSize) {
     // Temp stop branch. Scope guards, not bare tempStop()/tempStart(): the
     // reallocations below throw on OOM, and a throw past a bare tempStart()
     // leaves the FFT path stopped for good -- a frozen waterfall on top of
-    // whatever the caller does with the exception. The guards unwind in reverse,
-    // restarting the sink before the reshaper that feeds it.
-    dsp::block::TempStop reshapeGuard(&reshape);
+    // whatever the caller does with the exception. fftSink is the whole branch,
+    // so stopping it covers everything below.
     dsp::block::TempStop fftSinkGuard(&fftSink);
 
-    // The new geometry goes into locals. Everything handler() reads -- _fftSize,
-    // _nzFFTSize, the reshaper's keep and skip, the window, the FFT buffers and
-    // the plan -- describes one consistent configuration, so none of it may be
+    // The new geometry goes into locals. Everything the FFT thread reads --
+    // _fftSize, _nzFFTSize, _fftSkip, the window, the FFT buffers and the plan
+    // -- describes one consistent configuration, so none of it may be
     // published until all of it can be.
     const int fftSize = (newFFTSize > 0) ? newFFTSize : _fftSize;
     int skip, nzFFTSize;
-    genReshapeParams(effectiveSr, fftSize, _fftRate, skip, nzFFTSize);
-
-    // The exception: `out` has to be grown before setKeep() may ask for the
-    // larger block, and growing it allocates. Only the *bound* moves here --
-    // the reshaper still emits the old keep -- so a throw below leaves nothing
-    // behind but a roomier output stream. The opposite direction is the mirror
-    // image and waits until after the commit, below. Both guards above are
-    // held, so the FFT sink that reads reshape.out is joined, which is the
-    // other precondition setKeepBound() states.
-    if (nzFFTSize > reshape.getKeepBound()) { reshape.setKeepBound(nzFFTSize); }
+    genFrameParams(effectiveSr, fftSize, _fftRate, skip, nzFFTSize);
 
     // Update window. Built as a local and committed below with the FFT buffers:
     // allocate() alone would leave the *old*, possibly smaller window in place
-    // against a new _nzFFTSize, and handler() reads _nzFFTSize floats out of it.
+    // against a new _nzFFTSize, and processFFTInput() reads up to _nzFFTSize
+    // floats out of it.
     dsp::buffer::Buffer<float> newWindow(nzFFTSize);
     genFFTWindow(newWindow, nzFFTSize);
 
@@ -454,29 +475,19 @@ void IQFrontEnd::updateFFTPath(bool updateWaterfall, int newFFTSize) {
     newPlan.planDFT1D(fftSize, newInBuf, newOutBuf, FFTW_FORWARD);
 
     // Commit point: nothing above this line has been published, and nothing
-    // below it can throw. setKeep()/setSkip() only assign -- the TempStop each
-    // takes is a no-op under the guards already held here -- and the four moves
-    // are noexcept.
+    // below it can throw -- plain assignments and four noexcept moves.
     _fftSize = fftSize;
     _nzFFTSize = nzFFTSize;
-    reshape.setKeep(_nzFFTSize);
-    reshape.setSkip(skip);
+    _fftSkip = skip;
     fftWindowBuf = std::move(newWindow);
     fftwPlan = std::move(newPlan);
     fftInBuf = std::move(newInBuf);
     fftOutBuf = std::move(newOutBuf);
 
-    // Now that _keep has fallen, `out` can give the excess back -- a zero-padded
-    // FFT keeps a small fraction of each block, so this is most of the stream.
-    // It allocates, hence its place below the commit point: the configuration
-    // above is already coherent, and a failure here only leaves a buffer larger
-    // than it needs to be, which is why it is logged rather than propagated.
-    if (_nzFFTSize < reshape.getKeepBound()) {
-        try { reshape.setKeepBound(_nzFFTSize); }
-        catch (const std::exception& e) {
-            flog::warn("[IQFrontEnd] Could not shrink the reshaper output to {0}: {1}", _nzFFTSize, e.what());
-        }
-    }
+    // The frame in progress was windowed into the buffer just replaced, for
+    // the old geometry: start the next one from scratch.
+    _fftFill = 0;
+    _fftSkipLeft = 0;
 
     // Clear the rest of the FFT input buffer
     dsp::buffer::clear<fftwf_complex>(fftInBuf, _fftSize - _nzFFTSize, _nzFFTSize);

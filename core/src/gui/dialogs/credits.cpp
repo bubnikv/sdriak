@@ -18,8 +18,8 @@ namespace credits {
     // The popup is opened once per presentation rather than every frame.
     // Android Back closes the topmost ImGui popup from the outside (see
     // MainWindow::handleBackPress), and re-issuing OpenPopup() here would put it
-    // straight back on the stack in the same frame -- which is why Back used to
-    // do nothing at all. Every path that closes the dialog must clear this, or
+    // straight back on the stack in the same frame, so Back would do nothing
+    // at all. Every path that closes the dialog must clear this, or
     // the next presentation opens nothing and the one after it is the first to
     // work. Paths that bypass show() entirely go through reset().
     static bool popupOpened = false;
@@ -38,9 +38,9 @@ namespace credits {
         imageSize = style::dp(128.0f, 128.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, style::dp(20.0f, 20.0f));
         // The scrollbar keeps the shared style width, like every other scrollable
-        // panel. It used to be widened to a finger-sized 25 dp, but the body
-        // drag-scrolls anywhere (see below), so nobody needs to hit the bar to
-        // scroll on a touch screen and the extra width only steals content space.
+        // panel. It is not widened for touch: the body drag-scrolls anywhere
+        // (see below), so nobody needs to hit the bar to scroll on a touch
+        // screen, and extra width would only steal content space.
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
         ImVec2 dispSize = ImGui::GetIO().DisplaySize;
         ImVec2 center = ImVec2(dispSize.x / 2.0f, dispSize.y / 2.0f);

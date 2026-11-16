@@ -17,6 +17,11 @@ namespace ImGui {
 
         void releaseBuffer();
 
+        // Copies min(count, 1024) points in if the GUI is not drawing right
+        // now, and drops them otherwise. Never blocks, so a DSP thread can
+        // call it inline (see dsp::buffer::FrameTap).
+        void tryWrite(const dsp::complex_t* data, int count);
+
     private:
         std::mutex bufferMtx;
         dsp::complex_t buffer[1024];

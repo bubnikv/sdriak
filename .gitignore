@@ -4,6 +4,7 @@ deps/.pkg_cache/
 .vscode/
 .vs/
 .idea/
+.claude/settings.local.json
 *.old
 *.dll
 *.exe

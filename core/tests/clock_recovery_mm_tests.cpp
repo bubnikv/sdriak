@@ -53,7 +53,7 @@ void testLowerFrequencyAlreadyExceedsOldCapacity() {
 
     // Zero input produces zero timing error. Put the loop at its legal 9.5
     // lower frequency limit so process() advances by 9.5 samples per output.
-    // This alone exceeds the old nominal 10:1 + 64 allocation; the additional
+    // This alone exceeds a nominal 10:1 + 64 allocation; the additional
     // muGain*error term is why maxOutputBlock() reserves still more room.
     recovery.forceLoopState(9.5f);
     std::vector<float> input(maxInput, 0.0f);

@@ -4,10 +4,13 @@
 #include <signal_path/signal_path.h>
 #include <signal_path/sink.h>
 #include <portaudio.h>
-#include <dsp/convert/stereo_to_mono.h>
-#include <dsp/sink/ring_buffer.h>
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <vector>
 #include <utils/flog.h>
 #include <core.h>
+#include "portaudio_bridge.h"
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -21,6 +24,9 @@ SDRPP_MOD_INFO{
 
 class AudioSink : SinkManager::Sink {
 public:
+    static_assert(std::atomic<bool>::is_always_lock_free,
+                  "Audio callback play state must be lock-free");
+
     struct AudioDevice_t {
         std::string name;
         int index;
@@ -33,12 +39,7 @@ public:
     AudioSink(SinkManager::Stream* stream, std::string streamName) {
         _stream = stream;
         _streamName = streamName;
-        s2m.init(_stream->sinkOut);
-        monoRB.init(&s2m.out, 480);
-        stereoRB.init(_stream->sinkOut, 480);
-
-        // monoPacker.init(&s2m.out, 240);
-        // stereoPacker.init(_stream->sinkOut, 240);
+        bridge.init(_stream->sinkOut);
 
         // Initialize PortAudio
         devCount = Pa_GetDeviceCount();
@@ -92,9 +93,15 @@ public:
         }
 
         // Load config from file
+        playing.store(gui::mainWindow.isPlaying(), std::memory_order_relaxed);
+        playStateHandler.handler = playStateChangeHandler;
+        playStateHandler.ctx = this;
+        gui::mainWindow.onPlayStateChange.bindHandler(&playStateHandler);
     }
 
     ~AudioSink() {
+        gui::mainWindow.onPlayStateChange.unbindHandler(&playStateHandler);
+        stop();
         for (auto const& dev : devices) {
             delete dev;
         }
@@ -104,8 +111,7 @@ public:
         if (running) {
             return;
         }
-        doStart();
-        running = true;
+        running = doStart();
     }
 
     void stop() {
@@ -124,7 +130,7 @@ public:
             // TODO: Load SR from config
             if (running) {
                 doStop();
-                doStart();
+                running = doStart();
             }
             // TODO: Save to config
         }
@@ -136,19 +142,21 @@ public:
             _stream->setSampleRate(dev->sampleRates[dev->srId]);
             if (running) {
                 doStop();
-                doStart();
+                running = doStart();
             }
             // TODO: Save to config
         }
     }
 
 private:
-    void doStart() {
-        const PaDeviceInfo* deviceInfo;
+    static void playStateChangeHandler(bool newState, void* ctx) {
+        ((AudioSink*)ctx)->playing.store(newState, std::memory_order_relaxed);
+    }
+
+    bool doStart() {
         AudioDevice_t* dev = devices[devListId];
         PaStreamParameters outputParams;
-        deviceInfo = Pa_GetDeviceInfo(dev->index);
-        outputParams.channelCount = 2;
+        outputParams.channelCount = dev->channels;
         outputParams.sampleFormat = paFloat32;
         outputParams.hostApiSpecificStreamInfo = NULL;
         outputParams.device = dev->index;
@@ -156,108 +164,96 @@ private:
         PaError err;
 
         float sampleRate = dev->sampleRates[dev->srId];
-        int bufferSize = sampleRate / 60.0f;
-
-        if (dev->channels == 2) {
-            stereoRB.data.setMaxLatency(bufferSize * 2);
-            stereoRB.start();
-            // stereoPacker.setSampleCount(bufferSize);
-            // stereoPacker.start();
-            err = Pa_OpenStream(&stream, NULL, &outputParams, sampleRate, paFramesPerBufferUnspecified, 0, _stereo_cb, this);
-            //err = Pa_OpenStream(&stream, NULL, &outputParams, sampleRate, bufferSize, 0, _stereo_cb, this);
+        const size_t periodFrames = std::max<size_t>(1, (size_t)(sampleRate / 60.0f));
+        try {
+            bridge.configure(dev->channels, periodFrames);
         }
-        else {
-            monoRB.data.setMaxLatency(bufferSize * 2);
-            monoRB.start();
-            // stereoPacker.setSampleCount(bufferSize);
-            // monoPacker.start();
-            err = Pa_OpenStream(&stream, NULL, &outputParams, sampleRate, paFramesPerBufferUnspecified, 0, _mono_cb, this);
-            //err = Pa_OpenStream(&stream, NULL, &outputParams, sampleRate, bufferSize, 0, _mono_cb, this);
+        catch (const std::exception& e) {
+            flog::error("Could not allocate the audio bridge: {0}", e.what());
+            return false;
         }
 
+        // Let PortAudio choose the backend's native callback period. The FIFO
+        // handles variable frame counts without blocking the realtime thread.
+        err = Pa_OpenStream(&stream, NULL, &outputParams, sampleRate,
+                            paFramesPerBufferUnspecified, paNoFlag, _audio_cb, this);
         if (err != 0) {
             flog::error("Error while opening audio stream: ({0}) => {1}", err, Pa_GetErrorText(err));
-            return;
+            stream = nullptr;
+            return false;
+        }
+
+        try {
+            // Start the producer before the device so it can prefill the FIFO.
+            bridge.start();
+        }
+        catch (const std::exception& e) {
+            flog::error("Error while starting the audio bridge: {0}", e.what());
+            Pa_CloseStream(stream);
+            stream = nullptr;
+            return false;
         }
 
         err = Pa_StartStream(stream);
         if (err != 0) {
             flog::error("Error while starting audio stream: ({0}) => {1}", err, Pa_GetErrorText(err));
-            return;
+            bridge.stop();
+            Pa_CloseStream(stream);
+            stream = nullptr;
+            return false;
         }
+        streamOpen = true;
         flog::info("Audio device open.");
-        running = true;
+        return true;
     }
 
     void doStop() {
-        s2m.stop();
-        monoRB.stop();
-        stereoRB.stop();
-        // monoPacker.stop();
-        // stereoPacker.stop();
-        monoRB.data.stopReader();
-        stereoRB.data.stopReader();
-        // monoPacker.out.stopReader();
-        // stereoPacker.out.stopReader();
-        Pa_StopStream(stream);
-        Pa_CloseStream(stream);
-        monoRB.data.clearReadStop();
-        stereoRB.data.clearReadStop();
-        // monoPacker.out.clearReadStop();
-        // stereoPacker.out.clearWriteStop();
-    }
-
-    static int _mono_cb(const void* input, void* output, unsigned long frameCount,
-                        const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void* userData) {
-        AudioSink* _this = (AudioSink*)userData;
-        if (!gui::mainWindow.isPlaying()) {
-            memset(output, 0, frameCount * sizeof(float));
-            return 0;
+        // Stop producing first; the callback can safely drain the immutable
+        // FIFO or zero-fill while PortAudio shuts down. Do not reset the FIFO
+        // until Pa_CloseStream guarantees that no callback is still using it.
+        bridge.stop();
+        if (streamOpen) {
+            PaError err = Pa_StopStream(stream);
+            if (err != paNoError && err != paStreamIsStopped) {
+                flog::warn("Error while stopping audio stream: ({0}) => {1}", err, Pa_GetErrorText(err));
+            }
+            err = Pa_CloseStream(stream);
+            if (err != paNoError) {
+                flog::warn("Error while closing audio stream: ({0}) => {1}", err, Pa_GetErrorText(err));
+            }
+            streamOpen = false;
+            stream = nullptr;
         }
-        _this->monoRB.data.read((float*)output, frameCount);
-        return 0;
+        bridge.reset();
     }
 
-    static int _stereo_cb(const void* input, void* output, unsigned long frameCount,
-                          const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void* userData) {
+    static int _audio_cb(const void* input, void* output, unsigned long frameCount,
+                         const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void* userData) {
         AudioSink* _this = (AudioSink*)userData;
-        if (!gui::mainWindow.isPlaying()) {
-            memset(output, 0, frameCount * sizeof(dsp::stereo_t));
-            return 0;
+        float* samples = (float*)output;
+        const size_t channels = (size_t)_this->bridge.channels();
+        if (!_this->playing.load(std::memory_order_relaxed)) {
+            _this->bridge.discard();
+            std::memset(samples, 0, (size_t)frameCount * channels * sizeof(float));
+            return paContinue;
         }
-        _this->stereoRB.data.read((dsp::stereo_t*)output, frameCount);
-        return 0;
+
+        const size_t copied = _this->bridge.pop(samples, (size_t)frameCount);
+        if (copied != (size_t)frameCount) {
+            std::memset(samples + copied * channels, 0,
+                        ((size_t)frameCount - copied) * channels * sizeof(float));
+        }
+        return paContinue;
     }
-
-    // static int _mono_cb(const void *input, void *output, unsigned long frameCount,
-    //     const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void *userData) {
-    //     AudioSink* _this = (AudioSink*)userData;
-    //     if (_this->monoPacker.out.read() < 0) { return 0; }
-    //     memcpy((float*)output, _this->monoPacker.out.readBuf, frameCount * sizeof(float));
-    //     _this->monoPacker.out.flush();
-    //     return 0;
-    // }
-
-    // static int _stereo_cb(const void *input, void *output, unsigned long frameCount,
-    //     const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void *userData) {
-    //     AudioSink* _this = (AudioSink*)userData;
-    //     if (_this->stereoPacker.out.read() < 0) { flog::warn("CB killed"); return 0; }
-    //     memcpy((dsp::stereo_t*)output, _this->stereoPacker.out.readBuf, frameCount * sizeof(dsp::stereo_t));
-    //     _this->stereoPacker.out.flush();
-    //     return 0;
-    // }
-
 
     SinkManager::Stream* _stream;
-    dsp::convert::StereoToMono s2m;
-    dsp::sink::RingBuffer<float> monoRB;
-    dsp::sink::RingBuffer<dsp::stereo_t> stereoRB;
-
-    // dsp::Packer<float> monoPacker;
-    // dsp::Packer<dsp::stereo_t> stereoPacker;
+    PortAudioBridge bridge;
+    bool streamOpen = false;
+    std::atomic<bool> playing{ false };
+    EventHandler<bool> playStateHandler;
 
     std::string _streamName;
-    PaStream* stream;
+    PaStream* stream = nullptr;
 
     int srId = 0;
     int devCount;

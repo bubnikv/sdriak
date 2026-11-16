@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utils/flog.h>
 #include <module.h>
 #include <gui/gui.h>
@@ -184,7 +185,7 @@ private:
         RtAudio::StreamParameters parameters;
         parameters.deviceId = _this->devices[_this->devId].id;
         parameters.nChannels = 2;
-        unsigned int bufferFrames = _this->sampleRate / 200;
+        unsigned int bufferFrames = (unsigned int)dsp::sourceBlockSize(_this->sampleRate, _this->stream);
         RtAudio::StreamOptions opts;
         opts.flags = RTAUDIO_MINIMIZE_LATENCY;
         opts.streamName = "SDRIAK Audio Source";
@@ -253,8 +254,16 @@ private:
 
     static int callback(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames, double streamTime, RtAudioStreamStatus status, void* userData) {
         AudioSourceModule* _this = (AudioSourceModule*)userData;
-        memcpy(_this->stream.writeBuf, inputBuffer, nBufferFrames * sizeof(dsp::complex_t));
-        _this->stream.swap(nBufferFrames);
+        // RtAudio may pick a different period than the sr/200 requested, so
+        // publish it in pieces that fit the stream.
+        const dsp::complex_t* in = (const dsp::complex_t*)inputBuffer;
+        const int capacity = _this->stream.capacity();
+        for (unsigned int done = 0; done < nBufferFrames;) {
+            const int n = (int)std::min<unsigned int>(nBufferFrames - done, (unsigned int)capacity);
+            memcpy(_this->stream.writeBuf, &in[done], (size_t)n * sizeof(dsp::complex_t));
+            if (!_this->stream.swap(n)) { break; }
+            done += (unsigned int)n;
+        }
         return 0;
     }
 

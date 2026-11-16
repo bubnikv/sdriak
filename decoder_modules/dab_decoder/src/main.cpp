@@ -7,7 +7,6 @@
 #include <module.h>
 #include <filesystem>
 #include <dsp/stream.h>
-#include <dsp/buffer/reshaper.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/sink/handler_sink.h>
 #include <fstream>

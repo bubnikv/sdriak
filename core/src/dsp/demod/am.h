@@ -122,8 +122,7 @@ namespace dsp::demod {
         // |in[i]| * g, so scaling the magnitudes gives the same samples (up to
         // float rounding) without a complex-sized scratch buffer. The
         // equivalence holds for finite, normalized IQ. If |in[i]| overflows
-        // to inf, the old path output 0 and the new one outputs NaN, but
-        // both leave the AGC permanently broken until reset().
+        // to inf, the output is NaN and the AGC stays broken until reset().
         int process(int count, complex_t* in, T* out) {
             if constexpr (std::is_same_v<T, float>) {
                 volk_32fc_magnitude_32f(out, (lv_32fc_t*)in, count);

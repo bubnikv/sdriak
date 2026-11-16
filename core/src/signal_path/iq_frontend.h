@@ -1,12 +1,11 @@
 #pragma once
 #include "../dsp/buffer/frame_buffer.h"
-#include "../dsp/buffer/reshaper.h"
 #include "../dsp/multirate/power_decimator.h"
 #include "../dsp/correction/dc_blocker.h"
 #include "../dsp/chain.h"
 #include "../dsp/routing/splitter.h"
 #include "../dsp/channel/rx_vfo.h"
-#include "../dsp/sink/handler_sink.h"
+#include "../dsp/sink.h"
 #include "../dsp/math/conjugate.h"
 #include "../dsp/buffer/fftw.h"
 
@@ -59,7 +58,24 @@ public:
     double getEffectiveSamplerate();
 
 protected:
-    static void handler(dsp::complex_t* data, int count, void* ctx);
+    // The whole FFT branch on one thread. It reads fftIn straight off the
+    // splitter, cuts it into frames (processFFTInput()) and runs the FFT
+    // (runFFT()), with no intermediate stream.
+    class FFTSink : public dsp::Sink<dsp::complex_t> {
+    public:
+        void init(dsp::stream<dsp::complex_t>* in, IQFrontEnd* owner) {
+            _owner = owner;
+            dsp::Sink<dsp::complex_t>::init(in);
+        }
+
+        int run() override;
+
+    private:
+        IQFrontEnd* _owner = nullptr;
+    };
+
+    void processFFTInput(const dsp::complex_t* data, int count);
+    void runFFT();
     // newFFTSize > 0 replaces _fftSize, which is committed at the same point as
     // the buffers and the plan built for it -- see the definition.
     void updateFFTPath(bool updateWaterfall = false, int newFFTSize = -1);
@@ -69,7 +85,10 @@ protected:
         return 50.0 / sampleRate;
     }
 
-    static inline void genReshapeParams(double sampleRate, int size, double rate, int& skip, int& nzSampCount) {
+    // One frame every round(sampleRate / rate) samples: the first nzSampCount
+    // of them (at most the FFT size; the rest of the FFT is zero-padded) are
+    // transformed and the next `skip` dropped. Frames never overlap.
+    static inline void genFrameParams(double sampleRate, int size, double rate, int& skip, int& nzSampCount) {
         int fftInterval = round(sampleRate / rate);
         nzSampCount = std::min<int>(fftInterval, size);
         skip = fftInterval - nzSampCount;
@@ -89,8 +108,7 @@ protected:
 
     // FFT
     dsp::stream<dsp::complex_t> fftIn;
-    dsp::buffer::Reshaper<dsp::complex_t> reshape;
-    dsp::sink::Handler<dsp::complex_t> fftSink;
+    FFTSink fftSink;
 
     // VFOs
     std::map<std::string, dsp::stream<dsp::complex_t>*> vfoStreams;
@@ -106,7 +124,13 @@ protected:
     void (*_releaseFFTBuffer)(void* ctx);
     void* _fftCtx;
 
-    // Processing data
+    // Processing data. Framing state, touched only by fftSink's thread and by
+    // updateFFTPath() with that thread stopped: samples of the current frame
+    // already windowed into fftInBuf, and samples still to drop before the
+    // next frame starts.
+    int _fftSkip = 0;
+    int _fftFill = 0;
+    int _fftSkipLeft = 0;
     int _nzFFTSize;
     dsp::buffer::Buffer<float> fftWindowBuf;
     dsp::buffer::FFTWBuffer<fftwf_complex> fftInBuf, fftOutBuf;

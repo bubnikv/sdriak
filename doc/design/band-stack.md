@@ -1,45 +1,30 @@
-# Band stack — review of the current implementation, and a proposed model
+# Band stack — implementation, and a proposed model
 
-Date: 2026-07-25. Companion to `doc/research/band-stacking.md`, which establishes
-from primary sources what a band-stack register actually contains (Icom CI-V
-`1A 01`, Thetis `clsBandStackManager.cs`, Quisk `bandState`, Elecraft K4 `MA$`).
-This note reviews what this fork ships today (`12ec9799`, `d9c915fb`) and
-proposes the state machine and data model to replace it.
+Companion to `doc/research/band-stacking.md`, which establishes from primary
+sources what a band-stack register actually contains (Icom CI-V `1A 01`,
+Thetis `clsBandStackManager.cs`, Quisk `bandState`, Elecraft K4 `MA$`). Part 1
+describes the band stack as built; Parts 2–7 propose the data model and state
+machine to extend it; Part 8 describes the data-layer seam the proposal builds
+on.
 
-**Status (updated 2026-08-16).** Part 8 — the extraction step — has been
-implemented. Current `master` also has an interim subset of P1: plan rows now
-receive stable `band_id` values and collapse to canonical selector keys, while
-each `bandMemory[band_id]` is exactly three rotating optional entries. Entry 0
-is always current: ordinary write-back updates it in place. While any entry is
-empty, repeat tap rotates the prefix through the first empty entry right, then
-stores the current VFO at entry 0. Thus `[A, empty, empty] + X` becomes
-`[X, A, empty]`, and the next repeat with `Y` becomes `[Y, X, A]`. Once full,
-repeat tap overwrites entry 0 and rotates all three entries right. A
+**What is built.** Plan rows receive stable `band_id` values and collapse to
+canonical selector keys, and each band ID owns exactly three rotating optional
+entries. Entry 0 is always current: ordinary write-back updates it in place.
+While any entry is empty, repeat tap rotates the prefix through the first empty
+entry right, then stores the current VFO at entry 0. Thus `[A, empty, empty] + X`
+becomes `[X, A, empty]`, and the next repeat with `Y` becomes `[Y, X, A]`. Once
+full, repeat tap overwrites entry 0 and rotates all three entries right. A
 register-list pick materializes an empty row without first overwriting the old
 top, then promotes the selected row by rotating its prefix. A populated pick
 stores the current VFO before promotion. Empty positions retain their slot
 identity outside the rotated prefix. No current pointer is stored. Opening
 resolves only inside the restored visible group without writing; lifecycle save
-is additionally locked to the current service. There
-is deliberately no migration for pre-release development data. The
-service-owned catalog and shadow/dwell work in Parts 2–7 have not landed.
-Part 1 remains a point-in-time review of the earlier implementation. What
-landed before that interim subset:
+is additionally locked to the current service. The service-owned catalog and
+shadow/dwell tracking of Parts 2–7 are not built.
 
-| Commit | What |
-|---|---|
-| `a78257ef` | `gui/widgets/band_stack.{h,cpp}` — the data layer, §8.4–8.7, plus the `SET_MODE` guard (§8.10 folded commits 1 and 2 together) |
-| `5813127d`, `bf8edcf6` | one canonical mode-name table in `radio_interface.h`, §8.13–8.14 — see `doc/design/radio-modes.md` |
-| `d33bde8f` | the F-INP dialog split out of the digit widget — `gui/widgets/freq_input.h` + `freq_input/{dialog,keypad,bands}.cpp` |
-| `2693030f` | rigctl advertises `CWR` in its mode capability list, closing the half of §8.14 that commit 3 missed |
-
-The last of those is not in Part 8's plan; it is the other half of §1.1's
-complaint, done for the same reason and recorded in §1.1 below.
-
-**Config keys (updated 2026-08-09).** Frequency-input preferences and memory
-state live in one `frequencyMemory` subtree. The complete persisted layout is
-declared in `gui/widgets/freq_memory.h` — no other file spells the key names
-out:
+**Config keys.** Frequency-input preferences and memory state live in one
+`frequencyMemory` subtree. The complete persisted layout is declared in
+`gui/widgets/freq_memory.h` — no other file spells the key names out:
 
 ```text
 frequencyMemory:
@@ -56,29 +41,9 @@ frequencyMemory:
     lastFrequency: { <spectrum range ID>: <frequency> }
 ```
 
-The prose below keeps the old names because it also reviews the implementation
-that used them; the mapping is:
-
-| Was | Is |
-|---|---|
-| `lastMemorySelector` | `frequencyMemory.selector` |
-| `lastActiveBandService` | `frequencyMemory.band.preferredService` |
-| `lastActiveBandId` | removed; visible-band resolution is derived |
-| `bandMemory` | `frequencyMemory.band.stackingRegisters` |
-| `spectrumLastRangeId` | `frequencyMemory.spectrum.activeRange` |
-| `spectrumRangeMemory` | `frequencyMemory.spectrum.lastFrequency` |
-
-There is no migration for pre-release keys or layouts. An existing
-`config.json` may keep old keys as unused entries. The write-only band active ID
-is omitted; spectrum `activeRange` remains because it restores the highlighted
-range. Register readers accept only the canonical string; writes omit the field
-when no mode was recorded. Pre-release numeric modes are not migrated.
-
-The original verdict below was that the data model was keyed on mutable,
-duplicate band-plan names and could not represent the active register. The
-interim release fixes those two immediate defects with stable plan-band IDs and
-the rotating-top convention described above; the broader service-owned model
-remains the target architecture.
+Keys outside this layout are ignored. Spectrum `activeRange` restores the
+highlighted range. Register readers accept only the canonical mode string;
+writes omit the field when no mode was recorded.
 
 Terminology used throughout:
 
@@ -94,63 +59,42 @@ Terminology used throughout:
 
 ---
 
-## Part 1 — Review of the current implementation
+## Part 1 — The current implementation
 
 ### 1.1 Architectural placement
 
-**As reviewed.** Everything lived in `core/src/gui/widgets/frequency_select.cpp`,
-then 1036 lines spanning four unrelated responsibilities:
+The band stack is *application state*: it has to observe tuning that originates
+anywhere (digit widget, mouse wheel, waterfall drag, VFO drag, keypad,
+bookmarks, rigctl, QMX rig knob) and it has to be durable across a process that
+may be killed without notice. So it is not part of the widget that draws it:
 
-| Lines | Responsibility |
+| Responsibility | Lives in |
 |---|---|
-| 26–379, 1027–1036 | The frequency digit widget (hit-testing, wheel, clipboard, layout) |
-| 381–450, 663–801 | The F-INP keypad page |
-| 452–613, 803–964 | The band grid page (plan filtering, category buckets, labels) |
-| 485–560, 966–1025 | **The band stack store** (register I/O, mode heuristics, write-back) |
-
-The problem is not size, it is reachability. The band stack is *application
-state*: it has to observe tuning that originates anywhere (digit widget, mouse
-wheel, waterfall drag, VFO drag, keypad, bookmarks, rigctl, QMX rig knob) and it
-has to be durable across a process that may be killed without notice. A widget
-whose code only executes while its modal popup is open can do neither. This is
-the structural cause of gap 3 in the research note ("write-back only happens on
-band-grid use"), and it blocks every follow-on feature the note anticipates:
-band up/down shortcuts, rigctl `BANDSELECT`, per-band display state, and
-Thetis-style register overlays on the waterfall.
-
-**Where the four responsibilities live now.** All four have been separated; the
-line references throughout Part 1 are against the file as reviewed, and the
-table below is the map from there to the tree today.
-
-| Responsibility | Now in |
-|---|---|
-| Digit widget | `gui/widgets/frequency_select.{h,cpp}`, ~380 lines |
+| Digit widget | `gui/widgets/frequency_select.{h,cpp}` |
 | F-INP keypad page | `gui/widgets/freq_input/keypad.cpp` |
 | Band grid page | `gui/widgets/freq_input/bands.cpp` |
 | Modal shell, page toggle | `gui/widgets/freq_input/dialog.cpp` |
-| Band stack store | `gui/widgets/band_stack.{h,cpp}` |
+| Band stack store | `gui/widgets/band_stack.{h,cpp}`, instance `gui::bandStack` |
+| Persisted layout, lifecycle commit | `gui/widgets/freq_memory.{h,cpp}` |
 
 The dialog's three parts share one module header, `gui/widgets/freq_input.h`,
 which defines what a page is handed (`Context`, `Metrics`) and what it returns
-(`Outcome`). The split is worth one line of rationale beyond tidiness: routing
-the keypad's result back through `Outcome` leaves `keypad.cpp` with no `gui::`,
-`core::` or `config.h` dependency at all, so the one page that is pure input
-handling is now testable without an application around it.
+(`Outcome`). Routing the keypad's result back through `Outcome` leaves
+`keypad.cpp` with no `gui::`, `core::` or `config.h` dependency at all, so the
+one page that is pure input handling is testable without an application around
+it.
 
-**What this did and did not fix.** The *structural* cause above is gone: the
-store is a `gui::bandStack` instance that anything on the UI thread can reach,
-and §8.11 lists where each remaining P1 item now drops in. The *behavioural* gap
-is untouched, and deliberately so (§8.9) — `BandStack` is still stateless and
-still only ever called from the band grid, so nothing polls, nothing commits at
-shutdown, and gap 3 stands exactly as described until Part 3 is built. Finding
-§1.4/5 is the one to watch: it is now a missing caller, not a missing seam.
+`gui::bandStack` is reachable from anything on the UI thread. Its callers are
+the band grid (tap, long-press, register pick) and `freq_memory::commitCurrent()`,
+which `core.cpp` runs at shutdown and from the lifecycle hook. Nothing polls the
+tuning between those events (Part 3 proposes that); §8.8 lists where each
+remaining P1 item drops in.
 
-### 1.2 The keying defect and its three consequences
+### 1.2 Keying: stable band IDs, not plan names
 
-`bandMemory[<band name>]` (`frequency_select.cpp:495`, `:522`) assumes plan band
-names are unique within a plan and stable across plans. They are neither.
-
-**(a) Duplicate names are pervasive — including in the shipped default plan.**
+Registers are keyed by the stable band ID of the canonical `BandMapping` a plan
+row resolves to (`gui/widgets/band_mapping.{h,cpp}`), not by the plan band's
+name. Plan band names are neither unique within a plan nor stable across plans.
 Seventeen of the 21 files in `root/res/bandplans/*.json` reuse at least one band
 name; only ireland, slovakia and the two germany-mobile-* sets do not. The
 thirteen most affected:
@@ -171,153 +115,83 @@ thirteen most affected:
 | usa.json | 57 | 2 | `Shortwave Broadcast` ×14 |
 | germany.json | 76 | 2 | `Aeronautical HF` ×12 |
 
-Sorted by how many names repeat, which understates the damage: a small count is
-not a small problem. general.json has just two duplicated names, and one of them
-covers fifteen bands.
+A small count is not a small problem: general.json has just two duplicated
+names, and one of them covers all fifteen shortwave broadcast segments, which
+a name-keyed store would collapse into one three-slot stack. Names are also
+region-specific (`40m Ham Band` / `40m - Radioamateur` / `Radioamatori 80m`),
+so a name-keyed store would orphan every stack on a plan switch. Stable IDs
+avoid both.
 
-In the default plan, all fifteen shortwave broadcast segments — 2.300–2.468,
-3.200–3.400, 3.950–4.000, 4.750–4.995, 5.005–5.060, 5.900–6.200, 7.200–7.450,
-9.400–9.900, 11.600–12.100, 13.570–13.870, 15.100–15.800, 17.480–17.900,
-18.900–19.020, 21.450–21.850, 25.670–26.100 MHz — share **one** three-slot
-stack. Because `readBandRegisters()` (`:495`) revalidates every entry against the
-*tapped* segment's edges and the segments are disjoint, an entry stored while on
-31 m is discarded the moment the 41 m key is tapped. Net effect: for shortwave —
-the use case a KiwiSDR source and the planned EIBI module (`doc/todo/`) exist to
-serve — band memory essentially never hits and every tap lands on the segment
-midpoint. Identical failure for `13cm Ham Band` ×2 in general.json and usa.json,
-`80m CW` ×2 in russia.json, `70cm` ×4 in turkey.json.
+Plans also overlap: in general.json, `70cm Ham Band` (420–450 MHz) wholly
+contains `PMR446` (446.0–446.2 MHz), and differently-named overlapping pairs
+exist in 9 of the 21 shipped plans. Write-back therefore resolves the band to
+store under through the visible service: `BandStack::resolveBandForServices()`
+lets the preferred service win when it contains the frequency, and otherwise
+takes the first match in another visible service.
 
-**(b) Overlapping bands make write-back and read-back disagree.**
-`selectBand()` walks `plan.bands` and stops at the *first* band containing the
-current frequency (`:985–990`). In general.json, `70cm Ham Band` (420–450 MHz,
-index 38) precedes `PMR446` (446.0–446.2 MHz, index 39) and wholly contains it.
-So tuning to 446.05 and tapping any band key writes the register under
-`70cm Ham Band`; later tapping the *PMR446* key reads an empty
-`bandMemory["PMR446"]` and jumps to the PMR midpoint, while the 70 cm register
-the user cared about has been silently overwritten by the PMR excursion.
-Differently-named overlapping pairs exist in 9 of the 21 shipped plans
-(usa.json: `630m Band` 0.472–0.479 inside `Long Wave` 0.1485–0.519;
-australia.json: `40m Ham Band` 7.0–7.3 vs `Shortwave Broadcast` 7.2–7.45;
-france.json and italy.json six pairs each; general.json also has
-`Military Air` 225–380 vs `Military Sat` 240–270).
+### 1.3 The current register
 
-**(c) Stacks orphan on plan switch.** `bandMemory` is a flat global map and names
-are region-specific (`40m Ham Band` / `40m - Radioamateur` / `Radioamatori 80m`).
-Changing `bandPlan` abandons every stack silently. Conversely two plans sharing a
-name but not the edges share a stack, with containment revalidation as the only
-guard.
+Entry 0 of a band's three is its current register, so no separate pointer is
+stored: ordinary write-back overwrites entry 0 in place, and only an explicit
+band or register action rotates the array (the rules are under **What is
+built** above, and in `BandRegisterSet`). This matches Icom ("when you change
+the operating band or the Register, the previously operated frequency and mode
+are stored") and Thetis (`UpdateCurrentWithLastVisitedData` overwrites in
+place, never pushes): continuous tuning on one band consumes no slots, and a
+repeat tap cycles the stack, as `BN$^;` does on the K4, `Next()` in Thetis and
+the band key on Icom and Yaesu (note §5 gap 4).
 
-### 1.3 Missing state: the current-register pointer
+Opening the active band's register list is a persistence checkpoint: it stores
+the current VFO in entry 0 and then shows a frozen snapshot
+(`BandRegisterPopupSnapshot`), so later radio changes do not rewrite the list
+under the user. The popup holds the static canonical `BandMapping`, not a
+plan-owned row, so a plan reload cannot invalidate it. If the selected VFO's
+mode already matches the register's, `SET_MODE` is skipped, because the radio's
+`selectDemodByID()` has no early-out and rebuilds the demodulator chain, which
+is audible.
 
-The largest behavioural gap, and the reason the research note's gap 1 cannot be
-fixed in place. Nothing records *which* register the user is operating out of,
-so:
+### 1.4 Open findings, ordered by severity
 
-- `pushBandRegister()` (`:522`) can only unshift. Every band change consumes a
-  slot, so an evening of CW on 20 m leaves `[14.031, 14.028, 14.025]` and has
-  evicted the FT8 and SSB entries — precisely the eviction the note describes.
-  Icom ("when you change the operating band or the Register, the previously
-  operated frequency and mode are stored") and Thetis
-  (`UpdateCurrentWithLastVisitedData` → overwrite in place, never push) both
-  overwrite the *selected* slot.
-- Long-pressing a band and picking register 3 tunes there but does not remember
-  it (`:954` passes the frequency explicitly and returns). Retune, leave the
-  band, and the edit lands in register 1 while register 3 keeps a stale value.
-- The stack degenerates from "three user-meaningful slots" into "MRU list of the
-  last three frequencies", which is not a useful artefact and is not what any
-  surveyed product does.
-
-**Repeat-tap is worse than a no-op.** Tapping the band you are already on runs
-the write-back loop (which finds the band you are in — the same band), pushes the
-current frequency (promoting it to slot 1 and demoting the rest), then recalls
-slot 1 — which is now that same frequency. The tap does nothing audible but
-rotates the stack; three repeat taps while tuning around destroy it. Every
-product surveyed cycles instead: `BN$^;` on the K4, `Next()` in Thetis, the band
-key on Icom and Yaesu (note §5 gap 4).
-
-### 1.4 Further findings, ordered by severity
-
-Status as of 2026-07-26 in brackets. Findings 2, 7 and 8 were closed by the
-extraction (`a78257ef`); 10 was narrowed by the mode-name work; the rest are
-open and belong to P1 or later.
-
-1. **[open] No GEN bucket** (note gap 2). The write-back loop stores nothing when no
-   plan band contains the frequency, so a shortwave or WWV excursion outside the
-   plan is dropped. Icom has code 15 `GENE` — literally "other than above";
-   Thetis has `Band.GEN` *and* `waterfall_low_threshold_gen`.
-2. **[fixed, `a78257ef`] `SET_MODE` is issued unconditionally and it is not
-   cheap.** `radio_module.h:415 selectDemodByID()` has no early-out: it calls
-   `instantiateDemod()` and runs the whole `selectDemod()` path — new demod
-   object, bandwidth/snap/squelch/de-emphasis/NR reload from config, AF chain
-   rewiring — even when the requested mode equals the current one. So **every
-   band tap rebuilds the demodulator chain**, an audible click, even when the
-   mode does not change. A one-line guard on our side (compare with `GET_MODE`
-   first) avoids it without touching module ABI. *Shipped as that guard in
-   `band_stack.cpp:176`, inside the extraction commit rather than the separate
-   commit §8.10 planned.*
-3. **[open] `band.chan` snap bypasses the radio module.** This is one confirmed
+1. **No GEN bucket** (note gap 2). Write-back stores nothing when no band
+   contains the frequency, so a shortwave or WWV excursion outside the plan is
+   dropped. Icom has code 15 `GENE` — literally "other than above"; Thetis has
+   `Band.GEN` *and* `waterfall_low_threshold_gen`.
+2. **`band.chan` snap bypasses the radio module.** This is one confirmed
    instance of the systematic ownership problem tracked in
-   `doc/bugs/state-ownership-bypass.md`. `selectBand()` calls
-   `vit->second->setSnapInterval(band.chan)` (`:1020`, now
-   `band_stack.cpp:183`) directly on the waterfall VFO while
-   `RadioModule::snapInterval` (`radio_module.h:915`) keeps its old value. Two
-   consequences: the radio menu's snap field
-   (`radio_module.h:245`) disagrees with what the VFO actually does; and the
-   override survives only until the next `SET_MODE`, so on a band with no mode
+   `doc/bugs/state-ownership-bypass.md`. `BandStack::applySegmentTarget()`
+   calls `setSnapInterval(segment.chan)` directly on the waterfall VFO while
+   `RadioModule::snapInterval` keeps its own value. Two consequences: the radio
+   menu's snap field disagrees with what the VFO actually does; and the override
+   survives only until the next `SET_MODE`, so on a band with no mode
    (`targetMode < 0`, e.g. any `utility`-type band) the channel snap **leaks
    into the next band**. The honest fix is an append-only
    `RADIO_IFACE_CMD_SET_BAND_SNAP_INTERVAL` with explicit apply/clear semantics
    so the module stays authoritative without overwriting the per-mode setting.
-4. **[open] `mode = -1` conflates "no mode" with "no radio module".** `curMode`
-   stays −1 when the selected VFO is not a radio (`:970–974`, now
-   `BandStack::currentMode()`), and that −1 is stored. Coming back to the band
-   then applies the *heuristic* mode rather than restoring anything, and the
-   register has no way to express "leave the mode alone".
-5. **[open] Registers are only reachable through the modal.** No commit on
-   dialog open, none at shutdown. The common session — open F-INP, type a
-   frequency, ENT, listen all evening, quit — stores nothing at all (note gap
-   3). After the extraction this is no longer a placement problem: `commit()`
-   has somewhere to live, it just has no callers yet.
-6. **[fixed] `regPopupBand` is a raw `const bandplan::Band_t*`**
-   (`frequency_select.h:89`, now `freq_input::Bands::regPopupBand` in
-   `gui/widgets/freq_input.h`) held across frames into the
-   `std::vector<Band_t>` inside
-   `bandplan::bandplans`. `bandplan::loadBandPlan()` / `loadFromDir()` reallocate
-   that vector. Only reachable via a plan reload while the popup is open, but it
-   is a dangling pointer by construction. *The popup now stores a pointer to
-   the static canonical `BandMapping` plus a value snapshot of its registers, so
-   plan reloads cannot invalidate either.*
-7. **[fixed, `a78257ef`] `conf["bandMemory"]` is read with non-const
-   `operator[]`** (`:944`) under `acquire()` / `release()` — not
-   `release(true)` — which inserts a `null` into the config without marking it
-   dirty. Harmless today, wrong idiom, and that read re-runs on every frame the
-   register popup is open (global config mutex in a draw loop). *The read helper
-   resolves through a non-materializing section, and the popup now captures one
-   value snapshot on long-press, eliminating both the insertion and per-frame
-   config access.*
-8. **[fixed, `a78257ef`] Capacity 3 is hard-coded in two places** (`:511`,
-   `:532`). The note points out three is a hardware panel constraint; Thetis's
-   stacks are unbounded lists filtered by named `BandStackFilter`s. *Now one
-   `BandRegisterSet::SIZE` beside the fixed array model.*
-9. **[open] No lock, no label, no delete, no "store to slot k".** With automatic
+3. **`mode = -1` conflates "no mode" with "no radio module".**
+   `BandStack::currentMode()` returns −1 when the selected VFO is not a radio,
+   and that −1 is stored. Coming back to the band then applies the *heuristic*
+   mode rather than restoring anything, and the register has no way to express
+   "leave the mode alone".
+4. **Free tuning is committed only at checkpoints.** The register is written
+   on a band transition, on opening the register list, and at shutdown or the
+   lifecycle hook. Nothing polls in between, so a crash after an evening of
+   free tuning loses it. `freq_memory::commitCurrent()` is the commit; Part 3's
+   poll is what is missing.
+5. **No lock, no label, no delete, no "store to slot k".** With automatic
    write-back into three slots, a lock is what keeps a curated entry (the FT8
    frequency) from being consumed. Thetis's rule is one line: skip the commit if
    `Locked`, but always apply the lock flag itself so it stays unlockable.
-10. **[narrowed] The mode convention is duplicated across a language boundary**
-    — `BandStack::heuristicMode()` and `heuristic_mode()` in
-    `scripts/enrich_bandplans.py`. The third instance this finding originally
-    named, `source_modules/qmx_source/src/FreqModeSync.cpp`, is **withdrawn**:
-    that maps `qmx::QmxMode` ↔ `RADIO_IFACE_MODE_*`, which is an enum
-    translation for a specific rig, not the band→mode convention. §8.13 reaches
-    the same conclusion from the other direction and keeps it local. What
-    remains is a genuine C++/Python duplication with no shared source of truth;
-    both sides carry a "keep in sync" comment, which is the honest state of it
-    short of generating one from the other.
-11. **[open] Partial-overlap recall can exceed the source range.** A band that
-    only partially overlaps `[minFreq, maxFreq]` survives the grid filter
-    (`:826`, now `bands.cpp`), so its midpoint default or a stored register can
-    land outside the range and be silently clamped by `draw()` on the next
-    frame.
+6. **The mode convention is duplicated across a language boundary** —
+   `BandStack::heuristicMode()` and `heuristic_mode()` in
+   `scripts/enrich_bandplans.py`, with no shared source of truth; both sides
+   carry a "keep in sync" comment. (`qmx_source`'s `FreqModeSync` maps
+   `qmx::QmxMode` ↔ `RADIO_IFACE_MODE_*`, an enum translation for one rig, not
+   the band→mode convention.)
+7. **Partial-overlap recall can exceed the source range.** A band that only
+   partially overlaps `[minFreq, maxFreq]` survives the grid filter
+   (`freq_input/bands.cpp`), so its midpoint default or a stored register can
+   land outside the range and be silently clamped by `draw()` on the next
+   frame.
 
 ### 1.5 What is right and must be preserved
 
@@ -332,9 +206,9 @@ open and belong to P1 or later.
   the same choice Thetis makes (`BandStackEntry.frequency` is the VFO
   frequency).
 - **The resolution order** memory → `def_freq` → band midpoint, and mode from
-  memory → `def_mode` → convention. `heuristicRadioMode()` encodes the same
-  (band × mode-family) → exact-variant matrix the K4 exposes as `MA$`, including
-  the documented "LSB for 160/80/40 m, USB above" convention.
+  memory → `def_mode` → convention. `BandStack::heuristicMode()` encodes the
+  same (band × mode-family) → exact-variant matrix the K4 exposes as `MA$`,
+  including the documented "LSB for 160/80/40 m, USB above" convention.
 - **Range-filtering the grid** by `limitFreq`/`minFreq`/`maxFreq` in the display
   domain, and the tap-vs-long-press gesture split with a motion slop test.
 - **The register list popup** as the long-press surface — it just needs actions.
@@ -353,7 +227,7 @@ Two decisions carry the whole design:
 
 ### 2.1 D1 — separate "what the grid shows" from "what owns the memory"
 
-These are different concepts and the current code conflates them:
+These are different concepts:
 
 - **Plan bands** are a *display and navigation* artefact: region-specific,
   overlapping, duplicate-named, sometimes 326 of them, sometimes 9 segments of
@@ -490,8 +364,7 @@ Notes on the choices:
   inheriting.
 
 Plan bands map to buckets by **the bucket containing the plan band's centre**,
-which is single-valued and therefore never ambiguous — unlike today's
-first-containing-band write-back.
+which is single-valued and therefore never ambiguous.
 
 ### 2.3 The model
 
@@ -559,9 +432,8 @@ module ABI — and removes any way for the shadow to go stale against the radio.
   A selected empty popup row is materialized without overwriting the old top,
   then promoted by rotating only the prefix through that row.
 - Every populated `regs[i].freq` lies inside the bucket's ranges. Revalidated on load —
-  and because bucket ranges are code-defined and stable, revalidation now almost
-  never discards anything, unlike today's revalidation against editable plan
-  edges.
+  and because bucket ranges are code-defined and stable, revalidation almost
+  never discards anything.
 - Locked entries are never overwritten or evicted. **If every entry in a stack is
   locked, commit is a no-op** — state this explicitly or the eviction search has
   no terminating case.
@@ -594,38 +466,36 @@ Bucket ids are stable, human-readable, and independent of the selected plan.
 
 ### 2.6 Migration — and a constraint that dictates where it runs
 
-This migration belongs to the later service-owned-catalog release, not to the
-pre-release rotating-stack change on `master`. At that future boundary:
+This migration belongs to the service-owned-catalog release. At that
+boundary:
 
-1. For each `bandMemory[<stable band_id>]`, map each populated entry to the
-   service-owned band containing it while preserving cyclic array order.
+1. For each `frequencyMemory.band.stackingRegisters[<band ID>]`, map each
+   populated entry to the service-owned band containing it while preserving
+   cyclic array order.
 2. Keep the source top entry at destination index 0; pad missing entries with
    `null`; set `haveDisplay = false`.
-3. Write `bandStack` with `version: 2`; erase `bandMemory`.
+3. Write `bandStack` with `version: 2`; erase `stackingRegisters`.
 
-Lossless for every entry that was reachable, and entries that were unreachable
-because of a name collision get a home for the first time (the 15 shortwave
-segments fan out into `SW120m`…`SW11m`).
+Lossless for every stored entry.
 
 **Where it must run.** `core/src/core.cpp` repairs the config by **erasing every
-top-level key that is not in `defConfig`** (`core.cpp:394–406`). That runs
-immediately after `configManager.load(defConfig)` (`:342`) and *before* the
-existing migration block (`style::migrateLogicalDimension`, `:429–437`). So if
-`bandMemory` is dropped from `defConfig` in the same commit that adds
-`bandStack`, the repair pass deletes the old data before any code in
-`gui::mainWindow.init()` could migrate it.
+top-level key that is not in `defConfig`**. That runs immediately after
+`configManager.load(defConfig)` and *before* the existing migration block
+(`style::migrateLogicalDimension`). So if the stacking registers' key is
+dropped from `defConfig` in the same commit that adds `bandStack`, the repair
+pass deletes the old data before any code in `gui::mainWindow.init()` could
+migrate it.
 
-Therefore: the migration call must be placed **between `load()` (`:342`) and the
-unused-key repair loop (`:394`)** — a free function
+Therefore: the migration call must be placed **between `load()` and the
+unused-key repair loop** — a free function
 `bandstack::migrateConfig(core::configManager.conf)`, following the precedent of
-`style::migrateLogicalDimension`. The alternative (keep `bandMemory` in
+`style::migrateLogicalDimension`. The alternative (keep the old key in
 `defConfig` for one release) leaves dead config keys around and needs a
 follow-up commit; not worth it.
 
 Downgrade behaviour is worth stating: an older build reading a `version: 2`
-config finds no `bandMemory`, sees `bandStack` as an unused key, and **erases
-it**. Downgrading loses band memory. Acceptable, but it should be in the commit
-message.
+config finds no stacking registers, sees `bandStack` as an unused key, and
+**erases it**. Downgrading loses band memory.
 
 ---
 
@@ -640,8 +510,7 @@ everything else. It does **not** hook `tuner::tune()` or any tuning call site.
 Three reasons, in order of importance:
 
 1. **Thread safety.** `tuner::tune()` is called from the rigctl network thread —
-   the known, currently *postponed* bug in `doc/bugs/ui-thread-sync.md` (issue
-   #1437). Hooking the tune path would put band-stack mutation and config writes
+   the known, *postponed* bug in `doc/bugs/ui-thread-sync.md` (issue #1437). Hooking the tune path would put band-stack mutation and config writes
    on that thread. Polling from the draw loop keeps everything on the UI thread
    by construction, and does not depend on #1437 ever being fixed.
 2. **Coverage.** One function catches digit steps, the mouse wheel, keypad ENT,
@@ -650,8 +519,8 @@ Three reasons, in order of importance:
    to notify us. Turning the band up on a QMX front panel gives us the band
    stack for free.
 3. **Testability and reasoning.** The machine reduces to a pure transition
-   `step(freq, mode, dt) → actions`. (There is no unit-test harness in this repo
-   today, so this buys clarity rather than tests — worth being honest about.)
+   `step(freq, mode, dt) → actions`, which `core/tests` can cover the way
+   `band_register_set_tests` covers the register rotation.
 
 VFO switching falls out for free: selecting another VFO changes the polled
 frequency and is handled by the ordinary bucket-transition rule. As in Thetis —
@@ -785,7 +654,7 @@ range — the same problem, the same answer.
 
 - **Mode:** always compare against `GET_MODE` before `SET_MODE`, because
   `selectDemodByID()` has no early-out and rebuilds the demod chain
-  unconditionally (finding §1.4/2). `mode == -1` means leave the mode alone;
+  unconditionally (§1.3). `mode == -1` means leave the mode alone;
   distinguish it from "no radio module selected" by checking
   `modComManager.getModuleName(vfo) == "radio"` separately.
 - **Snap:** route `chan` through a new append-only
@@ -793,10 +662,10 @@ range — the same problem, the same answer.
   menu field stay authoritative. Recall order stays mode-then-snap, since
   `SET_MODE` reloads the demod's snap from config. When recalling into a band
   with no `chan`, explicitly re-apply the demod's stored snap so a channelized
-  band cannot leak its 25 kHz grid into the next band (finding §1.4/3).
+  band cannot leak its 25 kHz grid into the next band (finding §1.4/2).
 - **Range clamping:** clamp the recall target into `[minFreq, maxFreq]` before
   tuning when `limitFreq`, so a partially-in-range band cannot produce a
-  one-frame excursion (finding §1.4/11).
+  one-frame excursion (finding §1.4/7).
 
 ### 3.7 Edge cases
 
@@ -807,7 +676,7 @@ range — the same problem, the same answer.
 | Selected VFO changes | Polled frequency changes → ordinary bucket-crossing rule; no commit, no recall |
 | Source tuning range changes mid-session | Grid re-filters; stored registers untouched (they are keyed by bucket, not by range); recall clamps |
 | No band plan loaded | Grid shows the existing "No band plan loaded"; the service still tracks and commits — buckets do not need a plan |
-| Band plan switched | Stacks survive (this is the point of D1). Grid re-derives; `regPopupBand` must become an index or a copy, never a pointer (finding §1.4/6) |
+| Band plan switched | Stacks survive (this is the point of D1). Grid re-derives; the register popup holds the static canonical mapping and a value snapshot, so it cannot dangle |
 | Sticky auto-range latched | `applyDisplayState` suppressed; optionally *capture* the converged level into the bucket (see §4) |
 | Server (headless) mode | `core.cpp:438` takes the `server::main()` branch and never reaches `gui::mainWindow.init()`; the service is simply never constructed. No guard needed, but do not reference it from `signal_path` code, which *does* run headless |
 | All slots locked | Commit is a no-op; the register list shows the locks so this is visible rather than mysterious |
@@ -817,8 +686,8 @@ range — the same problem, the same answer.
 
 ## Part 4 — Layer 3: per-band display state
 
-Currently the waterfall range is the two global scalars `conf["min"]` /
-`conf["max"]` (`main_window.cpp:208–214`). Thetis has stored
+The waterfall range is the two global scalars `conf["min"]` / `conf["max"]`
+(`main_window.cpp`). Thetis has stored
 `display_grid_min_<band>` and `waterfall_low/high_threshold_<band>` per band,
 per receiver, with `_gen` / `_wwv` / `_xvtr` buckets, for over a decade
 (research §3), and the flat per-band map — separate from the stack entry — is
@@ -830,7 +699,7 @@ the architecture to copy.
   `autoRange.sticky()` is latched. Buckets without calibration inherit the
   global `min`/`max`, so behaviour is unchanged until the user calibrates.
 - **Captured** when the user moves the Ref or Range slider: the handlers in
-  `drawWaterfallControls()` (`main_window.cpp:1041`, `:1063`) already write
+  `drawWaterfallControls()` (`main_window.cpp`) already write
   `conf["min"]/["max"]` and would additionally write
   `bands[shadow.band].display`.
 - **Calibrated for free by sticky auto-range.** While the latch is on,
@@ -911,28 +780,21 @@ public:
 };
 ```
 
-**The band grid shrinks to a view.** Mostly done: `BandRegister`,
-`readBandRegisters`, `pushBandRegister`, `heuristicRadioMode`,
-`radioModeFromString` and `selectBand` left in `a78257ef`, and the grid itself
-is now `gui/widgets/freq_input/bands.cpp` rather than part of
-`frequency_select.cpp`. Still outstanding for P1: the `regPopupBand` pointer
-becomes a bucket id + slot index, and the two calls become `selectFromKey` /
+**The band grid is a view.** `gui/widgets/freq_input/bands.cpp` draws keys
+and register lists and calls `BandStack` (Part 8). For P1 its popup identifies
+a bucket id + slot index, and its two calls become `selectFromKey` /
 `recallSlot`.
 
 **`main_window.cpp`** — `bandStack.update(deltaTime)` once per frame, next to
-`autoRange.update()` (`:884`); the Ref/Range slider handlers (`:1045`, `:1069`)
-also call `captureDisplay()`.
+`autoRange.update()`; the Ref/Range slider handlers also call
+`captureDisplay()`.
 
-**`core.cpp`** — `defConfig["bandStack"]`, drop `defConfig["bandMemory"]`
-(`:150`), and `bandstack::migrateConfig()` between `load()` (`:342`) and the
-unused-key repair (`:394`); `gui::bandStack.commit()` before
-`disableAutoSave()` (`:511`).
+**`core.cpp`** — `defConfig["bandStack"]`, and `bandstack::migrateConfig()`
+between `load()` and the unused-key repair (§2.6). The shutdown and lifecycle
+commits already run through `freq_memory::commitCurrent()`.
 
-**`core/backends/android/backend.cpp`** — `gui::bandStack.commit()` in
-`APP_CMD_PAUSE` (`:155`), next to the existing `setPlayState(false)`, and before
-`finishAppAndRemoveTask()` in the exit dialog (`main_window.cpp:910`). Android
-has no shutdown path (`core.cpp:500` `#ifndef __ANDROID__`), so these two hooks
-plus the dwell timer are the whole durability story there.
+**Android** has no shutdown path (`core.cpp`, `#ifndef __ANDROID__`), so the
+lifecycle commit plus the dwell timer are the whole durability story there.
 
 **`radio_interface.h` / `radio_module.h`** — append
 `RADIO_IFACE_CMD_SET_SNAP_INTERVAL` (append-only keeps existing numeric values
@@ -1001,24 +863,23 @@ additive `extraBuckets` if a regional need appears.
 
 ### P1 — correctness (the only part that fixes bugs)
 
-Service extraction, band table, rotating-top registers, scoped visible
-resolution, current-service-locked shutdown/Android-pause commits, the
-`SET_MODE` guard, and `regPopupBand` de-pointering. This pre-release change does
-not migrate earlier development-only `bandMemory` shapes; migration belongs
-only to a later public service-catalog boundary if one is then necessary.
-Closes research gaps 1–3 and findings §1.2 (a)(b)(c), §1.3, §1.4/1,2,6,7.
+Built: the data-layer seam (Part 8), stable band IDs, rotating-top
+registers, scoped visible resolution, current-service-locked shutdown/lifecycle
+commits, the `SET_MODE` guard and the frozen register popup. Remaining: the
+bucket table with `GEN`, and shadow tracking. Closes research gaps 1–3 and
+findings §1.4/1 and 4.
 
 Verify in a real build:
 
-- [ ] A missing, malformed, or earlier development-only `bandMemory` entry is
-      treated as three empty slots; every newly written stable band contains
-      exactly three array positions with `null` for empty slots.
+- [ ] A missing or malformed `stackingRegisters` entry is treated as three
+      empty slots; every newly written stable band contains exactly three array
+      positions with `null` for empty slots.
 - [ ] Tune around 20 m for a while, tap 40 m, tap 20 m → back where you were,
       and the other two 20 m registers are **unchanged**.
 - [ ] Tune to 446.05 MHz, tap another band, tap PMR446 → returns to 446.05, and
       the 70 cm register is untouched.
 - [ ] Tune to 9.500 MHz (31 m SW), tap 40 m, tap the 31 m segment → returns to
-      9.500 (this fails today).
+      9.500.
 - [ ] Tune to 15.000 MHz (WWV, in no plan band and in no bucket), tap 20 m, then
       tap GEN → returns to 15.000. *Not 5.000 MHz, the obvious choice: 5.000 is
       in no plan band but it does fall in `SW60m` (4.700–5.100), because that
@@ -1081,191 +942,87 @@ Band up/down shortcut, rigctl band select, waterfall register overlays, snap via
 
 ---
 
-## Part 8 — Extraction step: factoring out the data layer
+## Part 8 — The data-layer seam
 
-**Implemented in `a78257ef`.** This part is kept as written, as the record of
-what was intended, with the three places reality diverged marked inline (§8.4
-the disposition of the grid helpers, §8.9 a third behaviour delta, §8.10 the
-commit sequence). §8.12's checklist is still the verification to run.
+The band-stacking data layer is `gui::bandStack` (`band_stack.{h,cpp}`),
+separate from the frequency-input widget. Everything in Parts 2–4 lands on this
+seam without touching the widget layer except to render new affordances.
 
-Parts 1–7 describe the target. This part is the *first* commit-level step, and it
-is deliberately narrow: **move the band-stacking data layer out of the frequency
-widget, changing nothing about what it decides.** Everything in Parts 2–4 then
-lands on the resulting seam without touching `frequency_select.cpp` again.
+### 8.1 Division of responsibility
 
-### 8.1 Goal and non-goals
+The widget renders band keys and register lists and reports user gestures;
+every *decision* — which register, which frequency, which mode, what to write
+back, what a first visit means — is made in `BandStack`, which the rest of the
+app can also reach.
 
-**Goal.** After this step, `FrequencySelect` renders band keys and register
-lists and reports user gestures; every *decision* — which register, which
-frequency, which mode, what to write back, what a first visit means — is made in
-one non-UI unit that the rest of the app can also reach.
+Not in it yet: the bucket table (§2.2), the poll-based shadow (§3.1), the dwell
+timer (§3.4), GEN, locks, per-band display (Part 4), and the snap interface
+command (§3.6). None of them require re-cutting this seam.
 
-**Non-goals, explicitly deferred:** the bucket table (§2.2), the `current`
-pointer (§1.3), in-place commit (§3.3), the poll-based shadow (§3.1), the dwell
-timer (§3.4), GEN, locks, cycling, per-band display (Part 4), and the snap
-interface command (§3.6). None of them require re-cutting this seam, which is the
-test of whether the seam is in the right place.
+### 8.2 Why the seam is not a passive store
 
-The value of keeping it this narrow is reviewability: the diff should read as
-moved code, so the build can be confirmed unchanged before any semantics are in
-play.
-
-### 8.2 Where to cut, and why not the obvious place
-
-The tempting seam is a passive store — `getRegisters(band)` /
-`putRegister(band, freq, mode)` — leaving `selectBand()`'s orchestration in the
-widget. That is the wrong cut: `selectBand()` **is** the state machine
-(write-back, then target resolution, then mode and snap application). Leaving it
-in the widget leaves the state machine interwoven, which is the thing being
-fixed, and it strands every later commit — the shadow, the dwell timer, the
-display state — with nowhere to live except the widget.
+A passive store — `getRegisters(band)` / `putRegister(band, freq, mode)` —
+would leave band selection's orchestration in the widget. That orchestration
+**is** the state machine (write-back, then target resolution, then mode and
+snap application), and everything later — the shadow, the dwell timer, the
+display state — would have nowhere to live except the widget.
 
 So the cut is by *direction of information*:
 
 > The widget expresses **intent**; the data layer **decides and acts**.
 
-Widget → data layer: `selectBand(band)`, `recallRegister(band, index)`,
-`registersFor(band)`, `modeName(mode)`.
-Data layer → world: request a tune, set the mode, set the snap.
+Widget → data layer: `selectBand()`, `selectLegacySegment()`,
+`openRegisters()`, `recallRegister()`. Data layer → world: request a tune, set
+the mode, set the snap.
 
-### 8.3 The one seam that needs a decision: how the data layer tunes
+### 8.3 How the data layer tunes
 
-`selectBand()` originally tuned by writing its own widget state —
-`setFrequency(...)` plus `frequencyChanged = true` — for `MainWindow::draw()` to
-consume. The band picker itself is drawn later in that same function, however,
-so the request could not be consumed until the next frame. A recalled mode change
-can reconfigure the VFO in between; the next frame's VFO-change handling then
-clears `frequencyChanged` before its branch runs and silently drops the recall.
-
-The data layer therefore follows `frequency_manager::applyBookmark()`: apply the
-recalled mode and channel spacing first, then call
+`BandStack` follows `frequency_manager::applyBookmark()`: it applies the
+recalled mode and channel spacing first, then calls
 `tuner::tune(TUNER_MODE_NORMAL, vfoName, frequency)` directly. Band selection
-already runs on the UI thread, so no deferred mailbox or private tuning wrapper
-is needed. The ordering matters because a mode change may rebuild the
-demodulator and alter the VFO reference or bandwidth.
+runs on the UI thread, so no deferred mailbox or private tuning wrapper is
+needed. The ordering matters because a mode change may rebuild the demodulator
+and alter the VFO reference or bandwidth.
 
-### 8.4 Code disposition
+It does not tune by writing the widget's own state (`setFrequency()` plus
+`frequencyChanged = true`): the band picker is drawn after `MainWindow::draw()`
+consumes that flag, so the request would wait a frame, and a recalled mode
+change can reconfigure the VFO in between, whose handling clears
+`frequencyChanged` and drops the recall.
 
-Moves out of `frequency_select.cpp`:
+### 8.4 Where the pieces live
 
-| Current | Symbol | Destination |
-|---|---|---|
-| `:462` | `kRadioModeNames[]` | `band_stack.cpp`, file-static |
-| `:464–469` | `radioModeFromString()` | `BandStack::modeFromString()` |
-| `:471–473` | `radioModeName()` | `BandStack::modeName()` |
-| `:485–490` | `struct BandRegister` | `band_stack.h` |
-| `:492–517` | `readBandRegisters()` | `BandStack::registersFor()` |
-| `:519–538` | `pushBandRegister()` | `band_stack.cpp`, file-static |
-| `:540–560` | `heuristicRadioMode()` | `BandStack::heuristicMode()` |
-| `:966–1025` | `selectBand()` | split into `selectBand()`, `recallRegister()`, private `storeCurrentBand()` and `applyTarget()` |
+| Piece | Lives in |
+|---|---|
+| Registers, band selection, recall, popup snapshot, lifecycle commit, mode heuristic, mode and snap application | `band_stack.{h,cpp}` |
+| Band grid page, category row, label helpers (`mhzExact()`, `wavelengthToken()`, `mhzLabel()`, `centeredLabel()`) | `freq_input/bands.cpp` |
+| Keypad page | `freq_input/keypad.cpp` |
+| `segButton()`, shared with the page toggle | `gui/widgets/simple_widgets.h` |
+| Haptic feedback | the widget's two gesture handlers, so `band_stack.cpp` needs neither `android_backend.h` nor its `#ifdef` |
 
-Stays on the UI side, because a non-UI consumer would never want it:
-`bandCategory()` (`:453`, the grid's category filter row), `mhzExact()` (`:476`),
-`wavelengthToken()` (`:563`), `mhzLabel()` (`:582`), `centeredLabel()` (`:598`),
-`segButton()` (`:608`), and all of `draw*`.
+The widget makes no module-com calls and does not touch
+`gui::waterfall.vfos`. It still includes `radio_interface.h` transitively,
+because `band_stack.h` does: `BandRegister::mode` *is* a `RADIO_IFACE_MODE_*`,
+and the widget names a mode for display. Mode names come from the canonical
+table in `radio_interface.h` (`radioModeName()` / `radioModeFromName()`); see
+`doc/design/radio-modes.md`.
 
-*Divergence.* "Stays in the widget" held for this commit but did not survive the
-follow-up split: all six helpers and both page bodies now live in
-`gui/widgets/freq_input/{keypad,bands}.cpp`, and `segButton()` — the one of them
-that is not band-specific, and which the page toggle also needed — moved to
-`gui/widgets/simple_widgets.h`. The disposition was right about *what is not
-data-layer work*; it was wrong to assume the remainder was one thing.
+### 8.5 The header
 
-`hapticTick()` moves *into* the widget's two gesture handlers rather than staying
-inside `selectBand()`. Haptics are touch feedback, not a consequence of a band
-decision, and moving it lets `band_stack.cpp` avoid `android_backend.h` and its
-`#ifdef` entirely.
+`band_stack.h` is the reference. Its shape: `BandRegister` (`freq`, `mode`),
+`BandRegisterSet` (three optional slots with the rotation rules), the frozen
+`BandRegisterPopupSnapshot` and the pure `prepareBandRegisterPopup()`
+transition that `band_register_set_tests` covers, and the `BandStack` class
+with an explicit UI-thread-only threading contract: nothing in it is called
+from the tune path, so rigctl's network thread (`doc/bugs/ui-thread-sync.md`)
+never reaches this state — the current frequency is sampled, never pushed in.
 
-The widget also loses `#include <radio_interface.h>` and every use of
-`core::modComManager` and `gui::waterfall.vfos` — a good check that the seam is
-clean. Net: roughly −150 lines from a 1036-line file, and the new unit is ~200
-lines including its documentation.
-
-### 8.5 Proposed header
-
-```cpp
-#pragma once
-#include <string>
-#include <vector>
-
-namespace bandplan { struct Band_t; }
-
-// One band stacking register: a previously operated frequency and mode, in the
-// IC-705 sense -- "when you change the operating band or the Register, the
-// previously operated frequency and mode are stored". See
-// doc/research/band-stacking.md for what the reference implementations keep.
-struct BandRegister {
-    double freq = 0;   // VFO tune frequency, Hz, display domain
-    int    mode = -1;  // RADIO_IFACE_MODE_*, -1 = nothing stored
-};
-
-// The band stacking data layer: what is remembered per band, and what happens
-// when the user asks for one.
-//
-// The band grid in FrequencySelect is a view over this. It draws keys and
-// register lists and reports gestures; every decision -- which register, which
-// frequency, which mode, what to write back, what a first visit means -- is
-// made here.
-//
-// Threading contract:
-//   - UI thread only. Nothing here is called from the tune path, so rigctl's
-//     network thread (doc/bugs/ui-thread-sync.md) never reaches this state:
-//     the current frequency is sampled, never pushed in.
-//
-// Stateless as of this commit -- the config is the store. The instance exists so
-// that the state this needs next (which register each band is currently in, the
-// uncommitted "last visited" entry, the commit timer) has a home that does not
-// churn call sites. See doc/design/band-stack.md.
-class BandStack {
-public:
-    // --- queries ---------------------------------------------------------
-
-    // Registers stored for a band, newest first, dropping any entry no longer
-    // inside the band's (possibly edited) edges. Empty for a band never
-    // visited.
-    std::vector<BandRegister> registersFor(const bandplan::Band_t& band) const;
-
-    // --- intents ---------------------------------------------------------
-
-    // A tap on a band key: store the frequency and mode of the band being
-    // left, then tune to this band's newest register -- or, on a first visit,
-    // to its default (def_freq / def_mode, else the convention below).
-    void selectBand(const bandplan::Band_t& band);
-
-    // A pick from a band's register list: the same write-back, but tune to the
-    // register the user chose. `index` indexes registersFor(band).
-    void recallRegister(const bandplan::Band_t& band, int index);
-
-    // --- policy ----------------------------------------------------------
-
-    // Mode implied by a band's type and frequency, for bands whose plan entry
-    // carries no def_mode. Keep in sync with heuristic_mode() in
-    // scripts/enrich_bandplans.py.
-    static int heuristicMode(const bandplan::Band_t& band);
-
-private:
-    void applyTarget(const bandplan::Band_t& band, double freq, int mode);
-    int  currentMode() const;       // -1 when the selected VFO is not a radio
-};
-```
-
-Two details settled while implementing this: the write-back helper
-(`storeCurrentBand`) is a file-static taking the already-locked `json&` rather
-than a private member, which keeps `json` out of the header; and the register
-cap, hard-coded as `3` in two places today (finding §1.4/8), becomes one
-`MAX_REGISTERS` in `band_stack.cpp`.
-
-`band_stack.h` needs only `<string>`, `<vector>` and a forward declaration, so it
-introduces no include cycle: `gui.h` includes it to declare the instance, and
-`band_stack.cpp` includes `gui/gui.h`.
-
-**Why a class rather than free functions,** given it holds no state yet: the
-state added next — the shadow, the dwell timer, `registerCount`, the per-band
-`current` pointers — is per-application state that must be reachable from
-`MainWindow::draw()`, `core.cpp`'s shutdown and the Android pause handler.
-`WaterfallAutoRange` is the in-tree precedent: also small, also could have been
-free functions over file statics, also a class because it owns a latch and a
-timer and is driven from the frame loop.
+**Why a class rather than free functions,** given the config is the store: the
+state P1 adds next — the shadow and the dwell timer — is per-application state
+that must be reachable from `MainWindow::draw()`, `core.cpp`'s shutdown and the
+Android pause handler. `WaterfallAutoRange` is the in-tree precedent: also
+small, also a class because it owns a latch and a timer and is driven from the
+frame loop.
 
 ### 8.6 Instance and build wiring
 
@@ -1274,228 +1031,32 @@ timer and is driven from the frame loop.
   stable identities and the selector's band-memory behavior.
 - `gui.h`: `SDRPP_EXPORT BandStack bandStack;` alongside `freqSelect`. Exported
   because out-of-tree consumers will want it (rigctl band select, §5.2).
-- `core/CMakeLists.txt` needs no change — `file(GLOB_RECURSE SRC "src/*.cpp")`
-  (`:9`) picks it up. It recurses, so the later `widgets/freq_input/` directory
-  needed no change either; but the glob has no `CONFIGURE_DEPENDS`, so adding a
-  source file requires a CMake re-configure before it is built.
+- `core/CMakeLists.txt` needs no entry — `file(GLOB_RECURSE SRC "src/*.cpp")`
+  picks it up, including `widgets/freq_input/`. The glob has no
+  `CONFIGURE_DEPENDS`, so adding a source file requires a CMake re-configure
+  before it is built.
 
-### 8.7 One simplification worth folding in: plan resolution
+### 8.7 Plan resolution
 
-`drawBandPage()` resolves the plan itself (`:808–816`): `planName` from
-`conf["bandPlan"]`, falling back to `"General"`, then to `bandplans.begin()`. But
-`gui::waterfall.bandplan` (`waterfall.h:156`) is already the app's authoritative
-resolved plan — set by `bandplanmenu::init()` (`menus/bandplan.cpp:45–53`) and
-updated by the plan combo (`:63–68`).
+Both the band grid and the data layer read `gui::waterfall.bandplan`, the app's
+resolved plan, set by `bandplanmenu::init()` (`menus/bandplan.cpp`) and updated
+by the plan combo. So the grid and the waterfall ruler always show the same
+plan, including when `conf["bandPlan"]` names a plan that is not loaded (both
+fall back to `bandplanNames[0]`), and no call threads the plan through. The
+"independent of the `bandPlanEnabled` toggle" requirement in
+`doc/todo/band-picker.md` holds — that flag controls visibility, not the
+pointer.
 
-Those two resolutions **use different fallbacks**: the menu falls back to
-`bandplanNames[0]`, the widget to `"General"`. So today, if `conf["bandPlan"]`
-names a plan that is not loaded, the waterfall ruler shows `bandplanNames[0]`
-while the band grid lists `"General"` — two different plans in one window.
+### 8.8 Where P1 lands
 
-So: both the widget and the data layer read `gui::waterfall.bandplan`, and the
-`planName` member (`frequency_select.h:83`) and its config read (`:628`) go away.
-This removes the third divergent fallback chain, guarantees the grid and the
-ruler agree, and removes the awkward `selectBand(band, plan, ...)` signature that
-threaded the plan through every call. The "independent of the `bandPlanEnabled`
-toggle" requirement in `doc/todo/band-picker.md` still holds — that flag controls
-visibility, not the pointer.
-
-### 8.8 Two things deliberately *not* fixed here
-
-Both are real, both are recorded in Part 1, and both are dissolved by P1's model
-rather than needing an interim fix:
-
-- **`regPopupBand` stays a raw `const Band_t*`** (finding §1.4/6). Holding a
-  `Band_t` by value would fix the dangling-pointer class, but it pulls
-  `bandplan.h` into `frequency_select.h` and is thrown away in P1, where the
-  popup identifies its band as a `(bucket id, slot)` pair and needs no `Band_t`
-  at all. *This too was removed by the later cleanup: the popup now holds the
-  static canonical `BandMapping`, not a plan-owned `Band_t`.*
-- **The register list keeps calling into the data layer per frame** while the
-  popup is open. Snapshotting on the long-press would be tidier, but the actual
-  defect at `:944` is the non-const `operator[]` insert. *This did not survive
-  the later cleanup: opening the active band's popup now persists its current
-  top once and returns a frozen register/capability snapshot; the popup performs
-  no per-frame band-stack access.*
-
-### 8.9 Intended behaviour deltas
-
-The commit should be reviewable as "nothing changed", with exactly two
-exceptions, both consequences of §8.7 and §8.8:
-
-1. When `conf["bandPlan"]` names a plan that is not loaded, the band grid now
-   lists the same plan as the waterfall ruler (`bandplanNames[0]`) instead of
-   `"General"`.
-2. Reading band memory no longer inserts a stray `"bandMemory": null` into the
-   config.
-3. *(Divergence — not planned here.)* `SET_MODE` is skipped when the mode
-   already matches, so a band tap no longer rebuilds the demodulator chain and
-   no longer clicks (finding §1.4/2). This was §8.10's commit 2; it shipped
-   inside commit 1 instead, which is the one thing about `a78257ef` that is not
-   a pure move.
-
-Everything else — which register a tap recalls, push-not-overwrite, the missing
-GEN bucket, repeat-tap rotating the stack — is **preserved as-is**, on purpose.
-Those are Part 1 findings and each gets its own commit.
-
-### 8.10 Commit sequence
-
-1. **`gui: factor the band stacking data layer out of frequency_select`** —
-   §8.4–8.7. No intended behaviour change beyond §8.9.
-2. **`band_stack: skip SET_MODE when the mode already matches`** — one guard
-   comparing against `GET_MODE` before `SET_MODE`, removing the demodulator
-   rebuild and its audible click on every band tap (finding §1.4/2). Separate so
-   it can be reverted on its own.
-3. **`modules: one canonical mode-name table`** — §8.13–8.14; see
-   `doc/design/radio-modes.md`. Touches `radio_interface.h`, the radio module,
-   recorder, frequency_manager, discord_integration and rigctl_server, so it is
-   kept apart from the band-stack commits above.
-4. P1 proper (§7), on the seam.
-
-*What actually happened.* 1 and 2 were folded into `a78257ef`, losing the
-separate revert the plan wanted for the guard — a small cost, noted so the
-sequence is not read as history. 3 shipped as `5813127d` plus `bf8edcf6`, which
-adds a static assertion tying the table to the enum. A step not in this list was
-needed between 3 and 4: splitting the F-INP dialog out of the digit widget
-(§1.1), since the band grid is where every P2 affordance lands and it was still
-tangled with the keypad.
-
-### 8.11 What the seam buys: how P1 drops in
-
-After commit 1, no further band-stack work touches the widget layer except to
-render new affordances (lock icons, cycling feedback) — and after the split,
-that means `freq_input/bands.cpp` alone, not `frequency_select.cpp`:
+Further band-stack work touches the widget layer only to render new affordances
+(lock icons, cycling feedback), in `freq_input/bands.cpp`:
 
 | P1 item | Where it lands |
 |---|---|
-| Bucket table, `bucketOf()` | new file-static table in `band_stack.cpp`; replaces the plan-walk inside `storeCurrentBand()` |
-| Rotating top, in-place commit | `BandState::regs[0]`; `recallRegister()` already receives the index it needs to rotate to the top |
-| Shadow, dwell timer | new private members; new public `update(double dt)` and `commit()` |
-| Poll-based tracking | `gui::bandStack.update(dt)` in `MainWindow::draw()`, beside `autoRange.update()` (`:884`) |
-| Shutdown / Android pause commit | `gui::bandStack.commit()` in `core.cpp:511` and `backend.cpp:155` |
-| Migration | free `bandstack::migrateConfig(json&)` called from `core.cpp` between `:342` and `:394` |
+| Bucket table, `bucketOf()` | new file-static table in `band_stack.cpp`; replaces the visible-service resolution behind write-back |
+| Shadow, dwell timer | new private members; new public `update(double dt)` |
+| Poll-based tracking | `gui::bandStack.update(dt)` in `MainWindow::draw()`, beside `autoRange.update()` |
+| Shutdown / Android pause commit | already `freq_memory::commitCurrent()` → `commitCurrentBand()`; extended to commit the shadow |
+| Migration | free `bandstack::migrateConfig(json&)` called from `core.cpp` before the unused-key repair (§2.6) |
 | Per-band display | `BandState` members + `captureDisplay()` called from the Ref/Range slider handlers |
-
-### 8.12 Verification for the build
-
-The extraction is behaviour-preserving, so the checks are equality checks against
-the current build:
-
-- [ ] Band grid renders identically; category row, range filtering and scrolling
-      unchanged.
-- [ ] Tap a band with stored memory → same frequency and mode as before.
-- [ ] Tap a band never visited → same default (`def_freq` for MW = 1 MHz AM;
-      midpoint elsewhere).
-- [ ] Long-press → register list shows the same entries with the same mode names;
-      picking one tunes as before.
-- [ ] `config.json` `bandMemory` is written in the same shape, and an existing
-      `bandMemory` still reads.
-- [ ] Channelized band (`chan` set, e.g. Marine VHF) still sets the VFO snap.
-- [ ] Android: haptic tick still fires on band tap and on long-press.
-- [ ] With `bandPlan` set to a plan that is not installed, the grid and the
-      waterfall ruler now agree (the one intended delta).
-
-### 8.13 Where the mode-name table belongs
-
-The extraction initially carried `kRadioModeNames[]` into `band_stack.cpp`. That
-was wrong: the enum→string mapping is not a band-stack concern, and five other
-sites already needed it. Surveying them:
-
-| Site | Indexed by | Names | CWR? |
-|---|---|---|---|
-| `core/src/radio_interface.h` (new) | `RADIO_IFACE_MODE_*` | NFM WFM AM DSB USB CW LSB RAW **CWR** | yes |
-| `radio_module.h:204` `modeLabels` | **display order**, paired `modeIDs[]` | … **CW-R** | yes |
-| `rigctl_server/main.cpp:339` | `RADIO_IFACE_MODE_*` | NFM→**"FM"** (Hamlib) | **no** |
-| `frequency_manager/bookmark.cpp:5` | `RADIO_IFACE_MODE_*` | canonical, 8 entries | **no** |
-| `recorder/main.cpp:535` | `RADIO_IFACE_MODE_*` | canonical, 8 entries | **no** |
-| `discord_integration/main.cpp:88` | if/else chain | WFM→"FM", no RAW | **no** |
-
-Three distinct namespaces looked to be in play, but only one turned out to be a
-real vocabulary rather than an accident:
-
-- **Canonical** — everything stored or shown as text: band stack registers,
-  bookmarks, recorder filenames, band plan `def_mode`, the radio menu's button
-  labels, and the radio's own per-mode config keys. One table.
-- **Hamlib protocol** (rigctl_server) — genuinely different (`FM` *is* narrow FM
-  there), and it parses incoming names too. Stays local, as one `if` each way
-  over the canonical table.
-- **Kenwood MD** (libqmx) — its own enum and digit codes, covering modes we do
-  not have. Stays local.
-
-The radio menu's *ordering* is local (a layout concern) but its labels are not.
-See `doc/design/radio-modes.md` for the full survey and the reasoning; the
-canonical spelling is `NFM`/`WFM`/`CWR`.
-
-So the canonical table lives in `core/src/radio_interface.h`, beside the enum it
-indexes, as `RADIO_IFACE_MODE_NAMES[]` plus inline `radioModeName()` /
-`radioModeFromName()`. That header is the module-com contract and is already in
-`core/src` precisely so modules depend only on core. Keeping the table next to
-the enum is what stops it going stale when a mode is appended — which is exactly
-what happened: `RADIO_IFACE_MODE_CWR` was added last and **four of the five
-copies never learned about it**.
-
-`BandStack::modeName` / `modeFromString` are gone; callers use the free
-functions. `band_stack.h` includes `radio_interface.h` because `BandRegister::mode`
-*is* a `RADIO_IFACE_MODE_*` and the struct should be interpretable on its own.
-The widget therefore still sees the contract header, transitively — it no longer
-makes module-com calls, which was the actual point of §8.4, but it does still
-name a mode for display.
-
-### 8.14 Two latent bugs found while surveying
-
-Both were pre-existing, both were the missing-CWR consequence, and both were
-fixed by commit 3 above — **verified in the tree 2026-07-26**, see the
-disposition after the findings:
-
-1. **[fixed] `recorder/main.cpp:578` — UB when recording in CW-R.**
-   `modeStr = radioModeToString[mode];` uses `std::map::operator[]`, which for
-   the absent key 8 inserts a value-initialised `const char*` (null) and assigns
-   it to `const char* modeStr`. That null then reaches
-   `std::regex_replace(templ, std::regex("\\$r"), modeStr)` at `:590`, which
-   constructs a string from it. Triggered by recording with `$r` in the filename
-   template while the radio is in CW-R.
-2. **[fixed] `frequency_manager` — out-of-bounds read on a CW-R bookmark.**
-   `demodModeList[]` has 8 entries but `currentBookmarkBwMode()` stores whatever
-   `GET_MODE` returns, so a bookmark created in CW-R indexes past the end at
-   `main.cpp:680` and `:982`. The edit combo (`demodModeListTxt`) cannot express
-   CW-R either, so such a bookmark cannot be corrected through the UI.
-
-`rigctl_server` has the same gap but is safe: it looks up with `find` / `find_if`
-(`:474`, `:504`) and falls back to `"RAW"`. It should still gain a CWR entry so
-Hamlib clients can select it.
-
-**What commit 3 actually did**, checked against the tree:
-
-- **`recorder`** — `radioModeToString` and its `std::map::operator[]` are gone.
-  `modeStr` is now seeded with a valid `"Unknown"`/`"IQ"` at `main.cpp:558` and
-  only replaced under a bounds check at `:577`, so no null can reach the
-  `$r` substitution at `:589`. The guard is doubled with an `assert`, and a
-  comment records why the placeholder is preferred to `radioModeName()`'s `"--"`
-  in a filename.
-- **`frequency_manager`** — `demodModeList[]` is gone; display goes through
-  `radioModeName()` (`:718`, `:1020`) and the edit combo iterates
-  `RADIO_IFACE_MODE_NAMES` over `_RADIO_IFACE_MODE_COUNT` (`:283–295`), so CW-R
-  is now both storable and correctable. *The claim previously made here — that
-  the combo uses "ImGui's array overload" — was wrong: it is a hand-rolled
-  `BeginCombo` + `Selectable` loop, and has to be, because the preview carries a
-  disabled "(not set)" state for a bookmark whose mode is −1 that the array
-  overload cannot express.*
-- **`discord_integration`** — bounds-checked `radioModeName()` at `main.cpp:97`.
-- **`rigctl_server`** — `hamlibModeName()` / `hamlibModeFromName()` (`:346`,
-  `:360`) are one explicit `if` for `NFM`↔`"FM"` over the canonical table, so
-  CW-R now converts in both directions.
-
-**The rigctl half was missed, and is now closed (`2693030f`).** The paragraph above asked for
-"a CWR entry so Hamlib clients can select it"; the conversion functions got one,
-the capability response did not. Until 2026-07-26 the `M ?` / `\set_mode ?`
-reply was the hard-coded literal `"FM WFM AM DSB USB CW LSB RAW\n"` — eight
-names — so the module *accepted* `M CWR` and *reported* `CWR` while telling any
-client that enumerated modes it was unsupported, and contradicted its own
-`dump_state` (`:657`), whose mode bitfield `0x2ef` sets `RIG_MODE_CWR` (0x80)
-and whose filter list advertises `0x82` = `CW | CWR`. It was the last
-hand-maintained mode list in the tree, which is precisely the drift commit 3 set
-out to remove. Now `hamlibModeList()` builds it from `RADIO_IFACE_MODE_NAMES`
-through `hamlibModeName()`, so advertised, accepted and reported cannot diverge
-again.
-
-Full result in `doc/design/radio-modes.md`.

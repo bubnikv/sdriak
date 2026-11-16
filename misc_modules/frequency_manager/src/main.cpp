@@ -109,7 +109,7 @@ private:
                     // bandwidth guard is not cosmetic: setBandwidth() clamps a 0
                     // to the demodulator's minimum and *persists* it into
                     // radio_config.json, so recalling a bookmark taken without a
-                    // radio VFO used to destroy the saved bandwidth of whatever
+                    // radio VFO would destroy the saved bandwidth of whatever
                     // mode it had just switched to.
                     if (bm.mode >= 0) {
                         int mode = bm.mode;

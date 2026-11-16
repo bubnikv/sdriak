@@ -4,7 +4,7 @@
 #include <dsp/hier_block.h>
 #include <dsp/sink/null_sink.h>
 #include <dsp/demod/gfsk.h>
-#include <dsp/routing/doubler.h>
+#include <dsp/buffer/frame_tap.h>
 #include <volk/volk.h>
 #include <codec2.h>
 #include <golay24.h>
@@ -120,6 +120,9 @@ namespace dsp {
             int count = _in->read();
             if (count < 0) { return -1; }
 
+            // Diagnostic display, inline and non-blocking.
+            tap.push(_in->readBuf, count);
+
             float val;
             for (int i = 0; i < count; i++) {
                 val = _in->readBuf[i];
@@ -134,6 +137,10 @@ namespace dsp {
         }
 
         stream<uint8_t> out;
+
+        // Soft symbols for the diagnostic display, fed before slicing.
+        // Initialise it before start().
+        buffer::FrameTap<float> tap;
 
     private:
         stream<float>* _in;
@@ -646,8 +653,7 @@ namespace dsp {
             _sampleRate = sampleRate;
 
             demod.init(input, M17_BAUDRATE, sampleRate, M17_DEVIATION, 31, M17_RRC_ALPHA, 1e-6f, 0.01f, 0.01f);
-            doubler.init(&demod.out);
-            slice.init(&doubler.outA);
+            slice.init(&demod.out);
             demux.init(&slice.out);
             lsfFEC.init(&demux.linkSetupOut, handler, ctx);
             payloadFEC.init(&demux.streamOut);
@@ -656,11 +662,10 @@ namespace dsp {
 
             ns2.init(&demux.packetOut);
 
-            diagOut = &doubler.outB;
+            diagTap = &slice.tap;
             out = &decodeAudio.out;
 
             hier_block::registerBlock(&demod);
-            hier_block::registerBlock(&doubler);
             hier_block::registerBlock(&slice);
             hier_block::registerBlock(&demux);
             hier_block::registerBlock(&lsfFEC);
@@ -682,12 +687,11 @@ namespace dsp {
             return decodeAudio.isReceiving();
         }
 
-        stream<float>* diagOut = NULL;
+        buffer::FrameTap<float>* diagTap = NULL;
         stream<stereo_t>* out = NULL;
 
     private:
         demod::GFSK demod;
-        routing::Doubler<float> doubler;
         M17Slice4FSK slice;
         M17FrameDemux demux;
         M17LSFDecoder lsfFEC;

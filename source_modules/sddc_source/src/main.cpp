@@ -251,7 +251,7 @@ private:
         // }
 
         // Compute buffer size (Lower than usual, but it's a workaround for their API having broken streaming)
-        _this->bufferSize = _this->sampleRate / 100.0;
+        _this->bufferSize = dsp::sourceBlockSize(_this->sampleRate, _this->ddcIn, 100);
 
         // Start streaming
         err = sddc_start(_this->openDev);

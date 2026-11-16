@@ -120,23 +120,24 @@ namespace dsp::filter {
         // Publishes a new active tap set and, if maxBlock > 0, a new block
         // bound. Overridden by DecimatingFIR to reset its phase.
         //
-        // The delay line is reshaped before the taps are committed. Each
-        // HistoryBuffer operation has the strong guarantee. If growing the
-        // history fails after a successful capacity change, the FIR retains
-        // its old taps and history with only harmless extra block capacity.
+        // The delay line is reshaped before the taps are committed, in a
+        // single HistoryBuffer operation with the strong guarantee, so a throw
+        // leaves the FIR on its old taps, bound and history.
         virtual void applyTaps(TapView<T> taps, int maxBlock) {
             assert(m_init);
+            // Keeps the newest samples when the tap count changes, matching
+            // the pre-kernel FIR behavior. A caller changing sample domains is
+            // responsible for an explicit reset after the new taps commit.
             if (maxBlock > 0 && maxBlock != m_hist.maxBlock()) {
                 // [RATE-SIZED] Same contract as init(): the new bound comes
                 // from the caller's rate arithmetic. This changes capacity,
                 // not the sample domain, so keep the retained samples.
                 // see doc/design/buffer-size-requirements.md 2.6
-                m_hist.setMaxBlock(maxBlock);
+                m_hist.reshape(maxBlock, taps.size() - 1);
             }
-            // Keeps the newest samples when the tap count changes, matching
-            // the pre-kernel FIR behavior. A caller changing sample domains is
-            // responsible for an explicit reset after the new taps commit.
-            m_hist.setHistory(taps.size() - 1);
+            else {
+                m_hist.setHistory(taps.size() - 1);
+            }
             m_taps = taps;
         }
 

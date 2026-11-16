@@ -1,5 +1,6 @@
 #pragma once
 #include <assert.h>
+#include <exception>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -31,25 +32,48 @@ namespace dsp {
                 return;
             }
             running = true;
-            doStart();
+            tempStopped = false;
+            try {
+                doStart();
+            }
+            catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                recoverFailedStart();
+                std::rethrow_exception(error);
+            }
         }
 
         virtual void stop() {
             assert(_block_init);
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
             if (!running) {
+                tempStopped = false;
                 return;
             }
             doStop();
             running = false;
+            // A permanent stop cancels any restart still owed by a matching
+            // tempStart(), including when stop() is called between tempStop()
+            // and tempStart().
+            tempStopped = false;
         }
 
         void tempStart() {
             assert(_block_init);
             if (!tempStopDepth || --tempStopDepth) { return; }
             if (tempStopped) {
-                doStart();
-                tempStopped = false;
+                try {
+                    doStart();
+                    tempStopped = false;
+                }
+                catch (...) {
+                    const std::exception_ptr error = std::current_exception();
+                    // doStart() may have created only part of a composite
+                    // block's workers (one that starts two). Join anything it
+                    // published before reporting the failed restart.
+                    recoverFailedStart();
+                    std::rethrow_exception(error);
+                }
             }
         }
 
@@ -104,6 +128,29 @@ namespace dsp {
         };
 
     protected:
+        // Restore a coherent state after doStart() throws. doStop() is virtual
+        // here, so composite blocks can join every worker they managed to
+        // create before the failure. If cleanup itself fails, keep `running`
+        // true and tempStopped false: the next stop/tempStop retries cleanup
+        // instead of assigning over a possibly joinable std::thread.
+        void recoverFailedStart() noexcept {
+            try {
+                doStop();
+                running = false;
+                tempStopped = false;
+            }
+            catch (const std::exception& e) {
+                running = true;
+                tempStopped = false;
+                flog::error("Failed to clean up a partially started DSP block: {0}", e.what());
+            }
+            catch (...) {
+                running = true;
+                tempStopped = false;
+                flog::error("Failed to clean up a partially started DSP block");
+            }
+        }
+
         void workerLoop() {
             while (run() >= 0) {}
         }

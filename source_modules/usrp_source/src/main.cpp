@@ -407,12 +407,12 @@ private:
 
     void worker() {
         // TODO: Select a better buffer size that will avoid bad timing
-        int bufferSize = sampleRate / 200;
+        // UHD treats this count as the capacity of stream.writeBuf. A bare
+        // sr/200 is 1 250 000 at 250 MS/s, past the end of the stream.
+        int bufferSize = dsp::sourceBlockSize(sampleRate, stream);
         try {
             while (true) {
                 uhd::rx_metadata_t meta;
-                void* ptr[] = { stream.writeBuf };
-                uhd::rx_streamer::buffs_type buffers(ptr, 1);
                 int len = streamer->recv(stream.writeBuf, bufferSize, meta, 1.0);
                 if (len < 0) { break; }
                 if (len != bufferSize) {

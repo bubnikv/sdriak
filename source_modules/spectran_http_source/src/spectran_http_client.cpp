@@ -1,6 +1,11 @@
 #include "spectran_http_client.h"
 #include <utils/flog.h>
 #include <inttypes.h>
+#include <algorithm>
+#include <charconv>
+#include <cstring>
+#include <exception>
+#include <system_error>
 
 SpectranHTTPClient::SpectranHTTPClient(std::string host, int port, dsp::stream<dsp::complex_t>* stream) {
     this->stream = stream;
@@ -78,7 +83,36 @@ void SpectranHTTPClient::setCenterFrequency(uint64_t freq) {
     }
 }
 
+namespace {
+    // Reads the integer after `key` in a flat JSON object. Returns false if the
+    // key is absent or no digits follow it, never throws: the metadata is peer
+    // data. A fractional part ("46080000.0") stops the parse, as std::stoll did.
+    bool parseIntField(const std::string& json, const char* key, int64_t& value) {
+        const size_t keyPos = json.find(key);
+        if (keyPos == std::string::npos) { return false; }
+        const char* p = json.data() + keyPos + strlen(key);
+        const char* end = json.data() + json.size();
+        while (p < end && (*p == ' ' || *p == '\t')) { p++; }
+        const auto result = std::from_chars(p, end, value);
+        return result.ec == std::errc() && result.ptr != p;
+    }
+}
+
 void SpectranHTTPClient::worker() {
+    // Backstop: an exception escaping a std::thread terminates the process,
+    // and everything this loop reads comes from the network.
+    try {
+        workerLoop();
+    }
+    catch (const std::exception& e) {
+        flog::error("Spectran HTTP worker stopped: {}", e.what());
+    }
+    catch (...) {
+        flog::error("Spectran HTTP worker stopped on an unknown exception");
+    }
+}
+
+void SpectranHTTPClient::workerLoop() {
     while (sock->isOpen()) {
         // Get chunk header
         net::http::ChunkHeader chdr;
@@ -89,37 +123,58 @@ void SpectranHTTPClient::worker() {
         size_t clen = chdr.getLength();
         if (!clen) { return; }
 
-        // Read JSON
+        // Read JSON. clen is a peer-controlled size_t and recvline() takes an
+        // int: narrowing can turn a length into 0, which recvline() treats as
+        // "no limit", or into a negative. Cap the metadata line explicitly;
+        // the real line is a few hundred bytes.
+        constexpr size_t MAX_METADATA_LINE = 64 * 1024;
+        const int lineCap = (int)std::min(clen, MAX_METADATA_LINE);
         std::string jsonData;
-        int jlen = sock->recvline(jsonData, clen, 5000);
+        int jlen = sock->recvline(jsonData, lineCap, 5000);
         if (jlen <= 0) {
             flog::error("Couldn't read JSON metadata");
             return;
         }
-
-        // Decode JSON (yes, this is hacky, but it must be extremely fast)
-        auto startFreqBegin = jsonData.find("\"startFrequency\":");
-        auto startFreqEnd = jsonData.find(',', startFreqBegin);
-        std::string startFreqStr = jsonData.substr(startFreqBegin + 17, startFreqEnd - startFreqBegin - 17);
-        int64_t startFreq = std::stoll(startFreqStr);
-
-        auto endFreqBegin = jsonData.find("\"endFrequency\":");
-        auto endFreqEnd = jsonData.find(',', endFreqBegin);
-        std::string endFreqStr = jsonData.substr(endFreqBegin + 15, endFreqEnd - endFreqBegin - 15);
-        int64_t endFreq = std::stoll(endFreqStr);
-
-        auto sampleFreqBegin = jsonData.find("\"sampleFrequency\":");
-        bool sampleFreqReceived = (sampleFreqBegin != -1);
-        int64_t sampleFreq;
-        if (sampleFreqReceived) {
-            auto sampleFreqEnd = jsonData.find(',', sampleFreqBegin);
-            std::string sampleFreqStr = jsonData.substr(sampleFreqBegin + 18, sampleFreqEnd - sampleFreqBegin - 18);
-            sampleFreq = std::stoll(sampleFreqStr);
+        // recvline() counts the '\n' but does not store it: a full read with
+        // nothing dropped means the line was cut off at the cap.
+        if (jlen == lineCap && (int)jsonData.size() == jlen) {
+            flog::error("JSON metadata line too long or unterminated");
+            return;
         }
-        
-        // Calculate and update center freq
+
+        // Decode JSON (yes, this is hacky, but it must be extremely fast).
+        // Every field is peer data: a missing or malformed one rejects the
+        // chunk instead of throwing out of this thread.
+        int64_t startFreq = 0;
+        int64_t endFreq = 0;
+        int64_t sampleFreq = 0;
+        if (!parseIntField(jsonData, "\"startFrequency\":", startFreq) ||
+            !parseIntField(jsonData, "\"endFrequency\":", endFreq)) {
+            flog::error("Malformed JSON metadata");
+            return;
+        }
+        const bool sampleFreqReceived = parseIntField(jsonData, "\"sampleFrequency\":", sampleFreq);
+
+        // Validate the protocol ranges before any arithmetic. Bounding both
+        // edges to [0, MAX_FREQ] makes the span and the midpoint below exact
+        // int64_t operations; the center must also be non-negative, since it
+        // is published as a uint64_t. The samplerate configures the DSP
+        // chain, so an enormous one is rejected as well.
+        constexpr int64_t MAX_FREQ = 1'000'000'000'000;    // 1 THz
+        constexpr int64_t MAX_SAMPLERATE = 1'000'000'000;  // 1 GS/s
+        if (startFreq < 0 || endFreq > MAX_FREQ || startFreq > endFreq) {
+            flog::error("Invalid frequency range in metadata: [{}, {}]", startFreq, endFreq);
+            return;
+        }
         int64_t samplerate = sampleFreqReceived ? sampleFreq : (endFreq - startFreq);
-        int64_t centerFreq = round(((double)endFreq + (double)startFreq) / 2.0);
+        if (samplerate <= 0 || samplerate > MAX_SAMPLERATE) {
+            flog::error("Invalid samplerate in metadata: {}", samplerate);
+            return;
+        }
+
+        // Calculate and update center freq
+        // Rounds half up, like round() on the exact midpoint.
+        int64_t centerFreq = startFreq + (endFreq - startFreq + 1) / 2;
         if (centerFreq != _centerFreq) {
             flog::debug("New center freq: {}", centerFreq);
             _centerFreq = centerFreq;
@@ -139,23 +194,38 @@ void SpectranHTTPClient::worker() {
             return;
         }
 
-        // Read data
-        uint8_t* buf = (uint8_t*)stream->writeBuf;
-        int sampLen = 0;
-        for (int i = jlen + 1; i < clen;) {
-            int read = sock->recv(&buf[sampLen], clen - i, true);
-            if (read <= 0) {
-                flog::error("Recv failed while reading data");
-                return;
-            }
-            i += read;
-            sampLen += read;
+        // The chunk length comes from the server. What follows the JSON line
+        // and the record separator is sample data of that remaining length,
+        // so it is validated before anything is read into writeBuf.
+        if (clen < (size_t)jlen + 1) {
+            flog::error("Chunk shorter than its metadata");
+            return;
         }
-        int sampCount = sampLen / 8;
+        size_t remaining = clen - ((size_t)jlen + 1);
 
-        // Swap to stream
-        if (streamingEnabled) {
-            if (!stream->swap(sampCount)) { return; }
+        // Read it in pieces of at most one stream buffer, publishing each.
+        // capBytes is a whole number of complex samples, so only the final
+        // piece can end in a partial sample, which is dropped as before.
+        // writeBuf changes on every swap, so it is re-read per piece.
+        const size_t capBytes = (size_t)stream->capacity() * sizeof(dsp::complex_t);
+        while (remaining > 0) {
+            const size_t want = std::min(remaining, capBytes);
+            uint8_t* buf = (uint8_t*)stream->writeBuf;
+            size_t got = 0;
+            while (got < want) {
+                int read = sock->recv(&buf[got], want - got, true);
+                if (read <= 0) {
+                    flog::error("Recv failed while reading data");
+                    return;
+                }
+                got += (size_t)read;
+            }
+            remaining -= want;
+
+            const int sampCount = (int)(got / sizeof(dsp::complex_t));
+            if (streamingEnabled && sampCount > 0) {
+                if (!stream->swap(sampCount)) { return; }
+            }
         }
         
         // Read trailing CRLF

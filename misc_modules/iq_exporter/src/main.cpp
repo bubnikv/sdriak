@@ -8,7 +8,6 @@
 #include <dsp/sink/handler_sink.h>
 #include <volk/volk.h>
 #include <signal_path/signal_path.h>
-#include <dsp/buffer/reshaper.h>
 #include <gui/dialogs/dialog_box.h>
 #include <core.h>
 
@@ -21,6 +20,10 @@ SDRPP_MOD_INFO{
 };
 
 ConfigManager config;
+
+// Largest selectable packet, in bytes. Packet sizes are powers of two from 8,
+// so every one is a whole number of samples of every sample type.
+#define MAX_PACKET_SIZE 32768
 
 enum Mode {
     MODE_NONE = -1,
@@ -76,7 +79,7 @@ public:
         sampleTypes.define("Float32", SAMPLE_TYPE_FLOAT32);
 
         // Define packet sizes
-        for (int i = 8; i <= 32768; i <<= 1) {
+        for (int i = 8; i <= MAX_PACKET_SIZE; i <<= 1) {
             char buf[16];
             sprintf(buf, "%d Bytes", i);
             packetSizes.define(i, buf, i);
@@ -111,12 +114,11 @@ public:
         sampTypeId = sampleTypes.valueId(sampType);
         packetSizeId = packetSizes.valueId(packetSize);
 
-        // Allocate buffer
-        buffer = dsp::buffer::alloc<uint8_t>(STREAM_BUFFER_SIZE * sizeof(dsp::complex_t));
+        // Packet assembly buffer: one packet, whatever the input block size.
+        buffer = dsp::buffer::alloc<uint8_t>(MAX_PACKET_SIZE);
 
-        // Init DSP
-        reshape.init(&iqStream, packetSize/sampleSize(), 0);
-        handler.init(&reshape.out, dataHandler, this);
+        // Init DSP. The handler cuts packets itself (see dataHandler()).
+        handler.init(&iqStream, dataHandler, this);
 
         // Set operating mode
         setMode(nMode);
@@ -308,7 +310,6 @@ private:
         ImGui::FillWidth();
         if (ImGui::Combo(("##iq_exporter_samp_" + _this->name).c_str(), &_this->sampTypeId, _this->sampleTypes.txt)) {
             _this->sampType = _this->sampleTypes.value(_this->sampTypeId);
-            _this->reshape.setKeep(_this->packetSize/_this->sampleSize());
             config.edit().section(_this->name).set("sampleType", _this->sampleTypes.key(_this->sampTypeId));
         }
 
@@ -317,7 +318,6 @@ private:
         ImGui::FillWidth();
         if (ImGui::Combo(("##iq_exporter_pkt_sz_" + _this->name).c_str(), &_this->packetSizeId, _this->packetSizes.txt)) {
             _this->packetSize = _this->packetSizes.value(_this->packetSizeId);
-            _this->reshape.setKeep(_this->packetSize/_this->sampleSize());
             config.edit().section(_this->name).set("packetSize", _this->packetSizes.key(_this->packetSizeId));
         }
 
@@ -382,7 +382,6 @@ private:
         if (!forceSet && mode == newMode) { return; }
 
         // Stop the DSP
-        reshape.stop();
         handler.stop();
 
         // Delete VFO or unbind IQ stream
@@ -404,7 +403,7 @@ private:
             vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, samplerate, samplerate, samplerate, samplerate, true);
 
             // Set its output as the input to the DSP
-            reshape.setInput(vfo->output);
+            handler.setInput(vfo->output);
         }
         else {
             // Bind IQ stream
@@ -412,11 +411,10 @@ private:
             streamBound = true;
 
             // Set its output as the input to the DSP
-            reshape.setInput(&iqStream);
+            handler.setInput(&iqStream);
         }
 
         // Start DSP
-        reshape.start();
         handler.start();
 
         // Update mode
@@ -453,44 +451,65 @@ private:
         }
     }
 
+    // Runs on the handler's thread, straight off the input stream. Converts
+    // into `buffer` and sends it each time it holds exactly packetSize bytes,
+    // so packets are cut in bytes, where they are defined, whatever block
+    // size the input delivers. The conversion is the only copy.
+    //
+    // packetSize and sampType are only read with sockMtx held and a socket
+    // open. The menu cannot change them while running, and start() takes
+    // sockMtx after any change, which orders the two threads.
     static void dataHandler(dsp::complex_t* data, int count, void* ctx) {
         IQExporterModule* _this = (IQExporterModule*)ctx;
 
-        // Try to cquire lock on socket
-        if (!_this->sockMtx.try_lock()) { return; }
+        // Try to acquire lock on socket
+        if (!_this->sockMtx.try_lock()) { _this->pktFill = 0; return; }
 
-        // If not valid or open, give uo
+        // If not valid or open, give up
         if (!_this->sock || !_this->sock->isOpen()) {
-            // Unlock socket mutex
-            _this->sockMtx.unlock();
-            return;
-        }
-        
-        // Convert the samples or send directory for float32
-        int size;
-        switch (_this->sampType) {
-        case SAMPLE_TYPE_INT8:
-            volk_32f_s32f_convert_8i((int8_t*)_this->buffer, (float*)data, 128.0f, count*2);
-            size = sizeof(int8_t)*2;
-            break;
-        case SAMPLE_TYPE_INT16:
-            volk_32f_s32f_convert_16i((int16_t*)_this->buffer, (float*)data, 32768.0f, count*2);
-            size = sizeof(int16_t)*2;
-            break;
-        case SAMPLE_TYPE_INT32:
-            volk_32f_s32f_convert_32i((int32_t*)_this->buffer, (float*)data, 2147483647.0f, count*2);
-            size = sizeof(int32_t)*2;
-            break;
-        case SAMPLE_TYPE_FLOAT32:
-            _this->sock->send((uint8_t*)data, count*sizeof(dsp::complex_t));
-        default:
-            // Unlock socket mutex
+            _this->pktFill = 0;
             _this->sockMtx.unlock();
             return;
         }
 
-        // Send converted samples
-        _this->sock->send(_this->buffer, count*size);
+        // Start a fresh packet on a new client or new settings, so a packet
+        // never mixes sample formats or straddles two connections.
+        if (_this->sock.get() != _this->pktSock || _this->packetSize != _this->pktSize || _this->sampType != _this->pktType) {
+            _this->pktSock = _this->sock.get();
+            _this->pktSize = _this->packetSize;
+            _this->pktType = _this->sampType;
+            _this->pktFill = 0;
+        }
+
+        const int sampSize = _this->sampleSize();
+        const int pktSamples = _this->pktSize / sampSize;
+        while (count > 0) {
+            int n = std::min<int>(count, pktSamples - _this->pktFill);
+            uint8_t* dst = &_this->buffer[_this->pktFill * sampSize];
+            switch (_this->pktType) {
+            case SAMPLE_TYPE_INT8:
+                volk_32f_s32f_convert_8i((int8_t*)dst, (float*)data, 128.0f, n*2);
+                break;
+            case SAMPLE_TYPE_INT16:
+                volk_32f_s32f_convert_16i((int16_t*)dst, (float*)data, 32768.0f, n*2);
+                break;
+            case SAMPLE_TYPE_INT32:
+                volk_32f_s32f_convert_32i((int32_t*)dst, (float*)data, 2147483647.0f, n*2);
+                break;
+            case SAMPLE_TYPE_FLOAT32:
+                memcpy(dst, data, n * sizeof(dsp::complex_t));
+                break;
+            }
+            data += n;
+            count -= n;
+            _this->pktFill += n;
+
+            // Send a complete packet
+            if (_this->pktFill == pktSamples) {
+                _this->sock->send(_this->buffer, _this->pktSize);
+                _this->pktFill = 0;
+            }
+        }
 
         // Unlock socket mutex
         _this->sockMtx.unlock();
@@ -526,9 +545,15 @@ private:
     VFOManager::VFO* vfo = NULL;
     bool streamBound = false;
     dsp::stream<dsp::complex_t> iqStream;
-    dsp::buffer::Reshaper<dsp::complex_t> reshape;
     dsp::sink::Handler<dsp::complex_t> handler;
+
+    // Packet being assembled. Touched only by dataHandler(), on the handler
+    // thread; a dropped block resets it, so a packet never has a gap.
     uint8_t* buffer = NULL;
+    int pktFill = 0;                    // samples already in `buffer`
+    int pktSize = 0;                    // bytes, as of the packet in progress
+    SampleType pktType = SAMPLE_TYPE_INT16;
+    const net::Socket* pktSock = NULL;  // socket the packet is meant for
 
     std::thread listenWorkerThread;
 

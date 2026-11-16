@@ -8,7 +8,6 @@
 #include "flex.h"
 
 class FLEXDecoder : public Decoder {
-    dsp::stream<float> dummy1;
     dsp::stream<uint8_t> dummy2;
 public:
     FLEXDecoder(const std::string& name, VFOManager::VFO* vfo) : diag(0.6, 1600) {
@@ -23,9 +22,9 @@ public:
         // Init DSP
         vfo->setBandwidthLimits(12500, 12500, true);
         vfo->setSampleRate(16000, 12500);
-        reshape.init(&dummy1, 1600.0, (1600 / 30.0) - 1600.0, 1600);
+        // No DSP yet, so nothing feeds the diagnostic display. When there is,
+        // give the demodulator a dsp::buffer::FrameTap as POCSAG has.
         dataHandler.init(&dummy2, _dataHandler, this);
-        diagHandler.init(&reshape.out, _diagHandler, this);
     }
 
     ~FLEXDecoder() {
@@ -53,17 +52,13 @@ public:
     void start() {
         flog::debug("FLEX start");
         // dsp.start();
-        reshape.start();
         dataHandler.start();
-        diagHandler.start();
     }
 
     void stop() {
         flog::debug("FLEX stop");
         // dsp.stop();
-        reshape.stop();
         dataHandler.stop();
-        diagHandler.stop();
     }
 
 private:
@@ -72,19 +67,10 @@ private:
         // _this->decoder.process(data, count);
     }
 
-    static void _diagHandler(float* data, int count, void* ctx) {
-        FLEXDecoder* _this = (FLEXDecoder*)ctx;
-        float* buf = _this->diag.acquireBuffer();
-        memcpy(buf, data, count * sizeof(float));
-        _this->diag.releaseBuffer();
-    }
-
     std::string name;
 
     VFOManager::VFO* vfo;
-    dsp::buffer::Reshaper<float> reshape;
     dsp::sink::Handler<uint8_t> dataHandler;
-    dsp::sink::Handler<float> diagHandler;
 
     flex::Decoder decoder;
 

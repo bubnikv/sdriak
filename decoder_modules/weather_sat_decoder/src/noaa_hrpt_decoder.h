@@ -5,6 +5,7 @@
 #include <dsp/noaa/hrpt.h>
 #include <dsp/noaa/tip.h>
 #include <dsp/sink.h>
+#include <dsp/buffer/frame_tap.h>
 #include <gui/widgets/symbol_diagram.h>
 #include <gui/widgets/line_push_image.h>
 #include <gui/gui.h>
@@ -25,8 +26,10 @@ public:
         split.bindStream(&dataStream);
         split.bindStream(&visStream);
 
-        reshape.init(&visStream, 1024, (NOAA_HRPT_VFO_SR / 30) - 1024);
-        visSink.init(&reshape.out, visHandler, this);
+        // 1024 symbols, 30 times a second, cut by visTap inside visSink's
+        // handler.
+        visTap.init(1024, (int)(NOAA_HRPT_VFO_SR / 30), visTapHandler, this);
+        visSink.init(&visStream, visHandler, this);
 
         deframe.init(&dataStream, 11090 * 10 * 2, (uint8_t*)dsp::noaa::HRPTSyncWord, 60);
         manDec.init(&deframe.out, false);
@@ -80,7 +83,6 @@ public:
         demod.start();
 
         split.start();
-        reshape.start();
         visSink.start();
 
         deframe.start();
@@ -135,7 +137,6 @@ public:
         demod.stop();
 
         split.stop();
-        reshape.stop();
         visSink.stop();
 
         deframe.stop();
@@ -470,9 +471,12 @@ private:
     }
 
     static void visHandler(float* data, int count, void* ctx) {
-        NOAAHRPTDecoder* _this = (NOAAHRPTDecoder*)ctx;
-        memcpy(_this->symDiag.acquireBuffer(), data, 1024 * sizeof(float));
-        _this->symDiag.releaseBuffer();
+        ((NOAAHRPTDecoder*)ctx)->visTap.push(data, count);
+    }
+
+    // tryWrite() drops the frame rather than wait for the GUI.
+    static void visTapHandler(const float* data, int count, void* ctx) {
+        ((NOAAHRPTDecoder*)ctx)->symDiag.tryWrite(data, count);
     }
 
     std::string _name;
@@ -486,7 +490,8 @@ private:
     dsp::stream<float> dataStream;
     dsp::Splitter<float> split;
 
-    dsp::Reshaper<float> reshape;
+    // Declared before visSink so it outlives the sink that feeds it.
+    dsp::buffer::FrameTap<float> visTap;
 
     dsp::ManchesterDeframer deframe;
     dsp::ManchesterDecoder manDec;

@@ -23,6 +23,7 @@ public:
 
 private:
     void worker();
+    void workerLoop();
 
     std::string host;
     int port;

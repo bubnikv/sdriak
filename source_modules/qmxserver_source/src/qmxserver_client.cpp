@@ -255,7 +255,9 @@ namespace qmxserver {
 
                 case ENET_EVENT_TYPE_RECEIVE:
                     if (event.channelID == 0) {
-                        assert(event.packet->dataLength == EXT_BLOCKLEN * 2 * 2);
+                        // The length comes from the peer: check it, don't
+                        // assert it. An assert let a bad packet abort a debug
+                        // build; anything other than one full block is dropped.
                         if (event.packet->dataLength == EXT_BLOCKLEN * 2 * 2) {
                             float gain = 1.0;
                             volk_16i_s32f_convert_32f((float*)this->output->writeBuf, (int16_t*)event.packet->data, 32768.0 * gain, EXT_BLOCKLEN * 2);

@@ -6,11 +6,12 @@ Date: 2026-08-04
 own the manager mutex until the access object is destroyed, so keep them in the
 smallest practical scope and copy values out before calling external code.
 
-## Porting from the old API
+## Porting a module from upstream SDR++
 
-Replace a read-only `transaction()` with `read()` and a transaction that writes
-with `edit()`. Pass an already-open access or section into helpers that belong to
-the same operation.
+Upstream modules bracket `config.conf` with `acquire()` and `release(modified)`.
+`conf` is private here: replace a pair that releases with `false` by `read()`,
+and one that releases with `true` by `edit()`. Pass an already-open access or
+section into helpers that belong to the same operation.
 
 Only one config access may be active on a thread, across all `ConfigManager`
 instances. Nested access compiles, but throws `std::logic_error` at runtime. In

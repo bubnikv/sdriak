@@ -1,4 +1,6 @@
 #include <gui/widgets/symbol_diagram.h>
+#include <algorithm>
+#include <string.h>
 
 namespace ImGui {
     SymbolDiagram::SymbolDiagram(float scale, int count) {
@@ -50,6 +52,12 @@ namespace ImGui {
 
     void SymbolDiagram::releaseBuffer() {
         bufferMtx.unlock();
+    }
+
+    void SymbolDiagram::tryWrite(const float* data, int count) {
+        std::unique_lock<std::mutex> lck(bufferMtx, std::try_to_lock);
+        if (!lck.owns_lock()) { return; }
+        memcpy(buffer, data, std::min<int>(count, sampleCount) * sizeof(float));
     }
 
 }

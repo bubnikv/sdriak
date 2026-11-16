@@ -1,6 +1,6 @@
 #pragma once
 #include <dsp/stream.h>
-#include <dsp/buffer/reshaper.h>
+#include <dsp/buffer/frame_tap.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/sink/handler_sink.h>
 #include <dsp/demod/quadrature.h>
@@ -9,7 +9,6 @@
 #include <dsp/correction/dc_blocker.h>
 #include <dsp/loop/fast_agc.h>
 #include <dsp/digital/binary_slicer.h>
-#include <dsp/routing/doubler.h>
 
 class POCSAGDSP : public dsp::Processor<dsp::complex_t, uint8_t> {
     using base_type = dsp::Processor<dsp::complex_t, uint8_t>;
@@ -36,14 +35,14 @@ public:
         fir.init(dsp::taps::fromArray<float>(10, taps), _maxBlock);
         recov.init(samplerate/baudrate, 1e-4, 1.0, 0.05, 128, 8, _maxBlock);
 
-        // [RATE-SIZED] Both output streams carry recovered symbols, not input
-        // samples. Use the recovery loop's derived worst-case bound rather than
-        // the nominal baud/sample ratio: its frequency and phase-error terms
-        // can legally make it emit faster than one sample per nominal symbol.
-        // Sized before anything is started, so no reader can be holding the
-        // old buffer. see doc/design/buffer-size-requirements.md 2.6
+        // [RATE-SIZED] The output stream and the soft-symbol buffer carry
+        // recovered symbols, not input samples. Use the recovery loop's derived
+        // worst-case bound rather than the nominal baud/sample ratio: its
+        // frequency and phase-error terms can legally make it emit faster than
+        // one sample per nominal symbol. Sized before anything is started, so
+        // no reader can be holding the old buffer. see doc/design/buffer-size-requirements.md 2.6
         _symbolMaxBlock = recov.maxOutputBlock();
-        soft.setBufferSize(_symbolMaxBlock);
+        softBuf.allocate(_symbolMaxBlock);
         base_type::out.setBufferSize(_symbolMaxBlock);
 
         // Init base
@@ -63,29 +62,34 @@ public:
         std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
         dsp::block::TempStop guard(this);
         // Still a stub. Whoever implements it has to move _symbolMaxBlock
-        // with the baud rate -- and resizing `soft` or `out` frees a buffer
-        // their readers may hold, which TempStop above does not stop.
+        // with the baud rate -- and resizing `out` frees a buffer its reader
+        // may hold, which TempStop above does not stop. (softBuf is private,
+        // and softTap's interval would have to follow the baud rate too.)
     }
 
     int run() {
         int count = base_type::_in->read();
         if (count < 0) { return -1; }
 
-        count = process(count, base_type::_in->readBuf, soft.writeBuf, base_type::out.writeBuf);
+        count = process(count, base_type::_in->readBuf, softBuf, base_type::out.writeBuf);
 
         base_type::_in->flush();
+        // Inline and non-blocking, so the diagnostic display cannot hold up
+        // the decoder.
+        softTap.push(softBuf, count);
         if (!base_type::out.swap(count)) { return -1; }
-        if (count) { if (!soft.swap(count)) { return -1; } }
         return count;
     }
 
-    dsp::stream<float> soft;
+    // Soft symbols for the diagnostic display. Initialise it before start().
+    dsp::buffer::FrameTap<float> softTap;
 
 private:
     dsp::demod::Quadrature demod;
     dsp::buffer::Buffer<float> demodOut;   // scratch, in place of demod's old out stream
     dsp::filter::FIR<float, float> fir;
     dsp::clock_recovery::MM<float> recov;
+    dsp::buffer::Buffer<float> softBuf;
 
     double _samplerate;
     int _maxBlock = STREAM_BUFFER_SIZE;

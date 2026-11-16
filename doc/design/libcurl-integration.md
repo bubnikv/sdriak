@@ -1,7 +1,6 @@
 # libcurl integration
 
-Binding rule for plugin authors. Split out of the old `doc/Forks.txt`, where it
-had been appended below an unrelated fork survey.
+Binding rule for plugin authors.
 
 libcurl is the sanctioned HTTPS/WebSocket implementation dependency in core.
 Plugins must not include <curl/curl.h>, add find_package(CURL), or link libcurl

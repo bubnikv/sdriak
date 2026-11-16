@@ -88,6 +88,9 @@ namespace ryfi {
 
         dsp::complex_t* in = base_type::_in->readBuf;
 
+        // Constellation display, inline and non-blocking.
+        tap.push(in, count);
+
         for (int i = 0; i < count; i++) {
             if (recv) {
                 // Copy the symbol to the output and rotate it approprieate

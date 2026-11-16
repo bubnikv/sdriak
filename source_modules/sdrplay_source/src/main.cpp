@@ -484,7 +484,7 @@ private:
 
         // Configure device
         _this->bufferIndex = 0;
-        _this->bufferSize = (float)_this->sampleRate / 200.0f;
+        _this->bufferSize = dsp::sourceBlockSize(_this->sampleRate, _this->stream);
 
         // RSP1A Options
         if (_this->openDev.hwVer == SDRPLAY_RSP1A_ID || _this->openDev.hwVer == SDRPLAY_RSP1B_ID) {

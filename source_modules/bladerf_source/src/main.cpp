@@ -328,7 +328,9 @@ private:
         }
 
         // Calculate buffer size, must be a multiple of 1024
-        _this->bufferSize = _this->sampleRate / 200.0;
+        // Bounded by the stream: the worker converts bufferSize samples into
+        // stream.writeBuf. The rate range is read from the device.
+        _this->bufferSize = dsp::sourceBlockSize(_this->sampleRate, _this->stream);
         _this->bufferSize /= 1024;
         _this->bufferSize *= 1024;
         if (_this->bufferSize < 1024) { _this->bufferSize = 1024; }

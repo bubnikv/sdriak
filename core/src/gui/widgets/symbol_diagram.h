@@ -18,6 +18,11 @@ namespace ImGui {
 
         void releaseBuffer();
 
+        // Copies min(count, sample count) values in if the GUI is not drawing
+        // right now, and drops them otherwise. Never blocks, so a DSP thread
+        // can call it inline (see dsp::buffer::FrameTap).
+        void tryWrite(const float* data, int count);
+
         std::vector<float> lines;
 
     private:

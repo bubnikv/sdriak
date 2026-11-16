@@ -7,7 +7,6 @@
 #include <module.h>
 #include <filesystem>
 #include <dsp/stream.h>
-#include <dsp/buffer/reshaper.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/sink/handler_sink.h>
 #include <gui/widgets/folder_select.h>
@@ -58,14 +57,13 @@ public:
         // Initialize DSP here
         decoder.init(vfo->output, INPUT_SAMPLE_RATE, lsfHandler, this);
         resamp.init(decoder.out, 8000, audioSampRate);
-        reshape.init(decoder.diagOut, 480, 0, 480);
-        diagHandler.init(&reshape.out, _diagHandler, this);
+        // Contiguous 480-symbol frames (10 per second at 4800 baud), fed
+        // inline by the slicer.
+        decoder.diagTap->init(480, 480, _diagHandler, this);
 
         // Start DSO Here
         decoder.start();
         resamp.start();
-        reshape.start();
-        diagHandler.start();
 
         // Setup audio stream
         srChangeHandler.ctx = this;
@@ -85,8 +83,6 @@ public:
         if (enabled) {
             decoder.stop();
             resamp.stop();
-            reshape.stop();
-            diagHandler.stop();
             sigpath::vfoManager.deleteVFO(vfo);
         }
 
@@ -106,8 +102,6 @@ public:
         // Start DSP here
         decoder.start();
         resamp.start();
-        reshape.start();
-        diagHandler.start();
 
         enabled = true;
     }
@@ -116,8 +110,6 @@ public:
         // Stop DSP here
         decoder.stop();
         resamp.stop();
-        reshape.stop();
-        diagHandler.stop();
 
         sigpath::vfoManager.deleteVFO(vfo);
         enabled = false;
@@ -237,11 +229,11 @@ private:
         if (!_this->enabled) { style::endDisabled(); }
     }
 
-    static void _diagHandler(float* data, int count, void* ctx) {
+    // Runs on the slicer's thread; tryWrite() drops the frame rather than
+    // wait for the GUI.
+    static void _diagHandler(const float* data, int count, void* ctx) {
         M17DecoderModule* _this = (M17DecoderModule*)ctx;
-        float* buf = _this->diag.acquireBuffer();
-        memcpy(buf, data, count * sizeof(float));
-        _this->diag.releaseBuffer();
+        _this->diag.tryWrite(data, count);
     }
 
     static void sampleRateChangeHandler(float sampleRate, void* ctx) {
@@ -267,8 +259,6 @@ private:
 
     dsp::M17Decoder decoder;
 
-    dsp::buffer::Reshaper<float> reshape;
-    dsp::sink::Handler<float> diagHandler;
     dsp::multirate::RationalResamplerBlock<dsp::stereo_t> resamp;
 
     ImGui::SymbolDiagram diag;

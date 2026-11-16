@@ -427,11 +427,16 @@ private:
     }
 
     void worker() {
-        int sampCount = sampleRate / 200;
+        // LMS_RecvStream() treats this count as the capacity of writeBuf.
+        int sampCount = dsp::sourceBlockSize(sampleRate, stream);
         lms_stream_meta_t meta;
         while (streamRunning) {
             int ret = LMS_RecvStream(&devStream, stream.writeBuf, sampCount, &meta, 1000);
-            if (!stream.swap(sampCount) || ret < 0) { break; }
+            // Publish only what was received, and check for an error before
+            // publishing anything: a short read or a timeout returns fewer
+            // than sampCount samples.
+            if (ret < 0) { break; }
+            if (ret > 0 && !stream.swap(ret)) { break; }
         }
     }
 

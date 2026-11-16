@@ -17,6 +17,7 @@
 #include <falcon_fec.h>
 #include <falcon_packet.h>
 #include <dsp/sink.h>
+#include <dsp/buffer/frame_tap.h>
 
 #include <gui/widgets/symbol_diagram.h>
 
@@ -43,19 +44,15 @@ public:
 
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, 4000000, INPUT_SAMPLE_RATE, 4000000, 4000000, true);
 
-        // dsp::Splitter<float> split;
-        // dsp::Reshaper<float> reshape;
-        // dsp::HandlerSink<float> symSink;
-        // dsp::stream<float> thrInput;
-        // dsp::Threshold thr;
-
         demod.init(vfo->output, INPUT_SAMPLE_RATE, 2000000.0f);
         recov.init(&demod.out, (float)INPUT_SAMPLE_RATE / 3571400.0f, powf(0.01f, 2) / 4.0f, 0.01, 100e-6f); // 0.00765625f, 0.175f, 0.005f
         split.init(&recov.out);
-        split.bindStream(&reshapeInput);
+        split.bindStream(&symInput);
         split.bindStream(&thrInput);
-        reshape.init(&reshapeInput, 1024, 198976);
-        symSink.init(&reshape.out, symSinkHandler, this);
+        // 1024 of every 200000 symbols, cut by symTap inside symSink's
+        // handler.
+        symTap.init(1024, 1024 + 198976, symTapHandler, this);
+        symSink.init(&symInput, symSinkHandler, this);
         thr.init(&thrInput);
         deframe.init(&thr.out, 10232, syncWord, 32);
         falconRS.init(&deframe.out);
@@ -65,7 +62,6 @@ public:
         demod.start();
         recov.start();
         split.start();
-        reshape.start();
         symSink.start();
         sink.start();
         pkt.start();
@@ -95,7 +91,6 @@ public:
         demod.start();
         recov.start();
         split.start();
-        reshape.start();
         symSink.start();
         sink.start();
         pkt.start();
@@ -110,7 +105,6 @@ public:
         demod.stop();
         recov.stop();
         split.stop();
-        reshape.stop();
         symSink.stop();
         sink.stop();
         pkt.stop();
@@ -202,10 +196,12 @@ private:
     }
 
     static void symSinkHandler(float* data, int count, void* ctx) {
-        Falcon9DecoderModule* _this = (Falcon9DecoderModule*)ctx;
-        float* buf = _this->symDiag.acquireBuffer();
-        memcpy(buf, data, 1024 * sizeof(float));
-        _this->symDiag.releaseBuffer();
+        ((Falcon9DecoderModule*)ctx)->symTap.push(data, count);
+    }
+
+    // tryWrite() drops the frame rather than wait for the GUI.
+    static void symTapHandler(const float* data, int count, void* ctx) {
+        ((Falcon9DecoderModule*)ctx)->symDiag.tryWrite(data, count);
     }
 
     std::string name;
@@ -222,8 +218,9 @@ private:
 
     dsp::Splitter<float> split;
 
-    dsp::stream<float> reshapeInput;
-    dsp::Reshaper<float> reshape;
+    dsp::stream<float> symInput;
+    // Declared before symSink so it outlives the sink that feeds it.
+    dsp::buffer::FrameTap<float> symTap;
     dsp::HandlerSink<float> symSink;
 
     dsp::stream<float> thrInput;

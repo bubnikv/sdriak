@@ -353,8 +353,8 @@ void FrequencySelect::draw() {
             }
         }
     }
-    // Assigned outside the hover-gated block: leaving the window while over a
-    // digit used to leave digitHovered stuck true, blocking the arrow-key
+    // Assigned outside the hover-gated block, so leaving the window while over
+    // a digit cannot leave digitHovered stuck true and block the arrow-key
     // tuning in main_window. Partial wheel notches are also dropped once the
     // cursor is off the digits so they can't discharge into a step later.
     digitHovered = hovered;

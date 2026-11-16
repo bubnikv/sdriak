@@ -221,8 +221,8 @@ namespace freq_input {
         const float sp = ImGui::GetStyle().ItemSpacing.x;
 
         // Page toggle plus the dialog's one dismiss control, in the same place
-        // on every page -- the pages below no longer carry a Cancel of their
-        // own. `page` is the segment index by construction.
+        // on every page -- the pages below carry no Cancel of their own.
+        // `page` is the segment index by construction.
         static const char* pageLabels[] = { "BAND", "SPECTRUM", "Frequency" };
         const float closeW = m.toggleHeight;
         if (doSegmentedControl("##sdrpp_freq_input_page", page, pageLabels, 3,

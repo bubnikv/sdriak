@@ -204,6 +204,12 @@ namespace server {
         // Server-pushed state: the network worker only caches it here; the
         // GUI thread applies it via syncRemoteState().
         std::mutex pushedStateMtx;
+        // Upper bounds on server-pushed rate and user prebuffer duration.
+        // Their product bounds the prebuffer ring (about 1.1 x 64 M complex
+        // samples, ~560 MB, at both limits). 64 MS/s at 8-bit IQ already
+        // saturates a gigabit link.
+        static constexpr double MAX_SERVER_SAMPLERATE = 64e6;
+        static constexpr int MAX_RX_PREBUFFER_MSEC = 1000;
         double currentSampleRate = 1000000.0;
         int rxPrebufferMsec = 100;
         // Remote tuning limits (native domain), last received from the server.

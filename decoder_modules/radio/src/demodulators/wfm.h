@@ -1,5 +1,6 @@
 #pragma once
 #include "../demod.h"
+#include <dsp/sink/handler_sink.h>
 #include <dsp/demod/broadcast_fm.h>
 #include "../rds_demod.h"
 #include <gui/widgets/symbol_diagram.h>
@@ -71,10 +72,9 @@ namespace demod {
             // sizes every buffer and stream in RDSDemod. see doc/design/buffer-size-requirements.md 2.6
             rdsDemod.init(&demod.rdsOut, _rdsInfo, demod.getRDSMaxBlock());
             hs.init(&rdsDemod.out, rdsHandler, this);
-            // keep is fixed and setKeep() is never called here, so the
-            // diagnostic stream is sized for the block it carries.
-            reshape.init(&rdsDemod.soft, 4096, (1187 / 30) - 4096, 4096);
-            diagHandler.init(&reshape.out, _diagHandler, this);
+            // Sliding 4096-symbol window, refreshed every ~39 symbols (30 fps
+            // at 1187.5 baud). Fed inline by rdsDemod, no thread of its own.
+            rdsDemod.softTap.init(4096, 1187 / 30, _diagHandler, this);
 
             // Init RDS display
             diag.lines.push_back(-0.8);
@@ -85,16 +85,12 @@ namespace demod {
             demod.start();
             rdsDemod.start();
             hs.start();
-            reshape.start();
-            diagHandler.start();
         }
 
         void stop() {
             demod.stop();
             rdsDemod.stop();
             hs.stop();
-            reshape.stop();
-            diagHandler.stop();
         }
 
         void showMenu() {
@@ -283,11 +279,11 @@ namespace demod {
             _this->rdsDecode.process(data, count);
         }
 
-        static void _diagHandler(float* data, int count, void* ctx) {
+        // Runs on the RDS demodulator's thread; tryWrite() drops the frame
+        // rather than wait for the GUI.
+        static void _diagHandler(const float* data, int count, void* ctx) {
             WFM* _this = (WFM*)ctx;
-            float* buf = _this->diag.acquireBuffer();
-            memcpy(buf, data, count * sizeof(float));
-            _this->diag.releaseBuffer();
+            _this->diag.tryWrite(data, count);
         }
 
         static void fftRedraw(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
@@ -336,8 +332,6 @@ namespace demod {
         dsp::sink::Handler<uint8_t> hs;
         EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
 
-        dsp::buffer::Reshaper<float> reshape;
-        dsp::sink::Handler<float> diagHandler;
         ImGui::SymbolDiagram diag;
 
         rds::Decoder rdsDecode;

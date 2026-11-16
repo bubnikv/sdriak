@@ -26,9 +26,9 @@ public:
         vfo->setBandwidthLimits(12500, 12500, true);
         vfo->setSampleRate(SAMPLERATE, 12500);
         dsp.init(vfo->output, SAMPLERATE, BAUDRATE);
-        reshape.init(&dsp.soft, BAUDRATE, (BAUDRATE / 30.0) - BAUDRATE, BAUDRATE);
+        // Sliding one-second window, refreshed at 30 fps.
+        dsp.softTap.init(BAUDRATE, BAUDRATE / 30, _diagHandler, this);
         dataHandler.init(&dsp.out, _dataHandler, this);
-        diagHandler.init(&reshape.out, _diagHandler, this);
 
         // Init decoder
         decoder.onMessage.bind(&POCSAGDecoder::messageHandler, this);
@@ -58,16 +58,12 @@ public:
 
     void start() {
         dsp.start();
-        reshape.start();
         dataHandler.start();
-        diagHandler.start();
     }
 
     void stop() {
         dsp.stop();
-        reshape.stop();
         dataHandler.stop();
-        diagHandler.stop();
     }
 
 private:
@@ -76,11 +72,11 @@ private:
         _this->decoder.process(data, count);
     }
 
-    static void _diagHandler(float* data, int count, void* ctx) {
+    // Runs on the DSP thread; tryWrite() drops the frame rather than wait
+    // for the GUI.
+    static void _diagHandler(const float* data, int count, void* ctx) {
         POCSAGDecoder* _this = (POCSAGDecoder*)ctx;
-        float* buf = _this->diag.acquireBuffer();
-        memcpy(buf, data, count * sizeof(float));
-        _this->diag.releaseBuffer();
+        _this->diag.tryWrite(data, count);
     }
 
     void messageHandler(pocsag::Address addr, pocsag::MessageType type, const std::string& msg) {
@@ -91,9 +87,7 @@ private:
     VFOManager::VFO* vfo;
 
     POCSAGDSP dsp;
-    dsp::buffer::Reshaper<float> reshape;
     dsp::sink::Handler<uint8_t> dataHandler;
-    dsp::sink::Handler<float> diagHandler;
 
     pocsag::Decoder decoder;
 

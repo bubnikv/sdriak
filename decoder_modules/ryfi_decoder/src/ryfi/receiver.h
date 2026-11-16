@@ -1,7 +1,6 @@
 #pragma once
 #include "utils/new_event.h"
 #include "dsp/demod/psk.h"
-#include "dsp/routing/doubler.h"
 #include "packet.h"
 #include "frame.h"
 #include "rs_codec.h"
@@ -49,7 +48,9 @@ namespace ryfi {
         */
         void stop();
         
-        dsp::stream<dsp::complex_t>* softOut;
+        // Received symbols for the constellation display. Initialise it
+        // before start(); it is fed by the deframer, on its thread.
+        dsp::buffer::FrameTap<dsp::complex_t>* softTap;
 
         NewEvent<Packet> onPacket;
 
@@ -58,7 +59,6 @@ namespace ryfi {
 
         // DSP
         dsp::demod::PSK<4> demod;
-        dsp::routing::Doubler<dsp::complex_t> doubler;
         Deframer deframer;
         ConvDecoder conv;
         RSDecoder rs;

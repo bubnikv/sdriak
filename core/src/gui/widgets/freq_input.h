@@ -21,8 +21,8 @@ namespace bandplan {
 namespace freq_input {
 
     // The tuning situation a page works against: where the radio is now, and
-    // what the source will accept. This is the (limitFreq, minFreq, maxFreq)
-    // argument tail that every keypad helper used to thread through by hand.
+    // what the source will accept, passed to every keypad helper as one
+    // argument.
     struct Context {
         uint64_t frequency = 0; // current display frequency, Hz
         bool limited = false;   // the source imposes a tuning range
@@ -60,14 +60,14 @@ namespace freq_input {
 
     // The dialog's layout budget, recomputed each frame by Dialog. Every page
     // is sized from it, so the popup keeps one width across pages and the dp()
-    // constants exist in exactly one place -- the page toggle and the band grid
-    // used to re-derive them from the keypad's own, free to drift silently.
+    // constants exist in exactly one place; the page toggle and the band grid
+    // read them from here rather than re-deriving them.
     //
     // Everything here is a function of the viewport and the style, never of the
     // content. A width that depended on what the grid holds would resize the
     // dialog as the user switches category; a height that depended on how much
     // the keypad has to say would move the keys out from under a finger
-    // mid-entry. Both used to happen.
+    // mid-entry.
     struct Metrics {
         // Keypad block.
         ImVec2 keySize;             // one digit key

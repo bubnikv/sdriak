@@ -7,8 +7,7 @@
 #include <module.h>
 #include <filesystem>
 #include "meteor_demod.h"
-#include <dsp/routing/splitter.h>
-#include <dsp/buffer/reshaper.h>
+#include <dsp/buffer/frame_tap.h>
 #include <dsp/sink/handler_sink.h>
 #include <meteor_demodulator_interface.h>
 #include <gui/widgets/folder_select.h>
@@ -58,17 +57,12 @@ public:
 
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, INPUT_SAMPLE_RATE, INPUT_SAMPLE_RATE, INPUT_SAMPLE_RATE, INPUT_SAMPLE_RATE, true);
         demod.init(vfo->output, 72000.0f, INPUT_SAMPLE_RATE, 33, 0.6f, 0.1f, 0.005f, brokenModulation, oqpsk, 1e-6, 0.01);
-        split.init(&demod.out);
-        split.bindStream(&symSinkStream);
-        split.bindStream(&sinkStream);
-        reshape.init(&symSinkStream, 1024, (72000 / 30) - 1024, 1024);
-        symSink.init(&reshape.out, symSinkHandler, this);
-        sink.init(&sinkStream, sinkHandler, this);
+        // One sink reads the symbols: it feeds the constellation tap inline
+        // (1024 symbols, 30 times a second) and writes the recording.
+        symTap.init(1024, 72000 / 30, symTapHandler, this);
+        sink.init(&demod.out, sinkHandler, this);
 
         demod.start();
-        split.start();
-        reshape.start();
-        symSink.start();
         sink.start();
 
         gui::menu.registerEntry(name, menuHandler, this, this);
@@ -82,9 +76,6 @@ public:
             recFile.close();
         }
         demod.stop();
-        split.stop();
-        reshape.stop();
-        symSink.stop();
         sink.stop();
         sigpath::vfoManager.deleteVFO(vfo);
         gui::menu.removeEntry(name);
@@ -100,9 +91,6 @@ public:
         demod.setInput(vfo->output);
 
         demod.start();
-        split.start();
-        reshape.start();
-        symSink.start();
         sink.start();
 
         enabled = true;
@@ -110,9 +98,6 @@ public:
 
     void disable() {
         demod.stop();
-        split.stop();
-        reshape.stop();
-        symSink.stop();
         sink.stop();
 
         sigpath::vfoManager.deleteVFO(vfo);
@@ -170,16 +155,17 @@ private:
         if (!_this->enabled) { style::endDisabled(); }
     }
 
-    static void symSinkHandler(dsp::complex_t* data, int count, void* ctx) {
+    // Runs on the sink's thread; tryWrite() drops the frame rather than wait
+    // for the GUI.
+    static void symTapHandler(const dsp::complex_t* data, int count, void* ctx) {
         MeteorDemodulatorModule* _this = (MeteorDemodulatorModule*)ctx;
-
-        dsp::complex_t* buf = _this->constDiagram.acquireBuffer();
-        memcpy(buf, data, 1024 * sizeof(dsp::complex_t));
-        _this->constDiagram.releaseBuffer();
+        _this->constDiagram.tryWrite(data, count);
     }
 
     static void sinkHandler(dsp::complex_t* data, int count, void* ctx) {
         MeteorDemodulatorModule* _this = (MeteorDemodulatorModule*)ctx;
+        _this->symTap.push(data, count);
+
         std::lock_guard<std::mutex> lck(_this->recMtx);
         if (!_this->recording) { return; }
         for (int i = 0; i < count; i++) {
@@ -227,12 +213,7 @@ private:
     // DSP Chain
     VFOManager::VFO* vfo;
     dsp::demod::Meteor demod;
-    dsp::routing::Splitter<dsp::complex_t> split;
-
-    dsp::stream<dsp::complex_t> symSinkStream;
-    dsp::stream<dsp::complex_t> sinkStream;
-    dsp::buffer::Reshaper<dsp::complex_t> reshape;
-    dsp::sink::Handler<dsp::complex_t> symSink;
+    dsp::buffer::FrameTap<dsp::complex_t> symTap;
     dsp::sink::Handler<dsp::complex_t> sink;
 
     ImGui::ConstellationDiagram constDiagram;

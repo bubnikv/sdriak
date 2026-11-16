@@ -5,11 +5,10 @@
 namespace dsp::convert {
     // Computation kernel, not a dsp::block. See dsp::math::Delay for why.
     //
-    // This used to keep a zero-filled scratch buffer of maxBlock floats and
-    // hand it to volk_32f_x2_interleave_32fc() as the imaginary part -- 4 MB of
-    // zeros per instance at the default block size, read in full on every call.
-    // Writing the zeros directly costs one store per sample instead of a load
-    // and a store, and removes the allocation entirely.
+    // The imaginary part is written as zeros directly, one store per sample.
+    // Interleaving against a zero-filled buffer instead would cost a
+    // maxBlock-float allocation (4 MB at the default block size) and a load
+    // per sample.
     class RealToComplex {
     public:
         RealToComplex() {}

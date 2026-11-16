@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <imgui.h>
 #include <module.h>
 #include <gui/gui.h>
@@ -293,7 +294,10 @@ private:
         }
 
         // Compute buffer size (Lower than usual, but it's a workaround for their API having broken streaming)
-        _this->bufferSize = _this->sampleRate / 400.0;
+        // fobos_rx_read_sync() fills one buffer of this length into either
+        // ddcIn or, when the DDC is bypassed, ddc.out: bound it by both.
+        _this->bufferSize = (std::min)(dsp::sourceBlockSize(_this->sampleRate, _this->ddcIn, 400),
+                                       _this->ddc.out.capacity());
 
         // Start streaming
         err = fobos_rx_start_sync(_this->openDev, _this->bufferSize);

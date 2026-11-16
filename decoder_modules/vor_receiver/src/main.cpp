@@ -6,7 +6,6 @@
 #include <signal_path/signal_path.h>
 #include <module.h>
 #include <filesystem>
-#include <dsp/buffer/reshaper.h>
 #include <dsp/sink/handler_sink.h>
 #include <gui/widgets/constellation_diagram.h>
 #include "vor_decoder.h"

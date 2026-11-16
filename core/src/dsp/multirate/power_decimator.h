@@ -32,6 +32,13 @@ namespace dsp::multirate {
             return 1 << decim::plans_len;
         }
 
+        // Ratio 1 has no stages and allocates nothing; RationalResampler uses
+        // setRatio(1) to release a decimator its current plan does not use.
+        int getStageCount() const {
+            assert(_init);
+            return stageCount;
+        }
+
         // Final count returned by process() for the configured input bound.
         int maxOutputBlock() const {
             assert(_init);
@@ -143,10 +150,9 @@ namespace dsp::multirate {
                 newStageCount = plan.stageCount;
                 newFirs.reserve(newStageCount);
                 // Only the first stage sees a full block. Each one emits at
-                // most ceil(in / decimation), so sizing them all for _maxBlock
-                // -- which is what this used to do -- pays for the whole chain
-                // at the input rate. For plan_32 ({8, 2, 2}) that is three
-                // 8.5 MB working buffers where 8.5 + 1.5 + 1.0 will do.
+                // most ceil(in / decimation), so each later stage is sized for
+                // its predecessor's output: for plan_32 ({8, 2, 2}) on complex
+                // samples, delay lines of 8 + 1 + 0.5 MB rather than 3 x 8.
                 // [RATE-SIZED] Exact: the decimations come from the plan, so
                 // stage i sees at most ceil(prev / decimation). Wrong only if
                 // DecimatingFIR ever emits more than that. see doc/design/buffer-size-requirements.md 2.6

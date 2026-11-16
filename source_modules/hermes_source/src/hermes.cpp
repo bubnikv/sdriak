@@ -40,7 +40,7 @@ namespace hermes {
 
     void Client::setSamplerate(HermesLiteSamplerate samplerate) {
         writeReg(0, (uint32_t)samplerate << 24);
-        blockSize = SAMPLERATE_LIST[samplerate] / 200;
+        blockSize = dsp::sourceBlockSize(SAMPLERATE_LIST[samplerate], out);
     }
 
     void Client::setFrequency(double freq) {
@@ -172,6 +172,10 @@ namespace hermes {
             int len = sock->recv(rbuf, 2048);
             if (len <= 0) { break; }
 
+            // Ignore anything shorter than a full USB packet: its frames would
+            // be decoded from whatever an earlier packet left in rbuf.
+            if (len < (int)sizeof(MetisUSBPacket)) { continue; }
+
             // Ignore anything that's not a USB packet
             // TODO: Gotta check the endpoint
             if (htons(pkt->hdr.signature) != HERMES_METIS_SIGNATURE || pkt->hdr.type != METIS_PKT_USB) {
@@ -192,6 +196,13 @@ namespace hermes {
                 if (hdr->c0 & (1 << 7)) {
                     uint8_t reg = (hdr->c0 >> 1) & 0x3F;
                     flog::warn("Got response! Reg={0}, Seq={1}", reg, (uint32_t)htonl(pkt->seq));
+                }
+
+                // Frames accumulate in writeBuf until blockSize is reached;
+                // publish what is there first if this frame would not fit.
+                if (sampleCount > 0 && sampleCount + HERMES_SAMPLES_PER_FRAME > out.capacity()) {
+                    out.swap(sampleCount);
+                    sampleCount = 0;
                 }
 
                 // Decode and save IQ to buffer

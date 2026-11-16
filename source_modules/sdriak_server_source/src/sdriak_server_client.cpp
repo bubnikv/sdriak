@@ -12,7 +12,10 @@ using namespace std::chrono_literals;
 
 namespace {
     constexpr int SAMPLE_STREAM_HEADER_SIZE = 8;
-    constexpr int DECOMP_INPUT_BUFFER_SIZE = STREAM_BUFFER_SIZE * sizeof(dsp::complex_t) + SAMPLE_STREAM_HEADER_SIZE;
+    // Sized by the wire limit, not the local STREAM_BUFFER_SIZE, so a desktop
+    // server's full-size blocks are accepted by a 32-bit Android client. The
+    // decompressor splits each one to its output stream's capacity.
+    constexpr int DECOMP_INPUT_BUFFER_SIZE = SERVER_PROTOCOL_MAX_BLOCK * sizeof(dsp::complex_t) + SAMPLE_STREAM_HEADER_SIZE;
     // Dead-link watchdog for heartbeat-capable servers, which send traffic at
     // least every 5 s. Mirrors the server's own HEARTBEAT_TIMEOUT.
     constexpr int LINK_TIMEOUT_MS = 15000;
@@ -241,7 +244,7 @@ namespace server {
 
     void Client::setRxPrebufferMsec(int msec) {
         std::lock_guard lck(pushedStateMtx);
-        rxPrebufferMsec = std::max(0, msec);
+        rxPrebufferMsec = std::clamp(msec, 0, MAX_RX_PREBUFFER_MSEC);
         applyRxPrebufferModeLocked(true);
     }
 
@@ -334,12 +337,23 @@ namespace server {
                     // memcpy: r_cmd_data is not 8-byte aligned (header offsets).
                     double samplerate;
                     memcpy(&samplerate, r_cmd_data, sizeof(double));
-                    {
-                        std::lock_guard lck(pushedStateMtx);
-                        currentSampleRate = samplerate;
-                        chain.setSampleRate(samplerate);
+                    // Don't trust the server: the prebuffer sizes its ring
+                    // from samplerate x prebuffer duration, so NaN, infinity
+                    // or an enormous rate would become an undefined
+                    // float-to-size_t conversion or a huge allocation that
+                    // throws out of this thread. With the duration capped at
+                    // MAX_RX_PREBUFFER_MSEC, bounding the rate bounds the ring.
+                    if (!std::isfinite(samplerate) || samplerate <= 0.0 || samplerate > MAX_SERVER_SAMPLERATE) {
+                        flog::error("Ignoring invalid samplerate from server: {0}", samplerate);
                     }
-                    samplerateDirty = true;
+                    else {
+                        {
+                            std::lock_guard lck(pushedStateMtx);
+                            currentSampleRate = samplerate;
+                            chain.setSampleRate(samplerate);
+                        }
+                        samplerateDirty = true;
+                    }
                 }
                 else if (r_cmd_hdr->cmd == COMMAND_SET_TUNING_LIMITS && r_pkt_hdr->size == sizeof(PacketHeader) + sizeof(CommandHeader) + 1 + 2 * sizeof(double)) {
                     bool enabled = r_cmd_data[0];

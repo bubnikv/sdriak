@@ -1,5 +1,5 @@
 #include "vor_receiver.h"
-#include <dsp/buffer/reshaper.h>
+#include <dsp/buffer/frame_tap.h>
 #include <dsp/sink/handler_sink.h>
 #include <utils/new_event.h>
 
@@ -40,10 +40,13 @@ namespace vor {
 
     private:
         static void dataHandler(float* data, int count, void* ctx);
+        static void windowHandler(const float* data, int count, void* ctx);
 
-        // DSP
+        // DSP. symSink cuts rx's output into contiguous integration windows
+        // with `window`, on its own thread.
+        // `window` is declared first so it outlives the sink that feeds it.
         Receiver rx;
-        dsp::buffer::Reshaper<float> reshape;
+        dsp::buffer::FrameTap<float> window;
         dsp::sink::Handler<float> symSink;
     };
 }

@@ -17,9 +17,8 @@ namespace ryfi {
     void Receiver::init(dsp::stream<dsp::complex_t>* in, double baudrate, double samplerate) {
         // Initialize the DSP
         demod.init(in, baudrate, samplerate, 31, 0.6, 0.1f, 0.005f, 1e-6, 0.01);
-        doubler.init(&demod.out);
-        softOut = &doubler.outA;
-        deframer.setInput(&doubler.outB);
+        softTap = &deframer.tap;
+        deframer.setInput(&demod.out);
         conv.setInput(&deframer.out);
         rs.setInput(&conv.out);
     }
@@ -37,7 +36,6 @@ namespace ryfi {
 
         // Start the DSP
         demod.start();
-        doubler.start();
         deframer.start();
         conv.start();
         rs.start();
@@ -57,7 +55,6 @@ namespace ryfi {
 
         // Stop the DSP
         demod.stop();
-        doubler.stop();
         deframer.stop();
         conv.stop();
         rs.stop();

@@ -70,8 +70,26 @@ namespace dsp::multirate {
             offset = 0;
         }
 
+        // Initialised but empty: no phase bank and no delay line. Used by
+        // RationalResampler for configurations that skip the polyphase stage,
+        // so that it does not hold a delay line sized for the full input
+        // block. reset() stays safe; only setRatio() makes process() valid
+        // again. Callable on a default-constructed object. No-throw.
+        void release() noexcept {
+            phases.release();
+            hist.release();
+            _interp = 1;
+            _decim = 1;
+            phase = 0;
+            offset = 0;
+            _init = true;
+        }
+
+        bool isEmpty() const { return phases.phaseCount() == 0; }
+
         // IN-PLACE: safe (in == out).
         inline int process(int count, const T* in, T* out) {
+            assert(!isEmpty());
             int outCount = 0;
 
             const T* window = hist.push(in, count);
@@ -107,8 +125,8 @@ namespace dsp::multirate {
 
     protected:
         bool _init = false;
-        int _interp;
-        int _decim;
+        int _interp = 1;
+        int _decim = 1;
         PolyphaseBank<float> phases;
         int phase = 0;
         int offset = 0;

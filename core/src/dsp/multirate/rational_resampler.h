@@ -32,9 +32,12 @@ namespace dsp::multirate {
             _outSamplerate = outSamplerate;
             _maxBlock = maxBlock;
             
-            // Dummy initialization since only used for processing
-            decim.init(2, _maxBlock);
-            resamp.init(1, 1, taps::lowPass(0.25, 0.1, 1.0), _maxBlock);
+            // Start both stages empty; reconfigure() builds only what the
+            // selected plan uses, so a skipped stage never holds a full-block
+            // delay line (8 MB for complex at the default bound).
+            // see doc/design/buffer-size-requirements.md 2.2
+            decim.init(1, _maxBlock);   // ratio 1: no stages, nothing allocated
+            resamp.release();
 
             // Proper configuration
             reconfigure();
@@ -284,6 +287,9 @@ namespace dsp::multirate {
             if (!plan.validRates) {
                 flog::warn("Resampler configured with a non-positive rate ({0} -> {1}), passing through",
                            _inSamplerate, _outSamplerate);
+                // Passthrough uses neither stage. Both calls are no-throw.
+                decim.setRatio(1);
+                resamp.release();
                 mode = Mode::NONE;
                 _maxOutputBlock = plan.outputMax;
                 _maxOutputBuffer = plan.bufferMax;
@@ -303,6 +309,15 @@ namespace dsp::multirate {
             _maxOutputBlock = 0;
             _maxOutputBuffer = 0;
 
+            // Release whatever the new plan does not use, before allocating
+            // what it does. Under DROP nothing reads either stage, and a stage
+            // the new plan skips cannot help a rollback, so this loses nothing
+            // and lowers the reconfiguration peak. Both calls are no-throw. A
+            // WFM -> NFM switch of the radio's AF resampler, for example,
+            // releases the 12 MB plan_4 decimator NFM does not run.
+            if (!plan.useDecim) { decim.setRatio(1); }
+            if (!plan.useResamp) { resamp.release(); }
+
             if (plan.useDecim) {
                 decim.setRatio(plan.predecRatio);
             }
@@ -311,7 +326,7 @@ namespace dsp::multirate {
             //
             // The ratio is derived exactly, as _outSamplerate * predecRatio over
             // _inSamplerate. Rounding intSamplerate to an integer first and taking
-            // the gcd of that -- which is what this used to do -- is a trap: the
+            // the gcd of that would be a trap: the
             // predecimated rate is usually fractional (2.5 MS/s / 64 = 39062.5),
             // and rounding destroys the common factor. gcd(39063, 24000) is 3
             // rather than 125, which turns interp into 8000 where 384 does the
@@ -319,9 +334,8 @@ namespace dsp::multirate {
             // same tapsPerPhase and a *worse* rate error.
             //
             // Note the names: `decim` is the PowerDecimator member, so the
-            // polyphase side is `resampInterp`/`resampDecim`. The old code
-            // declared a local `decim` here that shadowed the member, and only
-            // worked because decim.setRatio() happens to sit above it.
+            // polyphase side is `resampInterp`/`resampDecim`. Do not declare a
+            // local `decim` here: it would shadow the member.
             // Check for excessive error
             if (plan.error > 0.01) {
                 flog::warn("Resampling error is over 0.01%: {0}% ({1} -> {2}, interp {3}, decim {4})",

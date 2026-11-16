@@ -8,6 +8,7 @@
 #include <dsp/clock_recovery/mm.h>
 #include <dsp/digital/binary_slicer.h>
 #include <dsp/digital/differential_decoder.h>
+#include <dsp/buffer/frame_tap.h>
 
 class RDSDemod : public dsp::Processor<dsp::complex_t, uint8_t> {
     using base_type = dsp::Processor<dsp::complex_t, uint8_t>;
@@ -24,7 +25,7 @@ public:
     // maxBlock is the largest block this demodulator can be handed, which is
     // whatever BroadcastFM's RDS branch emits -- 1/50 of the full rate at the
     // usual 250 kHz IF. Everything below runs at 5 kHz, so sizing it for a
-    // full-rate block wastes ~50x on every buffer and both streams.
+    // full-rate block wastes ~50x on every buffer and on the output stream.
     void init(dsp::stream<dsp::complex_t>* in, bool enableSoft, int maxBlock = STREAM_BUFFER_SIZE) {
         // Save config
         this->enableSoft = enableSoft;
@@ -38,18 +39,21 @@ public:
         recov.init(5000.0 / (2375.0 / 2.0), 1e-6, 0.01, 0.01, 128, 8, maxBlock);
         diff.init(2);
 
-        // [RATE-SIZED] Every buffer and both streams below are sized from
+        // [RATE-SIZED] Every buffer and the output stream below are sized from
         // `maxBlock`, which the caller derived from BroadcastFM's RDS
-        // decimation ratio -- none of them is STREAM_BUFFER_SIZE any more, and
-        // process() bound-checks none of them. see doc/design/buffer-size-requirements.md 2.6
+        // decimation ratio, not from STREAM_BUFFER_SIZE, and process()
+        // bound-checks none of them. see doc/design/buffer-size-requirements.md 2.6
         // One complex scratch: the AGC copies out of the input stream, and every
         // later complex stage (costas, fir, costas2) runs in place on it.
         scratch.allocate(maxBlock);
 
-        // Both output streams carry at most one input block: `soft` one sample
-        // per input sample, `out` one symbol per ~4.2. Sized before anything is
-        // started, so no reader can be holding the old buffer.
-        soft.setBufferSize(maxBlock);
+        // The soft symbols, which the clock recovery writes in place over the
+        // real part -- one per input sample at most. They are not published
+        // as a stream; they only go to softTap.
+        softBuf.allocate(maxBlock);
+
+        // `out` carries at most one symbol per ~4.2 input samples. Sized before
+        // anything is started, so no reader can be holding the old buffer.
         base_type::out.setBufferSize(maxBlock);
 
         // Init the rest
@@ -91,22 +95,25 @@ public:
         int count = base_type::_in->read();
         if (count < 0) { return -1; }
 
-        count = process(count, base_type::_in->readBuf, soft.writeBuf, base_type::out.writeBuf);
+        count = process(count, base_type::_in->readBuf, softBuf, base_type::out.writeBuf);
 
         base_type::_in->flush();
+        // Inline and non-blocking, so the diagnostic display cannot hold up
+        // the demodulator.
+        if (enableSoft) { softTap.push(softBuf, count); }
         if (!base_type::out.swap(count)) { return -1; }
-        if (enableSoft) {
-            if (!soft.swap(count)) { return -1; }
-        }
         return count;
     }
 
-    dsp::stream<float> soft;
+    // Soft symbols for the diagnostic display. Initialise it before start();
+    // it is fed only while soft output is enabled.
+    dsp::buffer::FrameTap<float> softTap;
 
 private:
     bool enableSoft = false;
     
     dsp::buffer::Buffer<dsp::complex_t> scratch;
+    dsp::buffer::Buffer<float> softBuf;
 
     dsp::loop::FastAGC<dsp::complex_t> agc;
     dsp::loop::Costas<2> costas;

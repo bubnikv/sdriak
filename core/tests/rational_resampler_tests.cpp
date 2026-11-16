@@ -2,11 +2,120 @@
 
 #include <dsp/multirate/rational_resampler.h>
 
+#include <cmath>
 #include <vector>
 
 namespace {
 
 using test_support::expect;
+
+// Exposes which internal stages hold storage. The stages are protected
+// members; their own public queries report whether they are populated.
+template<class T>
+class InspectableResampler : public dsp::multirate::RationalResampler<T> {
+public:
+    using dsp::multirate::RationalResampler<T>::RationalResampler;
+    int decimStages() const { return this->decim.getStageCount(); }
+    bool resampEmpty() const { return this->resamp.isEmpty(); }
+};
+
+std::vector<float> testSignal(int count) {
+    std::vector<float> signal((size_t)count);
+    for (int i = 0; i < count; i++) {
+        signal[(size_t)i] = (float)(std::sin(0.013 * i) + 0.25 * std::sin(0.31 * i));
+    }
+    return signal;
+}
+
+// Runs the same blocks through both resamplers and requires identical output.
+void expectSameOutput(dsp::multirate::RationalResampler<float>& a,
+                      dsp::multirate::RationalResampler<float>& b,
+                      int maxInput, const char* message) {
+    const std::vector<float> input = testSignal(maxInput);
+    std::vector<float> outA((size_t)a.maxOutputBuffer());
+    std::vector<float> outB((size_t)b.maxOutputBuffer());
+    const int sizes[] = { maxInput, (maxInput / 3) + 1, maxInput - 1 };
+    for (int size : sizes) {
+        const int countA = a.process(size, input.data(), outA.data());
+        const int countB = b.process(size, input.data(), outB.data());
+        expect(countA == countB, message);
+        for (int i = 0; i < countA && i < countB; i++) {
+            if (outA[(size_t)i] != outB[(size_t)i]) {
+                expect(false, message);
+                return;
+            }
+        }
+    }
+}
+
+void testInterpolatingInitBuildsNoDecimator() {
+    InspectableResampler<float> resampler(24000.0, 48000.0, 4096);
+    expect(resampler.decimStages() == 0,
+           "interpolating resampler built decimator stages it never runs");
+    expect(!resampler.resampEmpty(),
+           "interpolating resampler has no polyphase stage");
+}
+
+void testDecimateOnlyReleasesPolyphase() {
+    InspectableResampler<float> resampler(64000.0, 16000.0, 4096);
+    expect(resampler.decimStages() == 2,
+           "exact 4:1 resampler did not build the plan_4 decimator");
+    expect(resampler.resampEmpty(),
+           "decimate-only resampler kept a polyphase delay line");
+
+    // reset() on the released stage must be safe, and processing must
+    // still respect the bound.
+    resampler.reset();
+    const std::vector<float> input = testSignal(4096);
+    std::vector<float> output((size_t)resampler.maxOutputBuffer());
+    expect(resampler.process(4096, input.data(), output.data()) <= resampler.maxOutputBlock(),
+           "decimate-only resampler exceeded its output bound");
+}
+
+void testPassthroughHoldsNothing() {
+    InspectableResampler<float> resampler(48000.0, 48000.0, 4096);
+    expect(resampler.decimStages() == 0 && resampler.resampEmpty(),
+           "passthrough resampler holds stage storage");
+
+    resampler.setRates(0.0, 48000.0);
+    expect(resampler.decimStages() == 0 && resampler.resampEmpty(),
+           "invalid-rate passthrough holds stage storage");
+}
+
+void testSwitchingReleasesAbandonedStages() {
+    constexpr int maxInput = 20000;
+
+    // The radio's AF resampler: built for WFM, then switched to NFM.
+    InspectableResampler<float> resampler(250000.0, 48000.0, maxInput);
+    expect(resampler.decimStages() == 2 && !resampler.resampEmpty(),
+           "250 kHz -> 48 kHz did not use both stages");
+
+    resampler.setInSamplerate(50000.0);
+    expect(resampler.decimStages() == 0,
+           "switch to 50 kHz kept the 250 kHz decimator");
+    expect(!resampler.resampEmpty(),
+           "switch to 50 kHz lost its polyphase stage");
+    {
+        dsp::multirate::RationalResampler<float> fresh(50000.0, 48000.0, maxInput);
+        expectSameOutput(resampler, fresh, maxInput,
+                         "switched resampler differs from a fresh 50 kHz one");
+    }
+
+    // And back: both stages are rebuilt from nothing.
+    resampler.setInSamplerate(250000.0);
+    expect(resampler.decimStages() == 2 && !resampler.resampEmpty(),
+           "switch back to 250 kHz did not rebuild both stages");
+    {
+        dsp::multirate::RationalResampler<float> fresh(250000.0, 48000.0, maxInput);
+        expectSameOutput(resampler, fresh, maxInput,
+                         "rebuilt resampler differs from a fresh 250 kHz one");
+    }
+
+    // Decimate-only from a configuration that used the polyphase stage.
+    resampler.setRates(64000.0, 16000.0);
+    expect(resampler.resampEmpty(),
+           "switch to an exact 4:1 ratio kept the polyphase delay line");
+}
 
 void exercise(double inputRate, double outputRate, int maxInput, const char* message) {
     dsp::multirate::RationalResampler<float> resampler(inputRate, outputRate, maxInput);
@@ -128,5 +237,9 @@ int main() {
         testNearUnityApproximationUsesActualRatio();
         testConfiguredBounds();
         testRateSizedCallersUseSelectedRatio();
+        testInterpolatingInitBuildsNoDecimator();
+        testDecimateOnlyReleasesPolyphase();
+        testPassthroughHoldsNothing();
+        testSwitchingReleasesAbandonedStages();
     });
 }

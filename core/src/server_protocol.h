@@ -4,7 +4,12 @@
 #include <gui/smgui.h>
 #include <dsp/types.h>
 
-#define SERVER_MAX_PACKET_SIZE  (STREAM_BUFFER_SIZE * sizeof(dsp::complex_t) * 2)
+// Largest baseband block, in samples, one packet may carry. This is a wire
+// limit, deliberately not STREAM_BUFFER_SIZE: a desktop server sends blocks
+// sized by its own constant (1000000), and a client built with a smaller one
+// (32-bit Android) must still accept them, then split them to its streams.
+#define SERVER_PROTOCOL_MAX_BLOCK 1000000
+#define SERVER_MAX_PACKET_SIZE  (SERVER_PROTOCOL_MAX_BLOCK * sizeof(dsp::complex_t) * 2)
 
 namespace server {
     // inline (not static): the helpers below odr-use these from a header.
