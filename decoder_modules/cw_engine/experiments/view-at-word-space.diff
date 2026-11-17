@@ -1,0 +1,68 @@
+diff -ru a/src/engine/decode_cw_config.cpp b/src/engine/decode_cw_config.cpp
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_config.cpp	2026-11-17 08:11:03.445233600 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_config.cpp	2026-11-17 08:11:04.228058800 +0100
+@@ -93,6 +93,7 @@
+         c.v3.front.det_s       = num_strict(env("SKIM_V3_DET_S"), c.v3.front.det_s);
+         c.v3.weak.preroll_x   = num_strict(env("SKIM_V3_PREROLL_X"), c.v3.weak.preroll_x);
+         c.v3.front.weak_db     = num_strict(env("SKIM_V3_WEAK_DB"), c.v3.front.weak_db);
++        if ((e = env("SKIM_V3_VIEW_WORD"))) { c.v3.front.view_at_word = flag(e); }   // SDRIAK's own
+         c.v3.weak.min_db      = num_strict(env("SKIM_V3_MIN_DB"), c.v3.weak.min_db);
+         c.rescore.min_evidence_weak = num_strict(env("SKIM_V3_RS_EV_WEAK"), c.rescore.min_evidence_weak);
+         c.v3.weak.fist_hold_s = num_strict(env("SKIM_V3_FIST_HOLD_S"), c.v3.weak.fist_hold_s);
+diff -ru a/src/engine/decode_cw_config.h b/src/engine/decode_cw_config.h
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_config.h	2026-11-17 08:11:03.410682800 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_config.h	2026-11-17 08:11:04.227061600 +0100
+@@ -126,6 +126,14 @@
+     // and QSB handling stays where it was earned; the new statistic serves
+     // the stations v2 loses (L of R 26-34 % under 10 dB).
+     double weak_db = 8.0;              // SKIM_V3_WEAK_DB: weak view below, SNR500
++    // SDRIAK's own switch, SKIM_V3_VIEW_WORD=1: the view may also change
++    // mid-over, while a word space runs (the live word space has fired), so
++    // each word is still read on one likelihood scale. Off, it changes only
++    // between overs, and a channel whose candidate was born in a fade stays
++    // in the weak view through every later peak: on fading paths at SNR500
++    // +10 dB v3 then lost to v2 (ITU moderate CER 0.30 against 0.19;
++    // ALGORITHM.md, Experiments, E3).
++    bool   view_at_word = false;       // SKIM_V3_VIEW_WORD
+ };
+ 
+ // --- v3: the decoder in the weak view -------------------------------------------
+diff -ru a/src/engine/decode_cw_viterbi.cpp b/src/engine/decode_cw_viterbi.cpp
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_viterbi.cpp	2026-11-17 08:11:03.377832600 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_viterbi.cpp	2026-11-17 08:11:04.230579000 +0100
+@@ -208,6 +208,10 @@
+ 
+     // --- v3 front end: cw_frontend.h -------------------------------------------
+     CwFrontEnd m_front;
++    // v3.front.view_at_word: samples left in which the view may change
++    // mid-over (opened when the live word space fires).
++    static constexpr unsigned kViewWindow = 64;
++    unsigned m_view_window = 0;
+ 
+     // --- the call reader: cw_callreader.h --------------------------------------
+     CwCallReader m_reader;
+@@ -542,6 +546,8 @@
+         }
+         if (m_live.word_due(sp, m_fist, m_clock.dit())) {
+             m_live.fire_word();
++            // a word space is running: the next word may start on another view
++            if (m_cfg.v3.front.view_at_word) { m_view_window = kViewWindow; }
+             word_close(text, m_t);
+             emit(text, ' ', tau);
+         }
+@@ -694,10 +700,12 @@
+     if ((m_front.candidate() && !(locked && !weak_view())) || (weak_view() && locked)) {
+         matched_amp = m_front.sample(i, q, m_clock);
+         m_front.track(matched_amp);
+-        // the view changes between overs only: mid-over the lattice would
+-        // read two likelihood scales in one word
+-        if (!m_lattice.active() || m_paused) { m_front.update_view(m_t, m_trace); }
++        // the view changes between overs, or (v3.front.view_at_word) while a
++        // word space runs: mid-word the lattice would read two likelihood
++        // scales in one word
++        if (!m_lattice.active() || m_paused || m_view_window) { m_front.update_view(m_t, m_trace); }
+     }
++    if (m_view_window) { m_view_window--; }
+     m_preroll.put_matched(matched_amp);
+     return matched_amp;
+ }

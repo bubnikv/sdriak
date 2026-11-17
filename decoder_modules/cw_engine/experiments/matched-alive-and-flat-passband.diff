@@ -1,0 +1,82 @@
+diff -ru a/src/engine/channelizer.h b/src/engine/channelizer.h
+--- a/decoder_modules/cw_engine/src/engine/channelizer.h	2026-11-17 06:15:06.678998100 +0100
++++ b/decoder_modules/cw_engine/src/engine/channelizer.h	2026-11-17 06:15:49.306386000 +0100
+@@ -23,6 +23,17 @@
+ // destructor, the rest the methods of the same names).
+ class SkimChannelizer {
+ public:
++    // The CW bank with a flat passband: create_ex(in_rate, 125,
++    // kCwFlatPassbandHz, kCwFlatTaps). The default prototype (±62.5 Hz,
++    // 8 taps a branch) is flat only to ±30 Hz and −6 dB at the channel edge,
++    // so a tone midway between two channels costs v3 3.3 dB in both. This
++    // one is −0.2 dB at ±62.5 Hz and still over 100 dB down at the output
++    // Nyquist (125 Hz), for 0.3 dB at the centre and 1.5× the polyphase
++    // work (ALGORITHM.md §5.3.6). v2's squelch reads the raw channel and
++    // loses 1.8 dB to the wider noise bandwidth; it is meant for v3.
++    static constexpr double   kCwFlatPassbandHz = 85.0;
++    static constexpr unsigned kCwFlatTaps = 12;
++
+     // Create a channelizer for input at in_rate Hz with chan_bw_hz channel
+     // spacing. in_rate/chan_bw_hz must be an even integer (the hop is M/2).
+     // Empty on invalid geometry.
+diff -ru a/src/engine/decode_cw_config.cpp b/src/engine/decode_cw_config.cpp
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_config.cpp	2026-11-17 06:15:06.689166700 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_config.cpp	2026-11-17 06:15:49.296199400 +0100
+@@ -96,6 +96,7 @@
+         c.v3.weak.min_db      = num_strict(env("SKIM_V3_MIN_DB"), c.v3.weak.min_db);
+         c.rescore.min_evidence_weak = num_strict(env("SKIM_V3_RS_EV_WEAK"), c.rescore.min_evidence_weak);
+         c.v3.weak.fist_hold_s = num_strict(env("SKIM_V3_FIST_HOLD_S"), c.v3.weak.fist_hold_s);
++        if ((e = env("SKIM_V3_MATCHED_ALIVE"))) { c.v3.weak.matched_alive = flag(e); }   // SDRIAK's own
+         if ((e = env("SKIM_V3_KWS"))) { c.v3.reader.on = strcmp(e, "0") != 0; }   // kr_cfg()
+         // kr_num(): upstream takes strtod() as is here, unparsable reads 0
+         if (set_nonempty(e = env("SKIM_V3_KWS_DC"))) { c.v3.reader.min_score = std::strtod(e, nullptr); }
+diff -ru a/src/engine/decode_cw_config.h b/src/engine/decode_cw_config.h
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_config.h	2026-11-17 06:15:06.628329900 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_config.h	2026-11-17 06:15:49.296199400 +0100
+@@ -142,6 +142,14 @@
+     double preroll_x = 2.5;            // SKIM_V3_PREROLL_X: weak head bar
+     // SKIM_V3_FIST_HOLD_S: quiet before the fist is forgotten (30 s; v2: 8).
+     double fist_hold_s = 30.0;         // SKIM_V3_FIST_HOLD_S: weak-view fist memory
++    // SDRIAK's own switch, SKIM_V3_MATCHED_ALIVE=1: a solid weak-view channel
++    // rides out a dip while its matched path has seen presence within an
++    // over break. Off, it rides it out while v2's discriminator on the 45 Hz
++    // soft envelope holds µ_mark > 3·µ_space — a ratio that envelope never
++    // reaches below about 0 dB SNR500, so solid weak copy paused about 20
++    // times a minute and tore every word (ALGORITHM.md §5.3.6: 0.9 dB at
++    // 18 WPM, 12 WPM at −3 dB from 80 % to 46 % CER).
++    bool   matched_alive = false;      // SKIM_V3_MATCHED_ALIVE
+ };
+ 
+ // --- v3: the call reader (CwCallReader) --------------------------------------------
+diff -ru a/src/engine/decode_cw_viterbi.cpp b/src/engine/decode_cw_viterbi.cpp
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_viterbi.cpp	2026-11-17 06:15:06.580961100 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_viterbi.cpp	2026-11-17 06:15:49.305350700 +0100
+@@ -721,16 +721,24 @@
+ CwState::DeadAir CwState::dead_air_now() const {
+     const bool solid =
+         m_clock.dit() > 0 && m_marks_committed >= 8 && m_clock.timing_error() < 0.35;
+-    const bool mu_alive =
+-        m_lattice.active() && m_disc.mark_level() > 3.0 * m_disc.space_level();
++    // v2's over break, or a second where the clock is slow (samples).
++    const unsigned over_break =
++        static_cast<unsigned>(std::max(kOverBreakDits * m_clock.dit(), 1.0 * m_rate));
++    // The lattice still rides a live signal through a dip: v2's discriminator
++    // on the soft envelope, or with v3.weak.matched_alive in the weak view,
++    // the matched path's presence seen within an over break.
++    const bool mu_alive = m_lattice.active() &&
++        (m_cfg.v3.weak.matched_alive && weak_view()
++             ? m_front.absent_run() < over_break
++             : m_disc.mark_level() > 3.0 * m_disc.space_level());
+     // v3: the detector is the gate — a candidate, or a solid lattice
+     // riding out a dip; no envelope squelch, no keying-duty bar.
+     // A channel that locked on a station keeps its over through word gaps
+     // and fades: dead air there takes v2's over break — kOverBreakDits of no
+     // evidence — not one dip of the presence log-odds (it tore every weak
+     // word in two on live-air replays).
+-    const unsigned quiet_bar = solid ? static_cast<unsigned>(std::max(kOverBreakDits * m_clock.dit(), 1.0 * m_rate))
+-                                  : static_cast<unsigned>(m_cfg.v3.weak.dead_s * m_rate);
++    const unsigned quiet_bar = solid ? over_break
++                                     : static_cast<unsigned>(m_cfg.v3.weak.dead_s * m_rate);
+     const bool fe_quiet =
+         !m_front.candidate() || m_front.absent_run() > quiet_bar ||
+         (m_front.noise() > 0 && m_front.snr500() < m_cfg.v3.weak.min_db);

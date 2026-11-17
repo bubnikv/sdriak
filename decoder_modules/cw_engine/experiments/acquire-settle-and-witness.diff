@@ -1,0 +1,192 @@
+diff -ru a/src/engine/cw_levels.h b/src/engine/cw_levels.h
+--- a/decoder_modules/cw_engine/src/engine/cw_levels.h	2026-11-17 06:41:18.877823800 +0100
++++ b/decoder_modules/cw_engine/src/engine/cw_levels.h	2026-11-17 06:52:01.222112000 +0100
+@@ -20,10 +20,13 @@
+ 
+ class CwLevels {
+ public:
+-    void init(double rate) {
++    // settle_s (CwAcquireConfig): the squelch stays shut this long after the
++    // first sample while the floor learns from every sample.
++    void init(double rate, double settle_s = 0.0) {
+         m_k_hi_rel = 1.0 - exp(-1.0 / (rate * 0.8));
+         m_k_lo     = 1.0 - exp(-1.0 / (rate * 0.3));
+         m_k_ph     = 1.0 - exp(-1.0 / (rate * 0.7));
++        m_settle_n = static_cast<unsigned>(settle_s * rate);
+     }
+ 
+     // One envelope sample (the raw channel's 3-tap average).
+@@ -32,10 +35,20 @@
+         m_env_hi = m > m_env_hi
+                        ? m
+                        : m_env_hi + m_k_hi_rel * (m - m_env_hi);
+-        if (m < 0.5 * (m_env_lo + m_env_hi)) {
++        // Settling: the floor is the running mean of every sample (a noise
++        // floor seeded by the channelizer's zero history, or by one small
++        // Rayleigh sample, would otherwise sit near 0 for a second), and the
++        // squelch stays shut.
++        const bool settling = m_seen < m_settle_n;
++        if (settling) {
++            m_seen++;
++            m_env_lo += (m - m_env_lo) / m_seen;
++        } else if (m < 0.5 * (m_env_lo + m_env_hi)) {
+             m_env_lo += m_k_lo * (m - m_env_lo);
+         }
+-        if (!m_gate_open) {
++        if (settling) {
++            m_gate_open = false;
++        } else if (!m_gate_open) {
+             m_gate_open = m_env_hi > 4.0 * m_env_lo + 1e-6;
+         } else if (m_env_hi < 2.6 * m_env_lo + 1e-6) {
+             m_gate_open = false;
+@@ -73,4 +86,6 @@
+     bool   m_gate_open = false;
+     double m_p_high = 0.0;                        // EMA of samples in the top 30 %
+     bool   m_keying = false;
++    unsigned m_settle_n = 0;                      // samples the squelch settles
++    unsigned m_seen = 0;                          // … seen so far
+ };
+diff -ru a/src/engine/decode_cw_config.cpp b/src/engine/decode_cw_config.cpp
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_config.cpp	2026-11-17 06:41:18.887695300 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_config.cpp	2026-11-17 06:52:01.221113600 +0100
+@@ -72,6 +72,9 @@
+     }
+     if (env(v + "RESCORE_DEBUG")) { c.rescore.debug = true; }
+     if (set_nonempty(e = env(v + "RELOCK_DB"))) { c.clock.relock_db = std::strtod(e, nullptr); }
++    // SDRIAK's own: the acquisition switches (decode_cw_config.h)
++    c.acquire.settle_s = num_strict(env(v + "SETTLE_S"), c.acquire.settle_s);
++    if ((e = env(v + "WITNESS"))) { c.acquire.witness = flag(e); }
+     if ((e = env(v + "RAYFADE"))) {               // soft_step: "r0,r1[,wmin]"
+         c.llr.rayfade = e[0] &&
+                     sscanf(e, "%lf,%lf,%lf", &c.llr.rayfade_r0, &c.llr.rayfade_r1, &c.llr.rayfade_wmin) >= 2 &&
+diff -ru a/src/engine/decode_cw_config.h b/src/engine/decode_cw_config.h
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_config.h	2026-11-17 06:41:18.813272700 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_config.h	2026-11-17 06:52:01.218144900 +0100
+@@ -79,6 +79,22 @@
+                                        // under this mark/space ratio (0 = off)
+ };
+ 
++// --- acquisition: the squelch's start and the slow-clock witness (SDRIAK's
++// own; ALGORITHM.md §5.3.6). A channel that starts on noise — the
++// channelizer's history is zero, so the floor tracker starts near 0 — opens
++// its squelch on noise, the bootstrap takes noise runs for marks, and a clock
++// learned 2× too slow locks itself in until the fist is forgotten.
++struct CwAcquireConfig {
++    // SKIM_Vn_SETTLE_S: the squelch stays shut for this long after the
++    // channel starts while the floor tracker learns from every sample (0 = off).
++    double settle_s = 0.0;
++    // SKIM_Vn_WITNESS=1: on a strong channel (v2 view) a trigger keeps
++    // reading mark runs while the lattice decodes; when their shortest tight
++    // class sits under the Dit window's floor (0.6 dit) the clock is too slow
++    // and jumps to it.
++    bool   witness = false;
++};
++
+ // --- v2's llr views (CwDiscriminator::llr) ---------------------------------------
+ struct CwLlrConfig {
+     bool   rayfade = false;            // SKIM_Vn_RAYFADE "r0,r1[,wmin]"
+@@ -175,6 +191,7 @@
+     CwAssemblyConfig assembly;
+     CwLatticeConfig  lattice;
+     CwClockConfig    clock;
++    CwAcquireConfig  acquire;
+     CwLlrConfig      llr;
+     CwRescoreConfig  rescore;
+     // v3 only
+diff -ru a/src/engine/decode_cw_viterbi.cpp b/src/engine/decode_cw_viterbi.cpp
+--- a/decoder_modules/cw_engine/src/engine/decode_cw_viterbi.cpp	2026-11-17 06:41:18.760363900 +0100
++++ b/decoder_modules/cw_engine/src/engine/decode_cw_viterbi.cpp	2026-11-17 06:52:01.225255300 +0100
+@@ -165,6 +165,14 @@
+     // --- bootstrap Schmitt (until the dit clock is learned) ------------------
+     CwBootstrap m_bootstrap;                // SDRIAK: cw_schmitt.h
+ 
++    // --- the slow-clock witness (CwAcquireConfig::witness) ---------------------
++    // The bootstrap's trigger kept running while the lattice decodes a strong
++    // channel, and the last mark runs it confirmed.
++    static constexpr unsigned kWitnessMarks = 8;
++    CwSchmitt m_witness;
++    float     m_wit[kWitnessMarks] = {};
++    unsigned  m_wit_n = 0, m_wit_head = 0;
++
+     // --- element clock --------------------------------------------------------
+     CwClock m_clock;                        // SDRIAK: cw_clock.h
+     unsigned  m_marks_committed = 0;             // marks committed on this clock
+@@ -262,6 +270,7 @@
+     void dead_air(bool solid, CwText &text);
+     void tone_step(float i, float q, float env, float mag, bool o_freq);
+     void bootstrap_step(float env, float matched_amp, CwText &text);
++    void witness_step(float env);
+ };
+ 
+ // SDRIAK: the backend is a class (upstream: a table of function pointers).
+@@ -295,7 +304,7 @@
+     : m_cfg(cfg), m_dict_source(std::move(dict)) {
+     m_trace = CwTrace{&m_cfg.diag, &m_freq_hz};
+     m_rate     = sample_rate > 0 ? sample_rate : 250.0;
+-    m_levels.init(m_rate);
++    m_levels.init(m_rate, m_cfg.acquire.settle_s);
+     m_disc.init(m_rate);
+     m_dump.init(m_cfg.diag);
+     // SDRIAK: the envelope (with the narrow biquad) and the edge-weak ratios,
+@@ -817,6 +826,53 @@
+     m_t++;
+ }
+ 
++// The slow-clock witness: a clock learned too slow (a noise-polluted
++// bootstrap) is self-consistent — true dits fall under the Dit window's
++// 0.6-dit floor, the lattice glues them with their gaps, and the re-lock ring
++// only ever sees the glued marks. The trigger on the raw envelope still sees
++// the true marks. On a strong channel (v2 view, peak 8× the floor, where noise
++// runs cannot pass for marks), when the shortest tight class of its last
++// marks (at least 3 within 1.5×) sits under 0.6 dit, the clock jumps to it.
++void CwState::witness_step(float env) {
++    if (weak_view() || m_clock.dit() <= 0 || !m_lattice.active()) {
++        m_wit_n = 0;
++        m_witness.idle();
++        return;
++    }
++    CwSchmitt::Run run;
++    if (!m_witness.step(env, m_levels.env_lo(), m_levels.env_hi(), run))
++        return;
++    m_witness.settle();
++    if (!run.key || run.len < CwSchmitt::kGlitch)
++        return;
++    m_wit[m_wit_head++ % kWitnessMarks] = static_cast<float>(run.len);
++    if (m_wit_n < kWitnessMarks) { m_wit_n++; }
++    if (m_wit_n < 6 || m_levels.env_hi() < 8.0 * m_levels.env_lo())
++        return;
++    float s[kWitnessMarks];
++    std::copy_n(m_wit, m_wit_n, s);
++    std::sort(s, s + m_wit_n);
++    for (unsigned i = 0; i + 2 < m_wit_n; i++) {
++        if (s[i + 2] <= 1.5f * s[i]) {
++            double sum = 0.0;
++            unsigned cnt = 0;
++            for (unsigned j = i; j < m_wit_n && s[j] <= 1.5f * s[i]; j++) {
++                sum += s[j];
++                cnt++;
++            }
++            const double est = sum / cnt;
++            if (est < 0.6 * m_clock.dit()) {
++                CW_DBG(m_trace, "[witness: clock %.1f too slow, marks at %.1f; jump]\n",
++                       m_clock.dit(), est);
++                m_clock.set_dit(std::clamp(est, m_rate * 0.022, m_rate * 0.30));
++                m_clock.clear_rings();
++                m_wit_n = 0;
++            }
++            return;
++        }
++    }
++}
++
+ bool CwState::process(const float *iq, unsigned nframes, SkimDecode *out) {
+     CwText text(out);
+     m_dict = m_dict_source ? m_dict_source->snapshot() : nullptr;
+@@ -910,6 +966,7 @@
+         }
+ 
+         soft_step(soft_env, matched_amp, text);
++        if (m_cfg.acquire.witness) { witness_step(env); }
+         if (m_front.on() && m_lattice.active() && !m_paused && m_clock.dit() > 0 && m_cfg.v3.reader.on &&
+             m_reader.due(m_t, m_rate)) {
+             m_reader.read(read_view(), m_cfg.v3.reader);
