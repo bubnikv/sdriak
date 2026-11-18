@@ -106,6 +106,10 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_executable(rigctl_server_tests tests/rigctl_server_tests.cpp)
     target_link_libraries(rigctl_server_tests PRIVATE sdrpp_core)
     add_test(NAME rigctl_server_tests COMMAND rigctl_server_tests)
+
+    add_executable(networking_tests tests/networking_tests.cpp)
+    target_link_libraries(networking_tests PRIVATE sdrpp_core)
+    add_test(NAME networking_tests COMMAND networking_tests)
 endif ()
 
 target_compile_definitions(sdrpp_core PRIVATE

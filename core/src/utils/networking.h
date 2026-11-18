@@ -56,6 +56,10 @@ namespace net {
 
         int read(int count, uint8_t* buf, bool enforceSize = true);
         bool write(int count, uint8_t* buf);
+        // Send what the socket accepts right now without blocking. Returns the
+        // number of bytes sent (0 if the send buffer is full) or -1 on error,
+        // which also marks the connection closed. TCP only.
+        int writeSome(int count, uint8_t* buf);
         void readAsync(int count, uint8_t* buf, void (*handler)(int count, uint8_t* buf, void* ctx), void* ctx, bool enforceSize = true);
         void writeAsync(int count, uint8_t* buf);
 
@@ -68,10 +72,12 @@ namespace net {
         // (accept, baseband, control), written under connectionOpenMtx; atomic
         // so those reads aren't a data race.
         std::atomic<bool> connectionOpen{false};
-        // connectionOpen only tracks the peer state; this tracks the descriptor
-        // itself so close() releases it exactly once even after a remote
-        // disconnect already cleared connectionOpen. Guarded by closeMtx.
-        bool socketClosed = false;
+        // connectionOpen only tracks the peer state. These track the descriptor
+        // itself: close() shuts it down exactly once (even after a remote
+        // disconnect already cleared connectionOpen) and the destructor
+        // releases it. Guarded by closeMtx.
+        bool socketShutdown = false;
+        bool socketReleased = false;
 
         std::mutex readMtx;
         std::mutex writeMtx;
@@ -115,10 +121,11 @@ namespace net {
 
         std::atomic<bool> listening{false};
         bool stopWorker = false;
-        // Same as ConnClass::socketClosed: listening goes false when accept()
-        // fails, so it cannot double as the "descriptor still open" flag.
-        // Guarded by closeMtx.
-        bool socketClosed = false;
+        // Same as ConnClass: listening goes false when accept() fails, so it
+        // cannot double as the "descriptor still open" flag. Guarded by
+        // closeMtx.
+        bool socketShutdown = false;
+        bool socketReleased = false;
 
         std::mutex acceptMtx;
         std::mutex closeMtx;

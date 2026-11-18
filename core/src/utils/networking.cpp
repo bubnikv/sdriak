@@ -20,6 +20,14 @@ namespace net {
 #endif
     }
 
+    static void shutdownSocket(Socket sock) {
+#ifdef _WIN32
+        ::shutdown(sock, SD_BOTH);
+#else
+        ::shutdown(sock, SHUT_RDWR);
+#endif
+    }
+
     ConnClass::ConnClass(Socket sock, struct sockaddr_in raddr, bool udp) {
         _sock = sock;
         _udp = udp;
@@ -29,6 +37,17 @@ namespace net {
 
     ConnClass::~ConnClass() {
         ConnClass::close();
+
+        // Only the owner destroys a connection, and nobody else can still be
+        // inside read()/write() on it then, so this is the one safe point to
+        // release the descriptor. A close() from another thread only shuts it
+        // down; releasing it there could let a concurrent recv()/send() hit a
+        // descriptor number already reused by an unrelated open.
+        std::lock_guard lck(closeMtx);
+        if (!socketReleased) {
+            socketReleased = true;
+            closeSocket(_sock);
+        }
     }
 
     void ConnClass::close() {
@@ -44,14 +63,12 @@ namespace net {
         readQueueCnd.notify_all();
         writeQueueCnd.notify_all();
 
-        // Close the descriptor exactly once, even if the peer already
-        // disconnected (which clears connectionOpen before we get here).
-        if (!socketClosed) {
-            socketClosed = true;
-#ifndef _WIN32
-            ::shutdown(_sock, SHUT_RDWR);
-#endif
-            closeSocket(_sock);
+        // Wake any thread blocked in recv()/send() on this connection, even
+        // if the peer already disconnected (which clears connectionOpen before
+        // we get here). The descriptor itself is released by the destructor.
+        if (!socketShutdown) {
+            socketShutdown = true;
+            shutdownSocket(_sock);
         }
 
         // Wait for the theads to terminate
@@ -149,6 +166,35 @@ namespace net {
         }
         
         return true;
+    }
+
+    int ConnClass::writeSome(int count, uint8_t* buf) {
+        if (!connectionOpen) { return -1; }
+        std::lock_guard lck(writeMtx);
+#ifdef _WIN32
+        // No per-call non-blocking flag on Winsock: send only when select()
+        // reports room. A send larger than the free space can still block
+        // briefly, but a stalled peer no longer blocks the caller for good.
+        fd_set set;
+        FD_ZERO(&set);
+        FD_SET(_sock, &set);
+        timeval tv = { 0, 0 };
+        int ready = select(0, NULL, &set, NULL, &tv);
+        if (ready == 0) { return 0; }
+        int ret = (ready > 0) ? send(_sock, (char*)buf, count, 0) : -1;
+#else
+        int ret = send(_sock, (char*)buf, count, MSG_DONTWAIT);
+        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) { return 0; }
+#endif
+        if (ret <= 0) {
+            {
+                std::lock_guard lck(connectionOpenMtx);
+                connectionOpen = false;
+            }
+            connectionOpenCnd.notify_all();
+            return -1;
+        }
+        return ret;
     }
 
     void ConnClass::readAsync(int count, uint8_t* buf, void (*handler)(int count, uint8_t* buf, void* ctx), void* ctx, bool enforceSize) {
@@ -304,18 +350,25 @@ namespace net {
         }
         acceptQueueCnd.notify_all();
 
-        // Close the descriptor exactly once; listening may already be false
-        // if accept() failed, but the socket still has to be released.
-        if (!socketClosed) {
-            socketClosed = true;
-#ifndef _WIN32
-            ::shutdown(sock, SHUT_RDWR);
-#endif
-            closeSocket(sock);
+        // Wake the accept worker first and release the descriptor only once
+        // it has left accept(), so it can never accept on a reused number.
+        // listening may already be false if accept() failed; the socket still
+        // has to be released.
+        if (!socketShutdown) {
+            socketShutdown = true;
+            shutdownSocket(sock);
         }
 
-        if (acceptWorkerThread.joinable()) { acceptWorkerThread.join(); }
+        // A handler running on the worker may close its own listener; that
+        // thread cannot be joined from itself, and the destructor, running on
+        // another thread, joins it and releases the descriptor.
+        bool onWorker = acceptWorkerThread.get_id() == std::this_thread::get_id();
+        if (acceptWorkerThread.joinable() && !onWorker) { acceptWorkerThread.join(); }
 
+        if (!onWorker && !socketReleased) {
+            socketReleased = true;
+            closeSocket(sock);
+        }
 
         listening = false;
     }

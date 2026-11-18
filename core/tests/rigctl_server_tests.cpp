@@ -12,8 +12,10 @@ namespace {
         if (!condition) { throw std::runtime_error(message); }
     }
 
+    // Ports below the Linux (32768+) and Windows (49152+) ephemeral ranges, so
+    // an outgoing connection can never self-connect on a port under test.
     std::shared_ptr<net::rigctl::Server> startServer(int& port) {
-        for (port = 45400; port < 45500; port++) {
+        for (port = 24400; port < 24420; port++) {
             try {
                 return net::rigctl::listen("127.0.0.1", port);
             }
