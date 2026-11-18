@@ -35,6 +35,8 @@
  */
 #pragma once
 
+#include <cmath>
+
 #include "skim_common.h"
 #include "cw_clock.h"
 #include "cw_debug.h"
@@ -179,7 +181,7 @@ public:
             m_local_floor = sv[ns / 2];
         }
         double floor = m_local_floor;
-        if (m_band_floor > 0 && !isnan(m_band_floor)) {
+        if (m_band_floor > 0 && !std::isnan(m_band_floor)) {
             floor = std::max(floor, m_band_floor * kHannPowerSum * 2.0 / 0.851);
         }
         if (floor <= 0)
@@ -540,7 +542,7 @@ private:
                 break;
             mu = (sum / cnt) / 0.843;
         }
-        if (band_floor > 0 && !isnan(band_floor)) {
+        if (band_floor > 0 && !std::isnan(band_floor)) {
             // the channel's noise through the MA: ENBW rate/L of the channel's
             // 0.851 × spacing (snr_meter.h), spacing = rate/2
             const double expect = band_floor * 2.0 / (0.851 * L);
