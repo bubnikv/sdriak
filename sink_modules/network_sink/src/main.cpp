@@ -13,6 +13,7 @@
 #include <core.h>
 #include <atomic>
 #include <memory>
+#include <vector>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -36,25 +37,38 @@ const char* sinkModesTxt = "TCP\0UDP\0";
 namespace {
     class NetworkSinkSession {
     public:
-        explicit NetworkSinkSession(net::Conn connection)
-            : connection(std::move(connection)) {}
+        NetworkSinkSession(net::Conn connection, bool tcp)
+            : connection(std::move(connection)), tcp(tcp) {}
 
         bool isOpen() const {
             return active.load() && connection && connection->isOpen();
         }
 
+        // Called from the DSP handlers only, serialized by netBufMtx.
+        // UDP datagrams go out whole. A TCP client that stops reading must not
+        // stall the DSP chain (the stream would back up into the IQ front
+        // end), so TCP sends never block: the unsent tail of a block is kept
+        // and finished first, and whole blocks are dropped while the socket is
+        // full. Blocks are lost, but the byte stream never splits a sample.
         bool write(int count, uint8_t* data) {
             if (!isOpen()) { return false; }
-            if (!connection->write(count, data)) {
-                active = false;
-                connection->close();
-                return false;
+            if (!tcp) {
+                if (!connection->write(count, data)) { return fail(); }
+                return true;
+            }
+
+            if (pendingOffset < pending.size()) {
+                if (!flushPending()) { return false; }
+                if (pendingOffset < pending.size()) { return true; } // still full: drop block
+            }
+
+            int sent = connection->writeSome(count, data);
+            if (sent < 0) { return fail(); }
+            if (sent < count) {
+                pending.assign(data + sent, data + count);
+                pendingOffset = 0;
             }
             return true;
-        }
-
-        void waitForEnd() {
-            if (connection) { connection->waitForEnd(); }
         }
 
         void close() {
@@ -63,7 +77,28 @@ namespace {
         }
 
     private:
+        bool flushPending() {
+            int left = (int)(pending.size() - pendingOffset);
+            int sent = connection->writeSome(left, &pending[pendingOffset]);
+            if (sent < 0) { return fail(); }
+            pendingOffset += sent;
+            if (pendingOffset == pending.size()) {
+                pending.clear();
+                pendingOffset = 0;
+            }
+            return true;
+        }
+
+        bool fail() {
+            active = false;
+            connection->close();
+            return false;
+        }
+
         net::Conn connection;
+        const bool tcp;
+        std::vector<uint8_t> pending;
+        size_t pendingOffset = 0;
         std::atomic<bool> active{true};
     };
 }
@@ -259,7 +294,7 @@ private:
             }
             else {
                 newSession = std::make_shared<NetworkSinkSession>(
-                    net::openUDP("0.0.0.0", port, hostname, port, false));
+                    net::openUDP("0.0.0.0", port, hostname, port, false), false);
             }
         }
         catch (const std::exception& e) {
@@ -330,7 +365,11 @@ private:
     static void clientHandler(net::Conn client, void* ctx) {
         NetworkSink* _this = (NetworkSink*)ctx;
 
-        auto newSession = std::make_shared<NetworkSinkSession>(std::move(client));
+        // The newest client takes over. The accept worker re-arms at once
+        // instead of waiting for the current client to end: a client that
+        // vanished while no audio flowed is never detected, and used to keep
+        // every new connection waiting in the backlog.
+        auto newSession = std::make_shared<NetworkSinkSession>(std::move(client), true);
         std::shared_ptr<NetworkSinkSession> oldSession;
         bool reject = false;
         {
@@ -339,24 +378,13 @@ private:
             if (!reject) {
                 oldSession = std::move(_this->session);
                 _this->session = newSession;
+                if (_this->listener && _this->listener->isListening()) {
+                    _this->listener->acceptAsync(clientHandler, _this);
+                }
             }
         }
         if (oldSession) { oldSession->close(); }
-        if (reject) {
-            newSession->close();
-            return;
-        }
-
-        newSession->waitForEnd();
-        newSession->close();
-
-        {
-            std::lock_guard lck(_this->sessionMtx);
-            if (_this->session == newSession) { _this->session.reset(); }
-            if (!_this->stopping && _this->listener && _this->listener->isListening()) {
-                _this->listener->acceptAsync(clientHandler, _this);
-            }
-        }
+        if (reject) { newSession->close(); }
     }
 
     SinkManager::Stream* _stream;
