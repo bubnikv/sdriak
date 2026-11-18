@@ -24,6 +24,9 @@ add_cmake_project(libbladeRF
         # custom command can locate libusb-1.0.dll. The suffix is patched to
         # 'bin' (see patch_libbladerf.cmake) to match our destdir layout.
         -DLIBUSB_PATH=${SDRPP_DEPS_INSTALL_PREFIX}
+        # udev rules go to an absolute UDEV_RULES_PATH (/etc/udev/rules.d),
+        # outside our destdir; that fails for non-root builds. Skip them.
+        -DINSTALL_UDEV_RULES=OFF
 )
 
 set(DEP_libbladeRF_DEPENDS libusb)

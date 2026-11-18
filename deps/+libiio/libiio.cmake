@@ -29,6 +29,10 @@ add_cmake_project(libiio
         # flex/bison-generated parser — extra host build deps we don't want
         # to require for a portable AppImage. Disable the daemon explicitly.
         -DWITH_IIOD=OFF
+        # libiio installs its udev rule to an absolute UDEV_RULES_INSTALL_DIR
+        # (/lib/udev/rules.d), outside our destdir. That fails for non-root
+        # builds and would never be shipped anyway; skip it.
+        -DINSTALL_UDEV_RULE=OFF
         # On Darwin, libiio's CMakeLists defaults OSX_FRAMEWORK + OSX_PACKAGE
         # to ON, which sets SKIP_INSTALL_ALL=ON and routes install into a
         # /Library/Frameworks .pkg instead of CMAKE_INSTALL_PREFIX. Disable
