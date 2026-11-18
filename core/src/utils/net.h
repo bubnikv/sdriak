@@ -124,6 +124,14 @@ namespace net {
         void close();
 
         /**
+         * Shut down both directions without releasing the descriptor. Wakes a
+         * thread blocked in recv()/send() on this socket; that thread can then
+         * close() it. Use instead of close() from a thread that does not own
+         * the I/O, so an in-flight call can never hit a recycled descriptor.
+         */
+        void shutdown();
+
+        /**
          * Check if the socket is open.
          * @return True if open, false if closed.
          */
@@ -191,6 +199,13 @@ namespace net {
          * Stop listening. The listener can no longer be used after this.
          */
         void stop();
+
+        /**
+         * Wake a thread blocked in accept() without releasing the descriptor
+         * (effective on Linux and Windows; elsewhere rely on an accept timeout).
+         * The accepting thread, or a later stop(), releases it.
+         */
+        void shutdown();
 
         /**
          * CHeck if the listener is still listening.

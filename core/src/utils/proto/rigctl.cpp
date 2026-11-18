@@ -240,9 +240,14 @@ namespace net::rigctl {
     }
 
     void Server::stop() {
+        // Wake the threads, never close under them: a descriptor closed while
+        // another thread is inside select()/recv()/send() on it may be reused
+        // by an unrelated open before that call runs. Each thread closes what
+        // it uses once it has woken up and left its I/O.
         stopping = true;
-        if (listener) { listener->stop(); }
+        if (listener) { listener->shutdown(); }
         if (listenThread.joinable()) { listenThread.join(); }
+        if (listener) { listener->stop(); }
 
         std::vector<std::shared_ptr<ClientSession>> stoppedSessions;
         {
@@ -250,7 +255,7 @@ namespace net::rigctl {
             stoppedSessions.swap(sessions);
         }
         for (auto& session : stoppedSessions) {
-            if (session->socket) { session->socket->close(); }
+            if (session->socket) { session->socket->shutdown(); }
         }
         for (auto& session : stoppedSessions) {
             if (session->worker.joinable()) { session->worker.join(); }
@@ -282,8 +287,9 @@ namespace net::rigctl {
                 sessions.push_back(session);
             }
             catch (...) {
-                session->socket->close();
+                session->socket->shutdown();
                 if (session->worker.joinable()) { session->worker.join(); }
+                session->socket->close();
                 stopping = true;
                 listener->stop();
                 break;
@@ -299,7 +305,13 @@ namespace net::rigctl {
                 // Receive command
                 std::vector<std::string> args;
                 int argCount = recvLine(sock, args);
-                if (argCount <= 0) { break; }
+                if (argCount <= 0) {
+                    // 0 is also the 1 s receive timeout or a blank line. Only
+                    // a closed socket (EOF, error, stop()) ends the session;
+                    // the timeout just lets this thread notice `stopping`.
+                    if (stopping.load() || !sock->isOpen()) { break; }
+                    continue;
+                }
 
                 // Parse command
                 std::string cmd = args[0];

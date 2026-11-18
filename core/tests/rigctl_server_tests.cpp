@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace {
     void require(bool condition, const char* message) {
@@ -55,6 +56,12 @@ int main() {
         require(std::abs(frequency - changedFrequency) < 0.001,
                 "set frequency did not reach the registered handler");
     }
+
+    // The server polls with a 1 s receive timeout; an idle client must stay
+    // connected across it (rigctl clients commonly poll every few seconds).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    require(client->isOpen() && std::abs(client->getFreq() - changedFrequency) < 0.001,
+            "an idle client was disconnected by the receive timeout");
 
     const auto stopStarted = std::chrono::steady_clock::now();
     server->stop();

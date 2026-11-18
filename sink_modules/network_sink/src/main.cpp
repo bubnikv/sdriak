@@ -267,13 +267,21 @@ private:
             return;
         }
 
+        // Anything left from a previous run is released only after
+        // sessionMtx: a listener's destructor joins its accept worker, which
+        // itself takes sessionMtx in clientHandler().
+        net::Listener oldListener;
+        std::shared_ptr<NetworkSinkSession> oldSession;
         {
             std::lock_guard lck(sessionMtx);
             stopping = false;
+            oldListener = std::move(listener);
+            oldSession = std::move(session);
             listener = std::move(newListener);
             session = std::move(newSession);
             if (listener) { listener->acceptAsync(clientHandler, this); }
         }
+        if (oldSession) { oldSession->close(); }
     }
 
     void stopServer() {

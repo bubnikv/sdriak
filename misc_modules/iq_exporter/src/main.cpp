@@ -11,6 +11,7 @@
 #include <gui/dialogs/dialog_box.h>
 #include <core.h>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 
@@ -78,26 +79,16 @@ namespace {
             if (socket) { socket->close(); }
         }
 
-        // Preserve the old status probe without allowing it to race packet
-        // transmission. IQ export peers normally send no data; a zero-byte
-        // TCP read is used only to notice an orderly peer shutdown.
-        bool probeOpen() {
-            std::unique_lock lck(mtx, std::try_to_lock);
-            if (!lck.owns_lock()) { return isOpen(); }
-            if (!isOpen()) { return false; }
-            if (protocol != PROTOCOL_UDP) {
-                uint8_t dummy;
-                if (socket->recv(&dummy, 1, false, net::NONBLOCKING) == 0) {
-                    active = false;
-                    return false;
-                }
-            }
-            return isOpen();
-        }
-
         void consume(dsp::complex_t* data, int count) {
+            // Only close() competes for mtx, and it retires the session, so a
+            // block skipped here never leaves a gap inside a live packet.
             std::unique_lock lck(mtx, std::try_to_lock);
             if (!lck.owns_lock() || !isOpen()) { return; }
+
+            if (protocol != PROTOCOL_UDP) {
+                probePeerLocked();
+                if (!isOpen()) { return; }
+            }
 
             // A non-blocking TCP send may have stopped part-way through a
             // packet. Finish that packet before accepting more samples; if
@@ -156,6 +147,19 @@ namespace {
             }
         }
 
+        // IQ export peers normally send nothing; a zero-byte TCP read is the
+        // only way to notice an orderly peer shutdown before a send fails.
+        // Done here, on the DSP thread under mtx, rather than by the GUI each
+        // frame, so the status display never contends with packet output.
+        void probePeerLocked() {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < nextProbe) { return; }
+            nextProbe = now + std::chrono::milliseconds(100);
+            uint8_t dummy;
+            socket->recv(&dummy, 1, false, net::NONBLOCKING);
+            if (!socket->isOpen()) { active = false; }
+        }
+
         bool flushTcpLocked() {
             while (packetPending && sendOffset < packetSize) {
                 const int sent = socket->send(&buffer[sendOffset], packetSize - sendOffset);
@@ -185,6 +189,7 @@ namespace {
         int fillBytes = 0;
         int sendOffset = 0;
         bool packetPending = false;
+        std::chrono::steady_clock::time_point nextProbe{};
         std::atomic<bool> active{true};
         std::mutex mtx;
     };
@@ -509,7 +514,7 @@ private:
         bool listening = false;
         {
             std::lock_guard lck(_this->sessionMtx);
-            sockOpen = _this->session && _this->session->probeOpen();
+            sockOpen = _this->session && _this->session->isOpen();
             listening = _this->listener && _this->listener->listening();
         }
 

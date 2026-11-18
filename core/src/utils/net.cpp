@@ -141,6 +141,19 @@ namespace net {
         closeSocket(sock.exchange(invalidSocket()));
     }
 
+    static void shutdownSocket(SockHandle_t sock) {
+        if (!validSocket(sock)) { return; }
+#ifdef _WIN32
+        ::shutdown(sock, SD_BOTH);
+#else
+        ::shutdown(sock, SHUT_RDWR);
+#endif
+    }
+
+    void Socket::shutdown() {
+        shutdownSocket(sock.load());
+    }
+
     bool Socket::isOpen() {
         return validSocket(sock.load());
     }
@@ -198,7 +211,11 @@ namespace net {
             // Receive
             int addrLen = sizeof(sockaddr_in);
             int err = ::recvfrom(handle, (char*)&data[read], maxLen - read, 0,(sockaddr*)(dest ? &dest->addr : NULL), (socklen_t*)(dest ? &addrLen : NULL));
-            if (err <= 0 && !WOULD_BLOCK) {
+            // A zero-length TCP read is an orderly peer shutdown. errno is not
+            // set in that case, so a stale EWOULDBLOCK must not mask it: the
+            // socket would stay "open" and a select() loop would spin on EOF.
+            bool peerClosed = (err == 0 && type() == SOCKET_TYPE_TCP);
+            if (peerClosed || (err < 0 && !WOULD_BLOCK)) {
                 close();
                 return err;
             }
@@ -237,6 +254,10 @@ namespace net {
 
     void Listener::stop() {
         closeSocket(sock.exchange(invalidSocket()));
+    }
+
+    void Listener::shutdown() {
+        shutdownSocket(sock.load());
     }
 
     bool Listener::listening() {

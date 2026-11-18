@@ -246,9 +246,14 @@ private:
             return;
         }
 
+        // A previous, no longer listening listener is released only after
+        // sessionMtx: its destructor joins its accept worker, which itself
+        // takes sessionMtx in clientHandler().
+        net::Listener oldListener;
         {
             std::lock_guard lck(sessionMtx);
             stopping = false;
+            oldListener = std::move(listener);
             listener = std::move(newListener);
             listener->acceptAsync(clientHandler, this);
         }
