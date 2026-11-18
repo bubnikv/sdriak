@@ -13,6 +13,8 @@
 #include <cmath>
 #include <cstring>
 #include <radio_interface.h>
+#include <atomic>
+#include <memory>
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 #define MAX_COMMAND_LENGTH 8192
@@ -33,6 +35,47 @@ enum {
 ConfigManager config;
 
 class SigctlServerModule : public ModuleManager::Instance {
+private:
+    struct ClientSession {
+        explicit ClientSession(net::Conn connection)
+            : connection(std::move(connection)) {}
+
+        bool isOpen() const {
+            return active.load() && connection && connection->isOpen();
+        }
+
+        int read(int count, bool enforceSize = false) {
+            if (!isOpen()) { return -1; }
+            return connection->read(count, dataBuf, enforceSize);
+        }
+
+        bool write(size_t count, uint8_t* data) {
+            std::lock_guard lck(ioMtx);
+            if (!isOpen()) { return false; }
+            if (!connection->write((int)count, data)) {
+                active = false;
+                connection->close();
+                return false;
+            }
+            return true;
+        }
+
+        void close() {
+            active = false;
+            if (connection) { connection->close(); }
+        }
+
+        uint8_t dataBuf[1024];
+        std::string command;
+
+    private:
+        // Declared after parser state so the connection is destroyed first
+        // and any in-flight operation has finished before those buffers die.
+        net::Conn connection;
+        std::atomic<bool> active{true};
+        std::mutex ioMtx;
+    };
+
 public:
     SigctlServerModule(std::string name) {
         this->name = name;
@@ -70,8 +113,7 @@ public:
         sigpath::vfoManager.onVfoDeleted.unbindHandler(&vfoDeletedHandler);
         core::moduleManager.onInstanceCreated.unbindHandler(&modChangedHandler);
         core::moduleManager.onInstanceDeleted.unbindHandler(&modChangedHandler);
-        if (client) { client->close(); }
-        if (listener) { listener->close(); }
+        stopServer();
     }
 
     void postInit() {
@@ -115,7 +157,13 @@ private:
         SigctlServerModule* _this = (SigctlServerModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
-        bool listening = (_this->listener && _this->listener->isListening());
+        bool connected = false;
+        bool listening = false;
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            connected = _this->session && _this->session->isOpen();
+            listening = _this->listener && _this->listener->isListening();
+        }
 
         if (listening) { style::beginDisabled(); }
         if (ImGui::InputText(CONCAT("##_rigctl_srv_host_", _this->name), _this->hostname, 1023)) {
@@ -177,7 +225,7 @@ private:
 
         ImGui::TextUnformatted("Status:");
         ImGui::SameLine();
-        if (_this->client && _this->client->isOpen()) {
+        if (connected) {
             ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "Connected");
         }
         else if (listening) {
@@ -189,18 +237,34 @@ private:
     }
 
     void startServer() {
+        net::Listener newListener;
         try {
-            listener = net::listen(hostname, port);
-            listener->acceptAsync(clientHandler, this);
+            newListener = net::listen(hostname, port);
         }
         catch (const std::exception& e) {
             flog::error("Could not start rigctl server: {}", e.what());
+            return;
+        }
+
+        {
+            std::lock_guard lck(sessionMtx);
+            stopping = false;
+            listener = std::move(newListener);
+            listener->acceptAsync(clientHandler, this);
         }
     }
 
     void stopServer() {
-        if (client) { client->close(); }
-        listener->close();
+        std::shared_ptr<ClientSession> oldSession;
+        net::Listener oldListener;
+        {
+            std::lock_guard lck(sessionMtx);
+            stopping = true;
+            oldSession = std::move(session);
+            oldListener = std::move(listener);
+        }
+        if (oldSession) { oldSession->close(); }
+        if (oldListener) { oldListener->close(); }
     }
 
     void refreshModules() {
@@ -299,33 +363,51 @@ private:
 
     static void clientHandler(net::Conn _client, void* ctx) {
         SigctlServerModule* _this = (SigctlServerModule*)ctx;
-        //flog::info("New client!");
-
-        _this->client = std::move(_client);
-        // Drop any partial command left over from the previous client
-        _this->command.clear();
-        _this->client->readAsync(1024, _this->dataBuf, dataHandler, _this, false);
-        _this->client->waitForEnd();
-        _this->client->close();
-
-        //flog::info("Client disconnected!");
-
-        _this->listener->acceptAsync(clientHandler, _this);
-    }
-
-    static void dataHandler(int count, uint8_t* data, void* ctx) {
-        SigctlServerModule* _this = (SigctlServerModule*)ctx;
-
-        for (int i = 0; i < count; i++) {
-            if (data[i] == '\n') {
-                _this->commandHandler(_this->command);
-                _this->command.clear();
-                continue;
+        auto newSession = std::make_shared<ClientSession>(std::move(_client));
+        std::shared_ptr<ClientSession> oldSession;
+        bool reject = false;
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            reject = _this->stopping;
+            if (!reject) {
+                oldSession = std::move(_this->session);
+                _this->session = newSession;
             }
-            if (_this->command.size() < MAX_COMMAND_LENGTH) { _this->command += (char)data[i]; }
+        }
+        if (oldSession) { oldSession->close(); }
+        if (reject) {
+            newSession->close();
+            return;
         }
 
-        _this->client->readAsync(1024, _this->dataBuf, dataHandler, _this, false);
+        // The listener's one worker services the current client directly.
+        // This preserves the old one-client-at-a-time behavior without the
+        // ConnClass read and write worker threads.
+        while (newSession->isOpen()) {
+            int count = newSession->read(sizeof(newSession->dataBuf), false);
+            if (count <= 0) { break; }
+            _this->processData(newSession.get(), count, newSession->dataBuf);
+        }
+        newSession->close();
+
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            if (_this->session == newSession) { _this->session.reset(); }
+            if (!_this->stopping && _this->listener && _this->listener->isListening()) {
+                _this->listener->acceptAsync(clientHandler, _this);
+            }
+        }
+    }
+
+    void processData(ClientSession* client, int count, uint8_t* data) {
+        for (int i = 0; i < count; i++) {
+            if (data[i] == '\n') {
+                commandHandler(client, client->command);
+                client->command.clear();
+                continue;
+            }
+            if (client->command.size() < MAX_COMMAND_LENGTH) { client->command += (char)data[i]; }
+        }
     }
 
     // Hamlib mode names. The app's canonical spellings (RADIO_IFACE_MODE_NAMES)
@@ -381,7 +463,11 @@ private:
                s == "Main" || s == "Sub" || s == "MEM" || s == "TX" || s == "RX" || s == "None";
     }
 
-    void commandHandler(std::string cmd) {
+    void commandHandler(ClientSession* session, std::string cmd) {
+        // Keep the existing response sites concise while binding every reply
+        // to the session that supplied this command, never a module-global
+        // "current client" that a reconnect could replace.
+        ClientSession* client = session;
         std::string corr = "";
         std::vector<std::string> parts;
         bool lastWasSpace = false;
@@ -421,7 +507,7 @@ private:
             std::string arguments;
             if (parts.size() > 1) { arguments = cmd.substr(parts[0].size()); }
             for (char c : parts[0]) {
-                commandHandler(c + arguments);
+                commandHandler(session, c + arguments);
             }
             return;
         }
@@ -736,11 +822,10 @@ private:
 
     char hostname[1024];
     int port = 4532;
-    uint8_t dataBuf[1024];
     net::Listener listener;
-    net::Conn client;
-
-    std::string command = "";
+    std::shared_ptr<ClientSession> session;
+    std::mutex sessionMtx;
+    bool stopping = true;
 
     EventHandler<std::string> modChangedHandler;
     EventHandler<VFOManager::VFO*> vfoCreatedHandler;

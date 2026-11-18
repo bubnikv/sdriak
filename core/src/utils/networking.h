@@ -113,7 +113,7 @@ namespace net {
     private:
         void worker();
 
-        bool listening = false;
+        std::atomic<bool> listening{false};
         bool stopWorker = false;
         // Same as ConnClass::socketClosed: listening goes false when accept()
         // fails, so it cannot double as the "descriptor still open" flag.

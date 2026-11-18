@@ -10,6 +10,9 @@
 #include <signal_path/signal_path.h>
 #include <gui/dialogs/dialog_box.h>
 #include <core.h>
+#include <atomic>
+#include <memory>
+#include <mutex>
 
 SDRPP_MOD_INFO{
     /* Name:            */ "iq_exporter",
@@ -43,6 +46,149 @@ enum SampleType {
     SAMPLE_TYPE_INT32,
     SAMPLE_TYPE_FLOAT32
 };
+
+namespace {
+    class ExportSession {
+    public:
+        ExportSession(std::shared_ptr<net::Socket> socket, Protocol protocol,
+                      SampleType sampleType, int packetSize)
+            : socket(std::move(socket)), protocol(protocol), sampleType(sampleType),
+              packetSize(packetSize), sampleSize(bytesPerSample(sampleType)) {
+            buffer = dsp::buffer::alloc<uint8_t>(packetSize);
+        }
+
+        ~ExportSession() {
+            close();
+            dsp::buffer::free(buffer);
+        }
+
+        bool isOpen() const {
+            return active.load() && socket && socket->isOpen();
+        }
+
+        // Retiring a session waits for at most the DSP block currently being
+        // converted. The packetizer and its socket therefore disappear as one
+        // unit, and no packet can straddle two clients.
+        void close() {
+            std::lock_guard lck(mtx);
+            if (!active.exchange(false)) { return; }
+            fillBytes = 0;
+            sendOffset = 0;
+            packetPending = false;
+            if (socket) { socket->close(); }
+        }
+
+        // Preserve the old status probe without allowing it to race packet
+        // transmission. IQ export peers normally send no data; a zero-byte
+        // TCP read is used only to notice an orderly peer shutdown.
+        bool probeOpen() {
+            std::unique_lock lck(mtx, std::try_to_lock);
+            if (!lck.owns_lock()) { return isOpen(); }
+            if (!isOpen()) { return false; }
+            if (protocol != PROTOCOL_UDP) {
+                uint8_t dummy;
+                if (socket->recv(&dummy, 1, false, net::NONBLOCKING) == 0) {
+                    active = false;
+                    return false;
+                }
+            }
+            return isOpen();
+        }
+
+        void consume(dsp::complex_t* data, int count) {
+            std::unique_lock lck(mtx, std::try_to_lock);
+            if (!lck.owns_lock() || !isOpen()) { return; }
+
+            // A non-blocking TCP send may have stopped part-way through a
+            // packet. Finish that packet before accepting more samples; if
+            // the socket is still full, drop this input block rather than
+            // corrupting the byte stream with a new packet.
+            if (packetPending && !flushTcpLocked()) { return; }
+
+            while (count > 0 && active.load()) {
+                const int remainingSamples = (packetSize - fillBytes) / sampleSize;
+                const int n = std::min(count, remainingSamples);
+                uint8_t* dst = &buffer[fillBytes];
+                switch (sampleType) {
+                case SAMPLE_TYPE_INT8:
+                    volk_32f_s32f_convert_8i((int8_t*)dst, (float*)data, 128.0f, n * 2);
+                    break;
+                case SAMPLE_TYPE_INT16:
+                    volk_32f_s32f_convert_16i((int16_t*)dst, (float*)data, 32768.0f, n * 2);
+                    break;
+                case SAMPLE_TYPE_INT32:
+                    volk_32f_s32f_convert_32i((int32_t*)dst, (float*)data, 2147483647.0f, n * 2);
+                    break;
+                case SAMPLE_TYPE_FLOAT32:
+                    memcpy(dst, data, n * sizeof(dsp::complex_t));
+                    break;
+                }
+                data += n;
+                count -= n;
+                fillBytes += n * sampleSize;
+
+                if (fillBytes != packetSize) { continue; }
+
+                if (protocol == PROTOCOL_UDP) {
+                    // A UDP packet is indivisible. A short/error send drops
+                    // this datagram, as before, without carrying state into
+                    // the next one.
+                    socket->send(buffer, packetSize);
+                    fillBytes = 0;
+                    if (!socket->isOpen()) { active = false; }
+                    continue;
+                }
+
+                packetPending = true;
+                sendOffset = 0;
+                if (!flushTcpLocked()) { return; }
+            }
+        }
+
+    private:
+        static int bytesPerSample(SampleType type) {
+            switch (type) {
+            case SAMPLE_TYPE_INT8:    return sizeof(int8_t) * 2;
+            case SAMPLE_TYPE_INT16:   return sizeof(int16_t) * 2;
+            case SAMPLE_TYPE_INT32:   return sizeof(int32_t) * 2;
+            case SAMPLE_TYPE_FLOAT32: return sizeof(dsp::complex_t);
+            default:                  return 0;
+            }
+        }
+
+        bool flushTcpLocked() {
+            while (packetPending && sendOffset < packetSize) {
+                const int sent = socket->send(&buffer[sendOffset], packetSize - sendOffset);
+                if (sent > 0) {
+                    sendOffset += sent;
+                    continue;
+                }
+                if (!socket->isOpen()) {
+                    active = false;
+                    packetPending = false;
+                    fillBytes = 0;
+                }
+                return false;
+            }
+            packetPending = false;
+            sendOffset = 0;
+            fillBytes = 0;
+            return true;
+        }
+
+        std::shared_ptr<net::Socket> socket;
+        Protocol protocol;
+        SampleType sampleType;
+        int packetSize;
+        int sampleSize;
+        uint8_t* buffer = NULL;
+        int fillBytes = 0;
+        int sendOffset = 0;
+        bool packetPending = false;
+        std::atomic<bool> active{true};
+        std::mutex mtx;
+    };
+}
 
 class IQExporterModule : public ModuleManager::Instance {
 public:
@@ -114,9 +260,6 @@ public:
         sampTypeId = sampleTypes.valueId(sampType);
         packetSizeId = packetSizes.valueId(packetSize);
 
-        // Packet assembly buffer: one packet, whatever the input block size.
-        buffer = dsp::buffer::alloc<uint8_t>(MAX_PACKET_SIZE);
-
         // Init DSP. The handler cuts packets itself (see dataHandler()).
         handler.init(&iqStream, dataHandler, this);
 
@@ -140,8 +283,6 @@ public:
         // Stop DSP
         setMode(MODE_NONE);
 
-        // Free buffer
-        dsp::buffer::free(buffer);
     }
 
     void postInit() {}
@@ -178,27 +319,28 @@ public:
     void start() {
         if (running) { return; }
 
-        // Acquire lock on the socket
-        std::lock_guard lck1(sockMtx);
+        if (listenWorkerThread.joinable()) { listenWorkerThread.join(); }
+
+        std::shared_ptr<net::Listener> newListener;
+        std::shared_ptr<ExportSession> newSession;
 
         // Start listening or open UDP socket
         try {
             if (proto == PROTOCOL_TCP_SERVER) {
                 // Create listener
-                listener = net::listen(hostname, port);
-
-                // Start listen worker
-                listenWorkerThread = std::thread(&IQExporterModule::listenWorker, this);
+                newListener = net::listen(hostname, port);
             }
             else if (proto == PROTOCOL_TCP_CLIENT) {
                 // Connect to TCP server. Runs on the GUI thread, so bound
                 // DNS + TCP connect instead of freezing the UI for the
                 // OS-level connect timeout.
-                sock = net::connect(hostname, port, 5000);
+                newSession = std::make_shared<ExportSession>(
+                    net::connect(hostname, port, 5000), proto, sampType, packetSize);
             }
             else {
                 // Open UDP socket
-                sock = net::openudp(hostname, port, "0.0.0.0", 0, true);
+                newSession = std::make_shared<ExportSession>(
+                    net::openudp(hostname, port, "0.0.0.0", 0, true), proto, sampType, packetSize);
             }
         }
         catch (const std::exception& e) {
@@ -208,41 +350,56 @@ public:
             return;
         }
 
+        {
+            std::lock_guard lck(sessionMtx);
+            stopping = false;
+            listener = newListener;
+            session = newSession;
+        }
+
+        if (newListener) {
+            try {
+                listenWorkerThread = std::thread(&IQExporterModule::listenWorker, this,
+                                                 newListener, sampType, packetSize);
+            }
+            catch (const std::exception& e) {
+                std::shared_ptr<ExportSession> failedSession;
+                {
+                    std::lock_guard lck(sessionMtx);
+                    stopping = true;
+                    listener.reset();
+                    failedSession = std::move(session);
+                }
+                newListener->stop();
+                if (failedSession) { failedSession->close(); }
+                flog::error("[IQExporter] Could not start listener worker: {}", e.what());
+                errorStr = e.what();
+                showError = true;
+                return;
+            }
+        }
+
         running = true;
     }
 
     void stop() {
-        if (!running) { return; }
+        if (!running && !listenWorkerThread.joinable()) { return; }
 
-        // Acquire lock on the socket
-        std::lock_guard lck1(sockMtx);
-
-        // Stop listening or close UDP socket
-        if (proto == PROTOCOL_TCP_SERVER) {
-            // Stop listener
-            if (listener) {
-                listener->stop();
-            }
-
-            // Wait for worker to stop
-            if (listenWorkerThread.joinable()) { listenWorkerThread.join(); }
-
-            // Free listener
-            listener.reset();
-
-            // Close socket and free it
-            if (sock) {
-                sock->close();
-                sock.reset();
-            }
+        std::shared_ptr<net::Listener> oldListener;
+        std::shared_ptr<ExportSession> oldSession;
+        {
+            std::lock_guard lck(sessionMtx);
+            stopping = true;
+            oldListener = std::move(listener);
+            oldSession = std::move(session);
         }
-        else {
-            // Close socket and free it
-            if (sock) {
-                sock->close();
-                sock.reset();
-            }
-        }
+
+        // Never close or join while holding sessionMtx: an accept that won
+        // the race must be able to observe `stopping`, reject its session,
+        // and let the worker terminate.
+        if (oldSession) { oldSession->close(); }
+        if (oldListener) { oldListener->stop(); }
+        if (listenWorkerThread.joinable()) { listenWorkerThread.join(); }
 
         running = false;
     }
@@ -348,11 +505,12 @@ private:
             }
         }
 
-        // Check if the socket is open by attempting a read
-        bool sockOpen;
+        bool sockOpen = false;
+        bool listening = false;
         {
-            uint8_t dummy;
-            sockOpen = !(!_this->sock || !_this->sock->isOpen() || (_this->proto != PROTOCOL_UDP && _this->sock->recv(&dummy, 1, false, net::NONBLOCKING) == 0));
+            std::lock_guard lck(_this->sessionMtx);
+            sockOpen = _this->session && _this->session->probeOpen();
+            listening = _this->listener && _this->listener->listening();
         }
 
         // Status text
@@ -361,7 +519,7 @@ private:
         if (sockOpen) {
             ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), (_this->proto == PROTOCOL_TCP_SERVER || _this->proto == PROTOCOL_TCP_CLIENT) ? "Connected" : "Sending");
         }
-        else if (_this->listener && _this->listener->listening()) {
+        else if (listening) {
             ImGui::TextColored(ImVec4(1.0, 1.0, 0.0, 1.0), "Listening");
         }
         else if (!_this->enabled) {
@@ -422,97 +580,44 @@ private:
         modeId = modes.valueId(newMode);
     }
 
-    void listenWorker() {
-        while (true) {
-            // Accept a client
-            auto newSock = listener->accept();
-            if (!newSock) { break; }
+    void listenWorker(std::shared_ptr<net::Listener> runListener,
+                      SampleType runSampleType, int runPacketSize) {
+        try {
+            while (true) {
+                // Accept a client
+                auto newSock = runListener->accept();
+                if (!newSock) { break; }
 
-            // Update socket
-            {
-                std::lock_guard lck(sockMtx);
-                sock = newSock;
+                auto newSession = std::make_shared<ExportSession>(
+                    std::move(newSock), PROTOCOL_TCP_SERVER, runSampleType, runPacketSize);
+                std::shared_ptr<ExportSession> oldSession;
+                bool reject = false;
+                {
+                    std::lock_guard lck(sessionMtx);
+                    reject = stopping || listener != runListener;
+                    if (!reject) {
+                        oldSession = std::move(session);
+                        session = newSession;
+                    }
+                }
+                if (reject) { newSession->close(); }
+                if (oldSession) { oldSession->close(); }
             }
         }
-    }
-
-    int sampleSize() {
-        switch (sampType) {
-        case SAMPLE_TYPE_INT8:
-            return sizeof(int8_t)*2;
-        case SAMPLE_TYPE_INT16:
-            return sizeof(int16_t)*2;
-        case SAMPLE_TYPE_INT32:
-            return sizeof(int32_t)*2;
-        case SAMPLE_TYPE_FLOAT32:
-            return sizeof(dsp::complex_t);
-        default:
-            return -1;
+        catch (const std::exception& e) {
+            runListener->stop();
+            flog::error("[IQExporter] Listener worker stopped: {}", e.what());
         }
     }
 
-    // Runs on the handler's thread, straight off the input stream. Converts
-    // into `buffer` and sends it each time it holds exactly packetSize bytes,
-    // so packets are cut in bytes, where they are defined, whatever block
-    // size the input delivers. The conversion is the only copy.
-    //
-    // packetSize and sampType are only read with sockMtx held and a socket
-    // open. The menu cannot change them while running, and start() takes
-    // sockMtx after any change, which orders the two threads.
     static void dataHandler(dsp::complex_t* data, int count, void* ctx) {
         IQExporterModule* _this = (IQExporterModule*)ctx;
-
-        // Try to acquire lock on socket
-        if (!_this->sockMtx.try_lock()) { _this->pktFill = 0; return; }
-
-        // If not valid or open, give up
-        if (!_this->sock || !_this->sock->isOpen()) {
-            _this->pktFill = 0;
-            _this->sockMtx.unlock();
-            return;
+        std::shared_ptr<ExportSession> activeSession;
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            activeSession = _this->session;
         }
-
-        // Start a fresh packet on a new client or new settings, so a packet
-        // never mixes sample formats or straddles two connections.
-        if (_this->sock.get() != _this->pktSock || _this->packetSize != _this->pktSize || _this->sampType != _this->pktType) {
-            _this->pktSock = _this->sock.get();
-            _this->pktSize = _this->packetSize;
-            _this->pktType = _this->sampType;
-            _this->pktFill = 0;
-        }
-
-        const int sampSize = _this->sampleSize();
-        const int pktSamples = _this->pktSize / sampSize;
-        while (count > 0) {
-            int n = std::min<int>(count, pktSamples - _this->pktFill);
-            uint8_t* dst = &_this->buffer[_this->pktFill * sampSize];
-            switch (_this->pktType) {
-            case SAMPLE_TYPE_INT8:
-                volk_32f_s32f_convert_8i((int8_t*)dst, (float*)data, 128.0f, n*2);
-                break;
-            case SAMPLE_TYPE_INT16:
-                volk_32f_s32f_convert_16i((int16_t*)dst, (float*)data, 32768.0f, n*2);
-                break;
-            case SAMPLE_TYPE_INT32:
-                volk_32f_s32f_convert_32i((int32_t*)dst, (float*)data, 2147483647.0f, n*2);
-                break;
-            case SAMPLE_TYPE_FLOAT32:
-                memcpy(dst, data, n * sizeof(dsp::complex_t));
-                break;
-            }
-            data += n;
-            count -= n;
-            _this->pktFill += n;
-
-            // Send a complete packet
-            if (_this->pktFill == pktSamples) {
-                _this->sock->send(_this->buffer, _this->pktSize);
-                _this->pktFill = 0;
-            }
-        }
-
-        // Unlock socket mutex
-        _this->sockMtx.unlock();
+        if (activeSession) { activeSession->consume(data, count); }
     }
 
     std::string name;
@@ -547,18 +652,11 @@ private:
     dsp::stream<dsp::complex_t> iqStream;
     dsp::sink::Handler<dsp::complex_t> handler;
 
-    // Packet being assembled. Touched only by dataHandler(), on the handler
-    // thread; a dropped block resets it, so a packet never has a gap.
-    uint8_t* buffer = NULL;
-    int pktFill = 0;                    // samples already in `buffer`
-    int pktSize = 0;                    // bytes, as of the packet in progress
-    SampleType pktType = SAMPLE_TYPE_INT16;
-    const net::Socket* pktSock = NULL;  // socket the packet is meant for
-
     std::thread listenWorkerThread;
 
-    std::mutex sockMtx;
-    std::shared_ptr<net::Socket> sock;
+    std::mutex sessionMtx;
+    bool stopping = true;
+    std::shared_ptr<ExportSession> session;
     std::shared_ptr<net::Listener> listener;
 };
 

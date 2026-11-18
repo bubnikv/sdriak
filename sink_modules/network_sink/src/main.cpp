@@ -11,6 +11,8 @@
 #include <config.h>
 #include <gui/style.h>
 #include <core.h>
+#include <atomic>
+#include <memory>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -30,6 +32,41 @@ enum {
 };
 
 const char* sinkModesTxt = "TCP\0UDP\0";
+
+namespace {
+    class NetworkSinkSession {
+    public:
+        explicit NetworkSinkSession(net::Conn connection)
+            : connection(std::move(connection)) {}
+
+        bool isOpen() const {
+            return active.load() && connection && connection->isOpen();
+        }
+
+        bool write(int count, uint8_t* data) {
+            if (!isOpen()) { return false; }
+            if (!connection->write(count, data)) {
+                active = false;
+                connection->close();
+                return false;
+            }
+            return true;
+        }
+
+        void waitForEnd() {
+            if (connection) { connection->waitForEnd(); }
+        }
+
+        void close() {
+            active = false;
+            if (connection) { connection->close(); }
+        }
+
+    private:
+        net::Conn connection;
+        std::atomic<bool> active{true};
+    };
+}
 
 class NetworkSink : SinkManager::Sink {
 public:
@@ -130,7 +167,13 @@ public:
     void menuHandler() {
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
-        bool listening = (listener && listener->isListening()) || (conn && conn->isOpen());
+        bool connected = false;
+        bool listening = false;
+        {
+            std::lock_guard lck(sessionMtx);
+            connected = session && session->isOpen();
+            listening = connected || (listener && listener->isListening());
+        }
 
         if (listening) { style::beginDisabled(); }
         if (ImGui::InputText(CONCAT("##_network_sink_host_", _streamName), hostname, 1023)) {
@@ -176,7 +219,7 @@ public:
 
         ImGui::TextUnformatted("Status:");
         ImGui::SameLine();
-        if (conn && conn->isOpen()) {
+        if (connected) {
             ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), (modeId == SINK_MODE_TCP) ? "Connected" : "Sending");
         }
         else if (listening) {
@@ -208,63 +251,104 @@ private:
     }
 
     void startServer() {
+        net::Listener newListener;
+        std::shared_ptr<NetworkSinkSession> newSession;
         try {
             if (modeId == SINK_MODE_TCP) {
-                listener = net::listen(hostname, port);
-                if (listener) {
-                    listener->acceptAsync(clientHandler, this);
-                }
+                newListener = net::listen(hostname, port);
             }
             else {
-                conn = net::openUDP("0.0.0.0", port, hostname, port, false);
+                newSession = std::make_shared<NetworkSinkSession>(
+                    net::openUDP("0.0.0.0", port, hostname, port, false));
             }
         }
         catch (const std::exception& e) {
             flog::error("Failed to open socket: {}", e.what());
+            return;
+        }
+
+        {
+            std::lock_guard lck(sessionMtx);
+            stopping = false;
+            listener = std::move(newListener);
+            session = std::move(newSession);
+            if (listener) { listener->acceptAsync(clientHandler, this); }
         }
     }
 
     void stopServer() {
-        if (conn) { conn->close(); }
-        if (listener) { listener->close(); }
+        std::shared_ptr<NetworkSinkSession> oldSession;
+        net::Listener oldListener;
+        {
+            std::lock_guard lck(sessionMtx);
+            stopping = true;
+            oldSession = std::move(session);
+            oldListener = std::move(listener);
+        }
+        if (oldSession) { oldSession->close(); }
+        if (oldListener) { oldListener->close(); }
     }
 
     static void monoHandler(float* samples, int count, void* ctx) {
         NetworkSink* _this = (NetworkSink*)ctx;
-        std::lock_guard lck(_this->connMtx);
-        if (!_this->conn || !_this->conn->isOpen()) { return; }
+        std::shared_ptr<NetworkSinkSession> activeSession;
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            activeSession = _this->session;
+        }
+        if (!activeSession || !activeSession->isOpen()) { return; }
+        std::lock_guard bufferLck(_this->netBufMtx);
 
         volk_32f_s32f_convert_16i(_this->netBuf, (float*)samples, 32768.0f, count);
 
-        _this->conn->write(count * sizeof(int16_t), (uint8_t*)_this->netBuf);
+        activeSession->write(count * sizeof(int16_t), (uint8_t*)_this->netBuf);
     }
 
     static void stereoHandler(dsp::stereo_t* samples, int count, void* ctx) {
         NetworkSink* _this = (NetworkSink*)ctx;
-        std::lock_guard lck(_this->connMtx);
-        if (!_this->conn || !_this->conn->isOpen()) { return; }
+        std::shared_ptr<NetworkSinkSession> activeSession;
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            activeSession = _this->session;
+        }
+        if (!activeSession || !activeSession->isOpen()) { return; }
+        std::lock_guard bufferLck(_this->netBufMtx);
 
         volk_32f_s32f_convert_16i(_this->netBuf, (float*)samples, 32768.0f, count * 2);
 
-        _this->conn->write(count * 2 * sizeof(int16_t), (uint8_t*)_this->netBuf);
+        activeSession->write(count * 2 * sizeof(int16_t), (uint8_t*)_this->netBuf);
     }
 
     static void clientHandler(net::Conn client, void* ctx) {
         NetworkSink* _this = (NetworkSink*)ctx;
 
+        auto newSession = std::make_shared<NetworkSinkSession>(std::move(client));
+        std::shared_ptr<NetworkSinkSession> oldSession;
+        bool reject = false;
         {
-            std::lock_guard lck(_this->connMtx);
-            _this->conn = std::move(client);
+            std::lock_guard lck(_this->sessionMtx);
+            reject = _this->stopping;
+            if (!reject) {
+                oldSession = std::move(_this->session);
+                _this->session = newSession;
+            }
+        }
+        if (oldSession) { oldSession->close(); }
+        if (reject) {
+            newSession->close();
+            return;
         }
 
-        if (_this->conn) {
-            _this->conn->waitForEnd();
-            _this->conn->close();
-        }
-        else {
-        }
+        newSession->waitForEnd();
+        newSession->close();
 
-        _this->listener->acceptAsync(clientHandler, _this);
+        {
+            std::lock_guard lck(_this->sessionMtx);
+            if (_this->session == newSession) { _this->session.reset(); }
+            if (!_this->stopping && _this->listener && _this->listener->isListening()) {
+                _this->listener->acceptAsync(clientHandler, _this);
+            }
+        }
     }
 
     SinkManager::Stream* _stream;
@@ -289,10 +373,12 @@ private:
     bool stereo = false;
 
     int16_t* netBuf;
+    std::mutex netBufMtx;
 
     net::Listener listener;
-    net::Conn conn;
-    std::mutex connMtx;
+    std::shared_ptr<NetworkSinkSession> session;
+    std::mutex sessionMtx;
+    bool stopping = true;
 };
 
 class NetworkSinkModule : public ModuleManager::Instance {

@@ -25,8 +25,6 @@ namespace net {
         _udp = udp;
         remoteAddr = raddr;
         connectionOpen = true;
-        readWorkerThread = std::thread(&ConnClass::readWorker, this);
-        writeWorkerThread = std::thread(&ConnClass::writeWorker, this);
     }
 
     ConnClass::~ConnClass() {
@@ -57,8 +55,8 @@ namespace net {
         }
 
         // Wait for the theads to terminate
-        if (readWorkerThread.joinable()) { readWorkerThread.join(); }
-        if (writeWorkerThread.joinable()) { writeWorkerThread.join(); }
+        if (readWorkerThread.joinable() && readWorkerThread.get_id() != std::this_thread::get_id()) { readWorkerThread.join(); }
+        if (writeWorkerThread.joinable() && writeWorkerThread.get_id() != std::this_thread::get_id()) { writeWorkerThread.join(); }
 
         {
             std::lock_guard lck(connectionOpenMtx);
@@ -138,7 +136,7 @@ namespace net {
 
         int beenWritten = 0;
         while (beenWritten < count) {
-            ret = send(_sock, (char*)buf, count, 0);
+            ret = send(_sock, (char*)&buf[beenWritten], count - beenWritten, 0);
             if (ret <= 0) {
                 {
                     std::lock_guard lck(connectionOpenMtx);
@@ -163,10 +161,16 @@ namespace net {
         entry.ctx = ctx;
         entry.enforceSize = enforceSize;
 
-        // Add entry to queue
+        // Add entry to queue and create the worker only if this connection
+        // actually uses asynchronous reads. Write-only users otherwise paid
+        // for two idle threads per connection.
         {
             std::lock_guard lck(readQueueMtx);
+            if (stopWorkers || !connectionOpen) { return; }
             readQueue.push_back(entry);
+            if (!readWorkerThread.joinable()) {
+                readWorkerThread = std::thread(&ConnClass::readWorker, this);
+            }
         }
 
         // Notify read worker
@@ -183,7 +187,11 @@ namespace net {
         // Add entry to queue
         {
             std::lock_guard lck(writeQueueMtx);
+            if (stopWorkers || !connectionOpen) { return; }
             writeQueue.push_back(entry);
+            if (!writeWorkerThread.joinable()) {
+                writeWorkerThread = std::thread(&ConnClass::writeWorker, this);
+            }
         }
 
         // Notify write worker

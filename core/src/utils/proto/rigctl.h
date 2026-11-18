@@ -4,6 +4,7 @@
 #include <string>
 #include <functional>
 #include <thread>
+#include <atomic>
 
 namespace net::rigctl {
     enum Mode {
@@ -305,8 +306,18 @@ namespace net::rigctl {
         }
 
     private:
+        struct ClientSession {
+            explicit ClientSession(std::shared_ptr<Socket> socket)
+                : socket(std::move(socket)) {}
+
+            std::shared_ptr<Socket> socket;
+            std::thread worker;
+            std::atomic<bool> done{false};
+        };
+
         void listenWorker();
-        void acceptWorker(std::shared_ptr<Socket> sock);
+        void acceptWorker(std::shared_ptr<ClientSession> session);
+        void reapSessions();
         void sendStatus(std::shared_ptr<Socket> sock, int status);
         void sendInt(std::shared_ptr<Socket> sock, int value);
         void sendFloat(std::shared_ptr<Socket> sock, double value);
@@ -317,8 +328,9 @@ namespace net::rigctl {
         std::thread listenThread;
         std::shared_ptr<net::Listener> listener;
 
-        std::mutex socketsMtx;
-        std::vector<std::shared_ptr<net::Socket>> sockets;
+        std::atomic<bool> stopping{false};
+        std::mutex sessionsMtx;
+        std::vector<std::shared_ptr<ClientSession>> sessions;
     };
 
     // timeoutMs bounds DNS resolution and the TCP connect; NO_TIMEOUT for the

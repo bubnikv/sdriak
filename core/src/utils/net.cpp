@@ -20,11 +20,28 @@
 namespace net {
     // === Private functions ===
 
+    static SockHandle_t invalidSocket() {
+#ifdef _WIN32
+        return INVALID_SOCKET;
+#else
+        return -1;
+#endif
+    }
+
+    static bool validSocket(SockHandle_t sock) {
+#ifdef _WIN32
+        return sock != INVALID_SOCKET;
+#else
+        return sock >= 0;
+#endif
+    }
+
     void init() {
         detail::ensureInit();
     }
 
     void closeSocket(SockHandle_t sock) {
+        if (!validSocket(sock)) { return; }
 #ifdef _WIN32
         shutdown(sock, SD_BOTH);
         closesocket(sock);
@@ -118,13 +135,14 @@ namespace net {
     }
 
     void Socket::close() {
-        if (!open) { return; }
-        open = false;
-        closeSocket(sock);
+        // Every error path and the destructor funnels through here. Taking
+        // the handle exactly once prevents a concurrent recv/send failure and
+        // an external stop from closing a recycled native descriptor twice.
+        closeSocket(sock.exchange(invalidSocket()));
     }
 
     bool Socket::isOpen() {
-        return open;
+        return validSocket(sock.load());
     }
 
     SocketType Socket::type() {
@@ -132,8 +150,11 @@ namespace net {
     }
 
     int Socket::send(const uint8_t* data, size_t len, const Address* dest) {
+        SockHandle_t handle = sock.load();
+        if (!validSocket(handle)) { return -1; }
+
         // Send data
-        int err = sendto(sock, (const char*)data, len, 0, (sockaddr*)(dest ? &dest->addr : (raddr ? &raddr->addr : NULL)), sizeof(sockaddr_in));
+        int err = sendto(handle, (const char*)data, len, 0, (sockaddr*)(dest ? &dest->addr : (raddr ? &raddr->addr : NULL)), sizeof(sockaddr_in));
 
         // On error, close socket
         if (err <= 0 && !WOULD_BLOCK) {
@@ -149,6 +170,9 @@ namespace net {
     }
 
     int Socket::recv(uint8_t* data, size_t maxLen, bool forceLen, int timeout, Address* dest) {
+        SockHandle_t handle = sock.load();
+        if (!validSocket(handle)) { return -1; }
+
         // Create FD set
         fd_set set;
         FD_ZERO(&set);
@@ -159,7 +183,7 @@ namespace net {
             // Wait for data or error if 
             if (blocking) {
                 // Enable FD in set
-                FD_SET(sock, &set);
+                FD_SET(handle, &set);
 
                 // Set timeout
                 timeval tv;
@@ -167,13 +191,13 @@ namespace net {
                 tv.tv_usec = (timeout - tv.tv_sec*1000) * 1000;
 
                 // Wait for data
-                int err = select(sock+1, &set, NULL, &set, (timeout > 0) ? &tv : NULL);
+                int err = select((int)(handle + 1), &set, NULL, &set, (timeout > 0) ? &tv : NULL);
                 if (err <= 0) { return err; }
             }
 
             // Receive
             int addrLen = sizeof(sockaddr_in);
-            int err = ::recvfrom(sock, (char*)&data[read], maxLen - read, 0,(sockaddr*)(dest ? &dest->addr : NULL), (socklen_t*)(dest ? &addrLen : NULL));
+            int err = ::recvfrom(handle, (char*)&data[read], maxLen - read, 0,(sockaddr*)(dest ? &dest->addr : NULL), (socklen_t*)(dest ? &addrLen : NULL));
             if (err <= 0 && !WOULD_BLOCK) {
                 close();
                 return err;
@@ -212,19 +236,21 @@ namespace net {
     }
 
     void Listener::stop() {
-        closeSocket(sock);
-        open = false;
+        closeSocket(sock.exchange(invalidSocket()));
     }
 
     bool Listener::listening() {
-        return open;
+        return validSocket(sock.load());
     }
 
     std::shared_ptr<Socket> Listener::accept(Address* dest, int timeout) {
+        SockHandle_t handle = sock.load();
+        if (!validSocket(handle)) { return NULL; }
+
         // Create FD set
         fd_set set;
         FD_ZERO(&set);
-        FD_SET(sock, &set);
+        FD_SET(handle, &set);
 
         // Define timeout
         timeval tv;
@@ -233,13 +259,13 @@ namespace net {
 
         // Wait for data or error
         if (timeout != NONBLOCKING) {
-            int err = select(sock+1, &set, NULL, &set, (timeout > 0) ? &tv : NULL);
+            int err = select((int)(handle + 1), &set, NULL, &set, (timeout > 0) ? &tv : NULL);
             if (err <= 0) { return NULL; }
         }
 
         // Accept
         int addrLen = sizeof(sockaddr_in);
-        SockHandle_t s = ::accept(sock, (sockaddr*)(dest ? &dest->addr : NULL), (socklen_t*)(dest ? &addrLen : NULL));
+        SockHandle_t s = ::accept(handle, (sockaddr*)(dest ? &dest->addr : NULL), (socklen_t*)(dest ? &addrLen : NULL));
         if ((int)s < 0) {
             if (!WOULD_BLOCK) { stop(); }
             return NULL;

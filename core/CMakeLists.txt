@@ -102,6 +102,10 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_executable(frame_tap_tests tests/frame_tap_tests.cpp)
     target_link_libraries(frame_tap_tests PRIVATE sdrpp_core)
     add_test(NAME frame_tap_tests COMMAND frame_tap_tests)
+
+    add_executable(rigctl_server_tests tests/rigctl_server_tests.cpp)
+    target_link_libraries(rigctl_server_tests PRIVATE sdrpp_core)
+    add_test(NAME rigctl_server_tests COMMAND rigctl_server_tests)
 endif ()
 
 target_compile_definitions(sdrpp_core PRIVATE

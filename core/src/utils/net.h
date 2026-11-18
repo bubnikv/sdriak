@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <memory>
@@ -174,8 +175,7 @@ namespace net {
 
     private:
         Address* raddr = NULL;
-        SockHandle_t sock;
-        bool open = true;
+        std::atomic<SockHandle_t> sock;
 
     };
 
@@ -206,8 +206,7 @@ namespace net {
         std::shared_ptr<Socket> accept(Address* dest = NULL, int timeout = NO_TIMEOUT);
 
     private:
-        SockHandle_t sock;
-        bool open = true;
+        std::atomic<SockHandle_t> sock;
 
     };
 

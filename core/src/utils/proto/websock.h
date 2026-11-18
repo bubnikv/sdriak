@@ -80,8 +80,6 @@ namespace net::websock {
 
         static constexpr int64_t MAX_FRAME_PAYLOAD = 1024 * 1024;
 
-        // socketMutex guards both socket lifetime and net::Socket method
-        // calls because net::Socket keeps non-atomic state internally.
         std::optional<::net::Socket> socket;
         std::mutex socketMutex;
 

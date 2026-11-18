@@ -139,9 +139,9 @@ namespace net::rigctl {
         if (err <= 0) { return err; }
 
         // Split
-        for (int i = 0; i < line.size(); i++) {
+        for (size_t i = 0; i < line.size(); i++) {
             // Skip spaces
-            for (; line[i] == ' '; i++);
+            for (; i < line.size() && line[i] == ' '; i++);
             if (i == line.size()) { break; }
 
             // Read part
@@ -236,66 +236,121 @@ namespace net::rigctl {
     }
 
     bool Server::listening() {
-        return listener->listening();
+        return listener && listener->listening();
     }
 
     void Server::stop() {
-        // Stop listen worker
-        listener->stop();
+        stopping = true;
+        if (listener) { listener->stop(); }
         if (listenThread.joinable()) { listenThread.join(); }
 
-        // Stop individual client threads
-        while (true) {
-            // Check how many sockets are left and stop if they're all closed
-            
+        std::vector<std::shared_ptr<ClientSession>> stoppedSessions;
+        {
+            std::lock_guard<std::mutex> lck(sessionsMtx);
+            stoppedSessions.swap(sessions);
+        }
+        for (auto& session : stoppedSessions) {
+            if (session->socket) { session->socket->close(); }
+        }
+        for (auto& session : stoppedSessions) {
+            if (session->worker.joinable()) { session->worker.join(); }
         }
     }
 
     void Server::listenWorker() {
-        while (true) {
-            // Wait for new client
-            auto sock = listener->accept();
-            if (!sock) { break; }
+        while (!stopping.load()) {
+            reapSessions();
 
-            // Add socket to list
-            {
-                std::lock_guard<std::mutex> lck(socketsMtx);
-                sockets.push_back(sock);
+            // Wait for new client
+            // A finite wait lets this same thread reap completed client
+            // workers. This avoids retaining one native thread handle per
+            // disconnected client until another client happens to arrive.
+            auto sock = listener->accept(NULL, 1000);
+            if (!sock) {
+                if (stopping.load() || !listener->listening()) { break; }
+                continue;
+            }
+            if (stopping.load()) {
+                sock->close();
+                break;
             }
 
-            // Start handler thread
-            std::thread acceptThread(&Server::acceptWorker, this, sock);
-            acceptThread.detach();
+            auto session = std::make_shared<ClientSession>(std::move(sock));
+            try {
+                session->worker = std::thread(&Server::acceptWorker, this, session);
+                std::lock_guard<std::mutex> lck(sessionsMtx);
+                sessions.push_back(session);
+            }
+            catch (...) {
+                session->socket->close();
+                if (session->worker.joinable()) { session->worker.join(); }
+                stopping = true;
+                listener->stop();
+                break;
+            }
         }
+        reapSessions();
     }
 
-    void Server::acceptWorker(std::shared_ptr<Socket> sock) {
-        while (true) {
-            // Receive command
-            std::vector<std::string> args;
-            int argCount = recvLine(sock, args);
-            if (argCount <= 0) { break; }
+    void Server::acceptWorker(std::shared_ptr<ClientSession> session) {
+        auto sock = session->socket;
+        try {
+            while (true) {
+                // Receive command
+                std::vector<std::string> args;
+                int argCount = recvLine(sock, args);
+                if (argCount <= 0) { break; }
 
-            // Parse command
-            std::string cmd = args[0];
-            if (cmd == "f" || cmd == "\\get_freq") {
-                // TODO: Check if handler exists
-                double freq = 0;
-                int res = getFreqHandler(freq);
-                if (!res) {
-                    sendFloat(sock, freq);
+                // Parse command
+                std::string cmd = args[0];
+                if (cmd == "f" || cmd == "\\get_freq") {
+                    double freq = 0;
+                    int res = getFreqHandler ? getFreqHandler(freq) : -1;
+                    if (!res) {
+                        sendFloat(sock, freq);
+                    }
+                    else {
+                        sendStatus(sock, res);
+                    }
                 }
-                else {
+                else if (cmd == "F" || cmd == "\\set_freq") {
+                    int res = -1;
+                    if (setFreqHandler && args.size() == 2) {
+                        try { res = setFreqHandler(std::stod(args[1])); }
+                        catch (...) { res = -1; }
+                    }
                     sendStatus(sock, res);
                 }
+                else {
+                    // Return error
+                    sendStatus(sock, -1);
+                }
             }
-            if (cmd == "F" || cmd == "\\set_freq") {
-                
+        }
+        catch (...) {
+            // A handler belongs to application code. Do not let an exception
+            // escape a networking thread and terminate the process.
+        }
+        sock->close();
+        session->done.store(true, std::memory_order_release);
+    }
+
+    void Server::reapSessions() {
+        std::vector<std::shared_ptr<ClientSession>> finished;
+        {
+            std::lock_guard<std::mutex> lck(sessionsMtx);
+            for (auto it = sessions.begin(); it != sessions.end();) {
+                if ((*it)->done.load(std::memory_order_acquire)) {
+                    finished.push_back(std::move(*it));
+                    it = sessions.erase(it);
+                }
+                else {
+                    ++it;
+                }
             }
-            else {
-                // Return error
-                sendStatus(sock, -1);
-            }
+        }
+        for (auto& session : finished) {
+            if (session->worker.joinable()) { session->worker.join(); }
         }
     }
 
@@ -315,5 +370,9 @@ namespace net::rigctl {
         char buf[128];
         sprintf(buf, "%lf\n", value);
         sock->sendstr(buf);
+    }
+
+    std::shared_ptr<Server> listen(std::string host, int port) {
+        return std::make_shared<Server>(net::listen(std::move(host), port));
     }
 }
