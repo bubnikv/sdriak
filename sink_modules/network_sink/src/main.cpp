@@ -62,7 +62,22 @@ namespace {
             if (connection) { connection->close(); }
         }
 
+        // TCP only. Clients never send anything, so one pending read sees an
+        // orderly or reset close even while no audio flows; the read worker
+        // then marks the connection closed. Anything a client does send is
+        // discarded.
+        void watchPeer() {
+            connection->readAsync(sizeof(peerBuf), peerBuf, onPeerData, this, false);
+        }
+
     private:
+        static void onPeerData(int, uint8_t*, void* ctx) {
+            ((NetworkSinkSession*)ctx)->watchPeer();
+        }
+
+        // Declared before the connection so it outlives the read worker,
+        // which the connection's destructor joins.
+        uint8_t peerBuf[256];
         net::Conn connection;
         std::atomic<bool> active{true};
     };
@@ -330,26 +345,40 @@ private:
     static void clientHandler(net::Conn client, void* ctx) {
         NetworkSink* _this = (NetworkSink*)ctx;
 
-        // The newest client takes over. The accept worker re-arms at once
-        // instead of waiting for the current client to end: a client that
-        // vanished while no audio flowed is never detected, and used to keep
-        // every new connection waiting in the backlog.
+        // A client that vanished without closing is dropped by the kernel
+        // within about 25 s (keepalive: 10 s idle, then 3 probes 5 s apart),
+        // and a send blocked on it gives up after 20 s where the platform
+        // supports TCP_USER_TIMEOUT. A client that is alive but not reading
+        // stays connected and paces the receiver.
+        client->setLivenessChecks(10, 5, 3, 20000);
         auto newSession = std::make_shared<NetworkSinkSession>(std::move(client));
+
+        // The first client keeps the stream while it is healthy; a second one
+        // is refused at once instead of waiting silently in the backlog.
         std::shared_ptr<NetworkSinkSession> oldSession;
-        bool reject = false;
+        bool accepted = false;
+        bool stopping = false;
         {
             std::lock_guard lck(_this->sessionMtx);
-            reject = _this->stopping;
-            if (!reject) {
-                oldSession = std::move(_this->session);
-                _this->session = newSession;
+            stopping = _this->stopping;
+            if (!stopping) {
+                accepted = !(_this->session && _this->session->isOpen());
+                if (accepted) {
+                    oldSession = std::move(_this->session);
+                    _this->session = newSession;
+                }
                 if (_this->listener && _this->listener->isListening()) {
                     _this->listener->acceptAsync(clientHandler, _this);
                 }
             }
         }
         if (oldSession) { oldSession->close(); }
-        if (reject) { newSession->close(); }
+        if (!accepted) {
+            if (!stopping) { flog::info("Network sink: refused a client, another one is connected"); }
+            newSession->close();
+            return;
+        }
+        newSession->watchPeer();
     }
 
     SinkManager::Stream* _stream;

@@ -9,6 +9,7 @@
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #endif
 
 namespace net {
@@ -165,6 +166,43 @@ namespace net {
             beenWritten += ret;
         }
         
+        return true;
+    }
+
+    bool ConnClass::setLivenessChecks(int idleSec, int intervalSec, int probes, int userTimeoutMs) {
+        if (_udp) { return false; }
+#ifdef _WIN32
+        DWORD on = 1;
+        if (setsockopt(_sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&on, sizeof(on)) != 0) { return false; }
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+        DWORD idle = idleSec, interval = intervalSec, count = probes;
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&idle, sizeof(idle));
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&interval, sizeof(interval));
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&count, sizeof(count));
+#endif
+        (void)userTimeoutMs;
+#else
+        int on = 1;
+        if (setsockopt(_sock, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) != 0) { return false; }
+#if defined(TCP_KEEPIDLE)
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPIDLE, &idleSec, sizeof(idleSec));
+#elif defined(TCP_KEEPALIVE)
+        // macOS names the idle time TCP_KEEPALIVE.
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPALIVE, &idleSec, sizeof(idleSec));
+#endif
+#ifdef TCP_KEEPINTVL
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPINTVL, &intervalSec, sizeof(intervalSec));
+#endif
+#ifdef TCP_KEEPCNT
+        setsockopt(_sock, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes));
+#endif
+#ifdef TCP_USER_TIMEOUT
+        unsigned int timeout = (unsigned int)userTimeoutMs;
+        setsockopt(_sock, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, sizeof(timeout));
+#else
+        (void)userTimeoutMs;
+#endif
+#endif
         return true;
     }
 

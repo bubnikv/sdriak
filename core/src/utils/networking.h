@@ -56,6 +56,14 @@ namespace net {
 
         int read(int count, uint8_t* buf, bool enforceSize = true);
         bool write(int count, uint8_t* buf);
+        // TCP only. Lets the kernel notice a peer that vanished without
+        // closing (power loss, cable, Wi-Fi): keepalive probes after idleSec
+        // of silence, every intervalSec, giving up after probes; and, where
+        // supported (Linux), unacknowledged sent data fails the connection
+        // after userTimeoutMs instead of the default ~15 minutes, so a send
+        // blocked on a dead peer returns. Options a platform lacks are
+        // skipped. Returns false if SO_KEEPALIVE itself could not be set.
+        bool setLivenessChecks(int idleSec, int intervalSec, int probes, int userTimeoutMs);
         void readAsync(int count, uint8_t* buf, void (*handler)(int count, uint8_t* buf, void* ctx), void* ctx, bool enforceSize = true);
         void writeAsync(int count, uint8_t* buf);
 

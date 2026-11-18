@@ -1,6 +1,7 @@
 // ConnClass / ListenerClass lifetime: close() from a foreign thread wakes a
 // blocked reader without releasing the descriptor under it, a closed listener
-// frees its port at once, and a read handler may close its own connection.
+// frees its port at once, a read handler may close its own connection, and a
+// pending read notices a peer that closes while no data flows.
 #include <utils/networking.h>
 
 #include <atomic>
@@ -70,6 +71,26 @@ namespace {
         listener.reset();
     }
 
+    // network_sink's health watch: one pending read on a connection the
+    // peer never writes to notices the peer closing, with no data flowing.
+    void pendingReadSeesSilentClose() {
+        Pair p = connectPair();
+        require(p.server->setLivenessChecks(10, 5, 3, 20000), "keepalive could not be enabled");
+        uint8_t buf[16];
+        p.server->readAsync(sizeof(buf), buf, [](int, uint8_t*, void*) {}, NULL, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(p.server->isOpen(), "an idle connection was reported closed");
+        p.client->close();
+        const auto started = clock_type::now();
+        while (p.server->isOpen() && clock_type::now() - started < std::chrono::seconds(2)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        require(!p.server->isOpen(), "a silent peer close was not noticed");
+
+        net::Conn udp = net::openUDP("127.0.0.1", 0, "127.0.0.1", 9, false);
+        require(!udp->setLivenessChecks(10, 5, 3, 20000), "liveness checks accepted a UDP socket");
+    }
+
     struct SelfClose {
         net::Conn conn;
         uint8_t buf[4];
@@ -100,5 +121,6 @@ int main() {
     closeWakesBlockedReader();
     closedListenerFreesPort();
     handlerMayCloseItsConnection();
+    pendingReadSeesSilentClose();
     return 0;
 }
