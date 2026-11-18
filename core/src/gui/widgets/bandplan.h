@@ -1,6 +1,7 @@
 #pragma once
 #include <gui/widgets/band_mapping.h>
 #include <json.hpp>
+#include <module.h>
 #include <imgui/imgui.h>
 #include <stdint.h>
 
@@ -87,8 +88,9 @@ namespace bandplan {
     // the call does not propagate parse errors out of the user's config.
     void loadColorTable(const json& table);
 
-    extern std::map<std::string, BandPlan_t> bandplans;
-    extern std::vector<std::string> bandplanNames;
-    extern std::string bandplanNameTxt;
-    extern std::map<std::string, BandPlanColor_t> colorTable;
+    // Exported so tests and modules use the library's single copy.
+    SDRPP_EXPORT std::map<std::string, BandPlan_t> bandplans;
+    SDRPP_EXPORT std::vector<std::string> bandplanNames;
+    SDRPP_EXPORT std::string bandplanNameTxt;
+    SDRPP_EXPORT std::map<std::string, BandPlanColor_t> colorTable;
 };

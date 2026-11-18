@@ -59,14 +59,14 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     target_link_libraries(band_picker_model_tests PRIVATE sdrpp_core)
     add_test(NAME band_picker_model_tests COMMAND band_picker_model_tests)
 
-    add_executable(bandplan_load_tests
-        tests/bandplan_load_tests.cpp
-        src/gui/widgets/bandplan.cpp)
+    # These loaders reach their state through exported symbols, so the tests
+    # link against the library instead of recompiling it. A source compiled
+    # into the test as well would define its globals twice, and they would
+    # be destroyed twice at exit.
+    add_executable(bandplan_load_tests tests/bandplan_load_tests.cpp)
     target_link_libraries(bandplan_load_tests PRIVATE sdrpp_core)
     add_test(NAME bandplan_load_tests COMMAND bandplan_load_tests)
 
-    # colormaps and the theme manager reach their state through exported
-    # symbols, so these link against the library instead of recompiling it.
     add_executable(colormap_load_tests tests/colormap_load_tests.cpp)
     target_link_libraries(colormap_load_tests PRIVATE sdrpp_core)
     add_test(NAME colormap_load_tests COMMAND colormap_load_tests)
