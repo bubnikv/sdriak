@@ -74,6 +74,7 @@ option(OPT_BUILD_PORTAUDIO_SINK "Build PortAudio Sink Module (Dependencies: port
 # Decoders
 option(OPT_BUILD_ATV_DECODER "Build ATV decoder (no dependencies required)" ON)
 option(OPT_BUILD_CW_ENGINE "Build the CW skimmer engine library the CW decoder modules link (no dependencies required)" ON)
+cmake_dependent_option(OPT_BUILD_CW_DEEPCW "Build the CW engine's DeepCW neural decoders, v1 and v2 (ONNX Runtime, loaded at run time; the models are not bundled)" OFF "OPT_BUILD_CW_ENGINE" OFF)
 option(OPT_BUILD_DAB_DECODER "Build the DAB/DAB+ decoder (no dependencies required)" OFF)
 option(OPT_BUILD_FALCON9_DECODER "Build the falcon9 live decoder (Dependencies: ffplay)" OFF)
 option(OPT_BUILD_KG_SSTV_DECODER "Build the KG SSTV (KG-STV) decoder module (no dependencies required)" OFF)
