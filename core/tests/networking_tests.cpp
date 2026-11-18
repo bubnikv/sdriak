@@ -1,14 +1,12 @@
 // ConnClass / ListenerClass lifetime: close() from a foreign thread wakes a
 // blocked reader without releasing the descriptor under it, a closed listener
-// frees its port at once, writeSome() never blocks, and a read handler may
-// close its own connection.
+// frees its port at once, and a read handler may close its own connection.
 #include <utils/networking.h>
 
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
 #include <thread>
-#include <vector>
 
 namespace {
     using clock_type = std::chrono::steady_clock;
@@ -72,28 +70,6 @@ namespace {
         listener.reset();
     }
 
-    void writeSomeNeverBlocks() {
-        Pair p = connectPair();
-        std::vector<uint8_t> chunk(65536, 0x5a);
-        const auto started = clock_type::now();
-        size_t queued = 0;
-        int sent = 0;
-        while ((sent = p.server->writeSome((int)chunk.size(), chunk.data())) > 0) {
-            queued += sent;
-            require(clock_type::now() - started < std::chrono::seconds(5),
-                    "the send buffer never filled");
-        }
-        require(sent == 0, "a full send buffer was reported as an error");
-        require(p.server->isOpen(), "a full send buffer closed the connection");
-
-        // Drain what was queued; the connection must accept data again.
-        std::vector<uint8_t> sink(queued);
-        require(p.client->read((int)queued, sink.data(), true) == (int)queued,
-                "the peer did not receive every queued byte");
-        require(p.server->writeSome(16, chunk.data()) == 16,
-                "writeSome() did not resume after the peer drained");
-    }
-
     struct SelfClose {
         net::Conn conn;
         uint8_t buf[4];
@@ -123,7 +99,6 @@ namespace {
 int main() {
     closeWakesBlockedReader();
     closedListenerFreesPort();
-    writeSomeNeverBlocks();
     handlerMayCloseItsConnection();
     return 0;
 }

@@ -168,35 +168,6 @@ namespace net {
         return true;
     }
 
-    int ConnClass::writeSome(int count, uint8_t* buf) {
-        if (!connectionOpen) { return -1; }
-        std::lock_guard lck(writeMtx);
-#ifdef _WIN32
-        // No per-call non-blocking flag on Winsock: send only when select()
-        // reports room. A send larger than the free space can still block
-        // briefly, but a stalled peer no longer blocks the caller for good.
-        fd_set set;
-        FD_ZERO(&set);
-        FD_SET(_sock, &set);
-        timeval tv = { 0, 0 };
-        int ready = select(0, NULL, &set, NULL, &tv);
-        if (ready == 0) { return 0; }
-        int ret = (ready > 0) ? send(_sock, (char*)buf, count, 0) : -1;
-#else
-        int ret = send(_sock, (char*)buf, count, MSG_DONTWAIT);
-        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) { return 0; }
-#endif
-        if (ret <= 0) {
-            {
-                std::lock_guard lck(connectionOpenMtx);
-                connectionOpen = false;
-            }
-            connectionOpenCnd.notify_all();
-            return -1;
-        }
-        return ret;
-    }
-
     void ConnClass::readAsync(int count, uint8_t* buf, void (*handler)(int count, uint8_t* buf, void* ctx), void* ctx, bool enforceSize) {
         if (!connectionOpen) { return; }
         // Create entry

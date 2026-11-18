@@ -56,10 +56,6 @@ namespace net {
 
         int read(int count, uint8_t* buf, bool enforceSize = true);
         bool write(int count, uint8_t* buf);
-        // Send what the socket accepts right now without blocking. Returns the
-        // number of bytes sent (0 if the send buffer is full) or -1 on error,
-        // which also marks the connection closed. TCP only.
-        int writeSome(int count, uint8_t* buf);
         void readAsync(int count, uint8_t* buf, void (*handler)(int count, uint8_t* buf, void* ctx), void* ctx, bool enforceSize = true);
         void writeAsync(int count, uint8_t* buf);
 
