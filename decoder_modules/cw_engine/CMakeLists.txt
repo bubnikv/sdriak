@@ -17,6 +17,8 @@ add_library(cw_engine STATIC
     src/engine/cw_reread.cpp
     src/engine/decode_cw_config.cpp
     src/engine/decode_cw_viterbi.cpp
+    src/engine/decode_bell.cpp
+    src/engine/bell/bell_decoder.cpp
     src/engine/oracle.cpp
     src/sdriak/fir_bandpass.cpp)
 

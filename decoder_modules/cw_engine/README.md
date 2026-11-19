@@ -74,6 +74,8 @@ src/sdriak     = SDRIAK's own: what upstream takes from WDSP
 | `engine/skim_sha256.h`, `engine/skim_sha256.cpp` | optional, SDRIAK's: `SkimSha256`, SHA-256 for the model pin |
 | `engine/ort_shim.h`, `engine/ort_shim.cpp` | optional: ONNX Runtime's C API loaded at run time (`SkimOrt`, the library and environment; `SkimOrtSession`, one model on the CPU or CUDA) |
 | `../vendor/onnxruntime/` | optional: the MIT C API header of ONNX Runtime 1.21 (`VENDOR.md`) |
+| `engine/bell/bell_decoder.h`, `engine/bell/bell_decoder.cpp` | SDRIAK's: `BellDecoder`, E. L. Bell's 1977 Bayesian Morse decoder (a Kalman filter per path on a pruned element/speed trellis), from AG1LE's C port `morse-wip`, corrected against the thesis's Fortran listing (`BELL.md`); `BellConfig` |
+| `engine/decode_bell.h`, `engine/decode_bell.cpp` | SDRIAK's: the backend `SkimBellBackend` ("bell") for the bench: Bell's IF filter emulated on the channel, \|IQ\| at 200 Hz, a peak AGC, `BellDecoder`; `BellBackendConfig` |
 
 The decoders expect **250 Hz complex baseband** with the tone within the
 ±62.5 Hz channel, before any AGC: the output of a 125 Hz-spaced channelizer

@@ -1,0 +1,710 @@
+/*
+ * bell_decoder.cpp — E. L. Bell's Bayesian manual-Morse decoder (see
+ * bell_decoder.h). Each routine carries the listing's name and page, and
+ * notes where it departs from the listing or from morse-wip.
+ *
+ * Copyright (C) 1977 E. L. Bell (U.S. Government work)
+ * Copyright (C) 2012-2014 Mauri Niininen, AG1LE
+ * Part of SDRIAK. GPL-3.0-or-later.
+ */
+#include "bell_decoder.h"
+
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+
+namespace {
+
+// --- INITL's tables (listing p. 160–161), 1-based like the Fortran ----------
+//
+// This is the listing's 16-state model: a letter state λ is the pair
+// (previous element, current element) — 1..8 a space after a mark, 9..16 a
+// mark after a space. Bell's "independent letter" tree model reads 300 more
+// states from a file, MORSEM, that the listing does not contain; morse-wip,
+// and this file, run the 16-state model.
+//
+// Element types k: 1 dit, 2 dah, 3 element space, 4 character space,
+// 5 word space, 6 pause. Speed steps i: 1..5 = −2..+2 steps.
+
+// ISX(K): the key state of element type K.
+constexpr int kIsx[7] = {0, 1, 1, 0, 0, 0, 0};
+// ILAMI(L): the element type of letter state L (IELMST is the identity here).
+constexpr int kIlami[17] = {0, 3, 4, 5, 6, 3, 4, 5, 6, 1, 2, 1, 2, 1, 2, 1, 2};
+// ILAMX(E): the key state of element type E.
+constexpr int kIlamx[7] = {0, 1, 1, 0, 0, 0, 0};
+// MEMFCN(L, K): the letter state after state L when element K follows; 0 =
+// not allowed. [K][L].
+constexpr int kMemfcn[7][17] = {
+    {},
+    {0, 9, 11, 13, 15, 9, 11, 13, 15, 9, 0, 11, 0, 13, 0, 15, 0},
+    {0, 10, 12, 14, 16, 10, 12, 14, 16, 0, 10, 0, 12, 0, 14, 0, 16},
+    {0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 5, 1, 5, 1, 5, 1, 5},
+    {0, 0, 2, 0, 0, 0, 6, 0, 0, 2, 6, 2, 6, 2, 6, 2, 6},
+    {0, 0, 0, 3, 0, 0, 0, 7, 0, 3, 7, 3, 7, 3, 7, 3, 7},
+    {0, 0, 0, 0, 4, 0, 0, 0, 8, 4, 8, 4, 8, 4, 8, 4, 8},
+};
+// ELEMTR(L, K): P(next element K | letter state L), Bell's Table XII (the
+// second-order symbol model). [K][L].
+constexpr float kElemtr[7][17] = {
+    {},
+    {0, .55f, .5f, .5f, .5f, .55f, .5f, .5f, .5f, 0, 0, 0, 0, 0, 0, 0, 0},
+    {0, .45f, .5f, .5f, .5f, .45f, .5f, .5f, .5f, 0, 0, 0, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, .581f, .54f, .923f, .923f, .923f, .923f, .95f, .95f},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, .335f, .376f, .062f, .062f, .062f, .062f, .04f, .04f},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, .069f, .069f, .012f, .012f, .012f, .012f, .009f, .009f},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, .015f, .015f, .003f, .003f, .003f, .003f, .001f, .001f},
+};
+// RTRANS(I, IND): P(speed step I), IND 1 after an element or word space,
+// 2 after a character space or pause. [IND][I].
+constexpr float kRtrans[3][6] = {
+    {},
+    {0, .1f, .2f, .4f, .2f, .1f},
+    {0, .15f, .2f, .3f, .2f, .15f},
+};
+// MEMDEL(ILELM, ISELM): WPM per speed step from element ILELM to ISELM.
+// [ISELM][ILELM], the DATA statement's column order.
+constexpr int kMemdel[7][7] = {
+    {},
+    {0, 0, 0, 2, 2, 5, 10},
+    {0, 0, 0, 2, 2, 5, 10},
+    {0, 2, 2, 0, 0, 0, 0},
+    {0, 2, 2, 0, 0, 0, 0},
+    {0, 2, 2, 0, 0, 0, 0},
+    {0, 2, 2, 0, 0, 0, 0},
+};
+// MEMPR(ILELM, ISELM): which RTRANS column applies; 0 = no speed change.
+// [ISELM][ILELM].
+constexpr int kMempr[7][7] = {
+    {},
+    {0, 0, 0, 1, 2, 1, 2},
+    {0, 0, 0, 1, 2, 1, 2},
+    {0, 1, 1, 0, 0, 0, 0},
+    {0, 1, 1, 0, 0, 0, 0},
+    {0, 1, 1, 0, 0, 0, 0},
+    {0, 1, 1, 0, 0, 0, 0},
+};
+// XTRANS: nominal durations in dits, and the density sharpness.
+constexpr int   kKimap[7] = {0, 1, 3, 1, 3, 7, 14};
+constexpr float kAparm[4] = {0, 3.0f, 1.5f, 1.0f};
+
+constexpr int isx(int k) { return kIsx[k]; }
+constexpr int ilami(int l) { return kIlami[l]; }
+constexpr int ilamx(int e) { return kIlamx[e]; }
+constexpr int memfcn(int l, int k) { return kMemfcn[k][l]; }
+constexpr float elemtr(int l, int k) { return kElemtr[k][l]; }
+constexpr float rtrans(int i, int ind) { return kRtrans[ind][i]; }
+constexpr int memdel(int ilelm, int iselm) { return kMemdel[iselm][ilelm]; }
+constexpr int mempr(int ilelm, int iselm) { return kMempr[iselm][ilelm]; }
+
+// TRANSL's code tree (morse-wip transl.cxx): node → dit child, dah child,
+// text. 0 is the root. Two links differ from morse-wip: Z's dah child (Z
+// had none, so ',' could never be read) and Q's dit child (pointed at '0').
+struct TreeNode {
+    int dit, dah;
+    const char *chr;
+};
+constexpr TreeNode kTree[] = {
+    {1, 2, "#"},              //  0 root
+    {3, 4, "E"},              //  1 .
+    {5, 6, "T"},              //  2 -
+    {7, 8, "I"},              //  3 ..
+    {9, 10, "A"},             //  4 .-
+    {11, 12, "N"},            //  5 -.
+    {13, 14, "M"},            //  6 --
+    {15, 16, "S"},            //  7 ...
+    {17, 18, "U"},            //  8 ..-
+    {19, 20, "R"},            //  9 .-.
+    {21, 22, "W"},            // 10 .--
+    {23, 24, "D"},            // 11 -..
+    {25, 26, "K"},            // 12 -.-
+    {27, 28, "G"},            // 13 --.
+    {29, 30, "O"},            // 14 ---
+    {31, 32, "H"},            // 15 ....
+    {33, 34, "V"},            // 16 ...-
+    {35, 36, "F"},            // 17 ..-.
+    {37, 38, "*..--*"},       // 18 ..--
+    {39, 40, "L"},            // 19 .-..
+    {41, 42, "\xC3\x84"},     // 20 .-.-   Ä
+    {43, 44, "P"},            // 21 .--.
+    {45, 46, "J"},            // 22 .---
+    {47, 48, "B"},            // 23 -...
+    {49, 50, "X"},            // 24 -..-
+    {51, 52, "C"},            // 25 -.-.
+    {53, 0, "Y"},             // 26 -.--
+    {55, 64, "Z"},            // 27 --..   (morse-wip: no dah child)
+    {0, 0, "Q"},              // 28 --.-   (morse-wip: dit child 57, '0')
+    {54, 0, "\xC3\x96"},      // 29 ---.   Ö
+    {56, 57, "*----*"},       // 30 ----
+    {0, 0, "5"},              // 31 .....
+    {0, 0, "4"},              // 32 ....-
+    {0, 60, "*...-.*"},       // 33 ...-.
+    {0, 0, "3"},              // 34 ...--
+    {0, 0, "e"},              // 35 ..-..
+    {0, 0, "*..-.-*"},        // 36 ..-.-
+    {58, 0, "*..--.*"},       // 37 ..--.
+    {0, 0, "2"},              // 38 ..---
+    {0, 0, "*.-...*"},        // 39 .-...
+    {0, 0, "e"},              // 40 .-..-
+    {0, 63, "<AR>"},          // 41 .-.-.
+    {0, 0, "*"},              // 42 .-.--
+    {0, 0, "*.--..*"},        // 43 .--..
+    {59, 0, "a"},             // 44 .--.-
+    {0, 0, "*.---.*"},        // 45 .---.
+    {66, 0, "1"},             // 46 .----
+    {0, 0, "6"},              // 47 -....
+    {61, 0, "<BT>"},          // 48 -...-
+    {0, 0, "/"},              // 49 -..-.
+    {0, 0, "*-..--*"},        // 50 -..--
+    {0, 0, "*-.-..*"},        // 51 -.-..
+    {0, 0, "^H"},             // 52 -.-.-
+    {0, 0, "<KN>"},           // 53 -.--.
+    {0, 0, "8"},              // 54 ---..
+    {0, 0, "7"},              // 55 --...
+    {0, 0, "9"},              // 56 ----.
+    {0, 0, "0"},              // 57 -----
+    {0, 0, "?"},              // 58 ..--..
+    {0, 0, "@"},              // 59 .--.-.
+    {0, 0, "<SK>"},           // 60 ...-.-
+    {0, 62, "*-...-.*"},      // 61 -...-.
+    {0, 0, "<BK>"},           // 62 -...-.-
+    {0, 0, "."},              // 63 .-.-.-
+    {0, 65, "*--..-*"},       // 64 --..-
+    {0, 0, ","},              // 65 --..--
+    {0, 0, "'"},              // 66 .----.
+};
+
+}  // namespace
+
+BellConfig BellConfig::listing() {
+    BellConfig c;
+    c.clamp_z = false;
+    return c;
+}
+
+BellConfig BellConfig::port() {
+    BellConfig c;
+    c.paths = 20;
+    c.wpm_min = 5;
+    c.wpm_max = 80;
+    c.port_xtrans_sign = true;
+    c.clamp_z = true;
+    return c;
+}
+
+BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
+    m_cfg.paths = std::clamp(m_cfg.paths, 7, 256);
+    m_cfg.ndelay = std::max(m_cfg.ndelay, 2);
+    reset();
+}
+
+void BellDecoder::reset() {
+    const int np = m_cfg.paths, nn = 30 * np;
+    // PROCES's DATA: ISAVE/25/, LAMBDA/25*5/, ILRATE/5*10,5*20,…,5*50/,
+    // P/750*1./, LAMSAV/750*5/, DUR/25*1000./, ILRSAV/750*20/, PATHSV/25*5/.
+    m_isave = np;
+    m_lambda.assign(np + 1, 5);
+    m_ilrate.assign(np + 1, 20);
+    for (int i = 1; i <= np; i++)
+        m_ilrate[i] = ((i - 1) / 5 % 5 + 1) * 10;
+    m_dur.assign(np + 1, 1000.0f);
+    m_pathsv.assign(np + 1, 5);
+    m_sort.assign(np + 1, 0);
+    m_p.assign(nn + 1, 1.0f);
+    m_lamsav.assign(nn + 1, 5);
+    m_dursav.assign(nn + 1, 0.0f);
+    m_ilrsav.assign(nn + 1, 20);
+    m_lkhd.assign(nn + 1, 0.0f);
+    m_pin.assign((np + 1) * 31, 0.0f);
+    m_imax = 1;
+    m_xhat = 0;
+    m_elmhat = 1;
+    m_px = m_spdhat = m_pelm = 0.0f;
+    m_rn = 0.1f;
+
+    // KALFIL's DATA: YKKIP/25*.5/, PKKIP/25*.1/.
+    m_ykkip.assign(np + 1, 0.5f);
+    m_pkkip.assign(np + 1, 0.1f);
+    m_ykksv.assign(nn + 1, 0.5f);
+    m_pkksv.assign(nn + 1, 0.1f);
+
+    // NOISE's DATA.
+    std::fill(std::begin(m_ylong), std::end(m_ylong), 1.0f);
+    std::fill(std::begin(m_yshort), std::end(m_yshort), 1.0f);
+    m_kl = m_kkl = m_ks = m_kks = 1;
+    m_ymin1 = m_ymin2 = 1.0f;
+    m_ymavg = 0.05f;
+
+    // TRELIS's DATA: PTHTRL/5000*5/, LMDSAV/5000*5/, N/0/. (morse-wip zeroes
+    // both, and the first NDELAY samples then index path 0, out of bounds.)
+    m_pthtrl.assign((m_cfg.ndelay + 1) * (np + 1), 5);
+    m_lmdsav.assign((m_cfg.ndelay + 1) * (np + 1), 5);
+    m_ipnod.assign(np + 1, 1);
+    m_ltrsv.assign(m_cfg.ndelay + 1, 0);
+    m_n = 0;
+    m_ndelst = 0;
+
+    m_ixlast = m_curstate = m_newstate = 0;
+}
+
+float BellDecoder::best_prob() const { return m_p[m_imax]; }
+float BellDecoder::amplitude() const { return m_ykkip[m_imax]; }
+
+void BellDecoder::push(float zin, std::string &out) {
+    float z;
+    noise(zin, m_rn, z);
+    if (m_cfg.clamp_z)
+        z = std::clamp(z, 0.0f, 1.0f);
+    proces(z, m_rn, out);
+}
+
+// NOISE (p. 190, and the OCR text of the page the scan lost): the noise
+// power is 0.3 × a slow average of the minimum envelope over the last 1 s
+// and 0.25 s; 2.4 × that average + 0.05 is subtracted to give a roughly
+// zero-mean key-up process. Bell chose the constants empirically for his
+// receiver (thesis §VIII); they assume a signal near unit amplitude.
+void BellDecoder::noise(float zin, float &rn, float &z) {
+    if (++m_kl == 201) m_kl = 1;
+    if (++m_ks == 51) m_ks = 1;
+    if (++m_kkl >= 200) m_kkl = 200;
+    if (++m_kks >= 50) m_kks = 50;
+    if (m_kks > 2) {
+        m_ylong[m_kl] = zin;
+        m_yshort[m_ks] = zin;
+        m_ymin1 = zin;
+        m_ymin2 = zin;
+    }
+    for (int i = 1; i <= m_kkl; i++)
+        if (m_ylong[i] <= m_ymin1) m_ymin1 = m_ylong[i];
+    for (int i = 1; i <= m_kks; i++)
+        if (m_yshort[i] <= m_ymin2) m_ymin2 = m_yshort[i];
+    const float ymin = std::min(m_ymin1, m_ymin2);
+    m_ymavg += (ymin - m_ymavg) * 0.004f;
+    rn = std::max(0.3f * m_ymavg, 0.005f);
+    z = 1.1f * (zin - 2.4f * m_ymavg - 0.05f);
+}
+
+// PROCES (p. 167–168).
+void BellDecoder::proces(float z, float rn, std::string &out) {
+    // For each saved path: transition probabilities, new nodes, likelihoods.
+    for (int i = 1; i <= m_isave; i++) {
+        trprob(i, m_lambda[i], m_dur[i], m_ilrate[i]);
+        path(i, m_lambda[i], m_dur[i], m_ilrate[i]);
+        likhd(z, rn, i, m_lambda[i], m_dur[i], m_ilrate[i]);
+    }
+    // Posterior of each new node, of the key state, element and speed.
+    // When every node scores zero the listing divides by zero; start over.
+    if (!probp()) {
+        reset();
+        return;
+    }
+    sprob();
+    m_xhat = m_px > 0.5f ? 1 : 0;
+    savep();
+    trelis(out);
+}
+
+// TRPROB (p. 169–170).
+void BellDecoder::trprob(int ip, int lambda, float dur, int ilrate) {
+    if (lambda == 0) {
+        for (int n = 1; n <= 30; n++) pin(ip, n) = 0.0f;
+        return;
+    }
+    const int ielem = ilami(lambda);
+    const float ptrx = static_cast<float>(xtrans(ielem, dur, ilrate));
+    float psum = 0.0f, pint[31] = {};
+    for (int k = 1; k <= 6; k++)
+        for (int i = 1; i <= 5; i++)
+            ptrans(k, i, lambda, ilrate, ptrx, psum, pint, (i - 1) * 6 + k);
+    // (No guard in the listing: PSUM is never 0 for a valid λ.)
+    for (int n = 1; n <= 30; n++) pin(ip, n) = psum != 0.0f ? pint[n] / psum : 0.0f;
+}
+
+// XTRANS (p. 170): P(the element lasts another 5 ms | it has lasted D0),
+// from a density centred on the nominal length with exponential tails.
+// Single precision, like the listing: whether D0 lands exactly on the
+// nominal length decides which branch runs.
+double BellDecoder::xtrans(int ielem, float d0, int irate) const {
+    const int mscale = kKimap[ielem];
+    const float rscale = 1200.0f / static_cast<float>(irate);
+    const float b0 = d0 / (static_cast<float>(mscale) * rscale);
+    const float b1 = (d0 + kSampleMs) / (static_cast<float>(mscale) * rscale);
+    float alpha;
+    if (ielem == 6) alpha = 14.0f * kAparm[3];
+    else if (ielem == 5) alpha = 7.0f * kAparm[2];
+    else alpha = static_cast<float>(mscale) * kAparm[1];
+
+    if (b1 <= 1.0f) {
+        const float p1 = 1.0f - 0.5f * std::exp(alpha * (b1 - 1.0f));
+        const float p0 = 1.0f - 0.5f * std::exp(alpha * (b0 - 1.0f));
+        return p1 / p0;
+    }
+    if (b0 < 1.0f && b1 > 1.0f) {
+        // Listing line 23600: P1=0.5*EXP(-ALPHA*(B1-1.)). morse-wip has
+        // -0.5 here (xtrans.cxx:78).
+        const float half = m_cfg.port_xtrans_sign ? -0.5f : 0.5f;
+        const float p1 = half * std::exp(-alpha * (b1 - 1.0f));
+        const float p0 = 1.0f - 0.5f * std::exp(alpha * (b0 - 1.0f));
+        return p1 / p0;
+    }
+    return std::exp(-alpha * (b1 - b0));
+}
+
+// PTRANS (p. 171).
+void BellDecoder::ptrans(int kelem, int irate, int lambda, int ilrate, float ptrx, float &psum,
+                         float *pin, int n) const {
+    const int ilelm = ilami(lambda);
+    if (kelem == ilelm) {
+        // The same element continues: the key-state probability, no speed change.
+        pin[n] = irate == 3 ? ptrx : 0.0f;
+    } else {
+        const float pelem = elemtr(lambda, kelem);
+        const float prate = static_cast<float>(spdtr(irate, ilrate, kelem, ilelm));
+        pin[n] = (1.0f - ptrx) * pelem * prate;
+    }
+    psum += pin[n];
+}
+
+// SPDTR (p. 172).
+double BellDecoder::spdtr(int isrt, int ilrt, int iselm, int ilelm) const {
+    if (ilelm == iselm) return isrt == 3 ? 1.0 : 0.0;
+    const int idel = memdel(ilelm, iselm);
+    const int ind1 = mempr(ilelm, iselm);
+    if (ind1 == 0) return 0.0;
+    const int israte = ilrt + (isrt - 3) * idel;
+    // Listing: 10 and 60 WPM; morse-wip: 5 and 80.
+    if (israte > m_cfg.wpm_max || israte < m_cfg.wpm_min) return 0.0;
+    return rtrans(isrt, ind1);
+}
+
+// PATH (p. 173–174).
+void BellDecoder::path(int ip, int lambda, float dur, int ilrate) {
+    for (int i = 1; i <= 5; i++) {
+        for (int k = 1; k <= 6; k++) {
+            const int n = (i - 1) * 6 + k;
+            const int j = (ip - 1) * 30 + n;
+            m_dursav[j] = 0.0f;
+            m_ilrsav[j] = ilrate;
+            if (lambda == 0) {
+                m_lamsav[j] = 0;
+                continue;
+            }
+            m_lamsav[j] = memfcn(lambda, k);
+            if (m_lamsav[j] == 0) continue;
+            const int ilelm = ilami(lambda);
+            const int ixl = ilamx(ilelm);
+            const int ixs = isx(k);
+            // The duration grows while the key state stays, restarts on a change.
+            m_dursav[j] = dur * static_cast<float>(1 - ixs - ixl + 2 * ixs * ixl) + kSampleMs;
+            m_ilrsav[j] = ilrate + (i - 3) * memdel(ilelm, k);
+        }
+    }
+}
+
+// LIKHD (p. 174–175).
+void BellDecoder::likhd(float z, float rn, int ip, int lambda, float dur, int ilrate) {
+    if (lambda == 0) {
+        // (The listing indexes ILAMI(IELMST(0)) here; the node's PIN is 0.)
+        for (int n = 1; n <= 30; n++) m_lkhd[(ip - 1) * 30 + n] = 0.0f;
+        return;
+    }
+    const int kelem = ilami(lambda);
+    for (int k = 1; k <= 6; k++) {
+        for (int i = 1; i <= 5; i++) {
+            const int n = (i - 1) * 6 + k;
+            const int j = (ip - 1) * 30 + n;
+            m_lkhd[j] = kalfil(z, ip, rn, isx(k), kelem, j, dur, ilrate, pin(ip, n));
+        }
+    }
+}
+
+// KALFIL (p. 176–177): one scalar Kalman step on the amplitude for this
+// extension, and the Gaussian likelihood of the innovation.
+float BellDecoder::kalfil(float z, int ip, float rn, int ixs, int kelem, int jnode, float dur,
+                          int ilrate, float pin) {
+    constexpr float kPinMin = 0.0001f;
+    if (pin <= kPinMin) {
+        // Not scored. (The listing leaves YKKSV/PKKSV stale; a zero-mass
+        // node can still be saved when SAVEP runs out of mass.)
+        m_ykksv[jnode] = m_ykkip[ip];
+        m_pkksv[jnode] = m_pkkip[ip];
+        return 0.0f;
+    }
+    float phi, qa;
+    model(dur, kelem, ilrate, ixs, phi, qa);
+    const float hz = static_cast<float>(ixs);
+    const float ykk = m_ykkip[ip], pkk = m_pkkip[ip];
+    const float ypred = phi * ykk;
+    const float ppred = phi * pkk * phi + qa;
+    const float pz = hz * ppred + rn;
+    const float pzinv = 1.0f / pz;
+    const float g = ppred * hz * pzinv;
+    const float pest = (1.0f - g * hz) * ppred;
+    const float zr = z - hz * ypred;
+    m_ykksv[jnode] = std::max(ypred + g * zr, 0.01f);
+    m_pkksv[jnode] = pest;
+    const float a = 0.5f * pzinv * zr * zr;
+    if (a > 1000.0f) return 0.0f;
+    return std::exp(-a) / std::sqrt(pz);
+}
+
+// MODEL (p. 177–178): during a mark the amplitude is a slow random walk;
+// during a space it decays towards 0 with no process noise; entering a mark
+// after a space adds variance that grows with the space's length.
+void BellDecoder::model(float dur, int ielm, int ilr, int ixs, float &phi, float &qa) const {
+    const float r1 = 1200.0f / static_cast<float>(ilr);
+    const float bauds = std::min(dur / r1, 14.0f);
+    if (ielm < 3) {
+        qa = 0.0001f;
+        phi = 1.0f;
+        return;
+    }
+    if (ixs != 0) {
+        phi = 1.0f;
+        qa = 0.15f * std::exp(0.6f * (bauds - 14.0f));
+        qa += 0.01f * bauds * std::exp(0.2f * (1.0f - bauds));
+        return;
+    }
+    const float xsamp = 22.4f * r1;
+    phi = bauds >= 14.0f ? 1.0f : std::pow(10.0f, -2.0f / xsamp);
+    qa = 0.0f;
+}
+
+// PROBP (p. 178–179). false when no node has any mass.
+bool BellDecoder::probp() {
+    const int ni = 30 * m_isave;
+    std::vector<float> psav(ni + 1, 0.0f);
+    double psum = 0.0;
+    for (int i = 1; i <= m_isave; i++) {
+        for (int n = 1; n <= 30; n++) {
+            const int j = (i - 1) * 30 + n;
+            psav[j] = m_p[i] * pin(i, n) * m_lkhd[j];
+            psum += psav[j];
+        }
+    }
+    if (!(psum > 0.0)) return false;
+    for (int j = 1; j <= ni; j++) m_p[j] = static_cast<float>(psav[j] / psum);
+    return true;
+}
+
+// SPROB (p. 179–180).
+void BellDecoder::sprob() {
+    float pselem[7] = {};
+    m_spdhat = 0.0f;
+    m_px = 0.0f;
+    for (int k = 1; k <= 6; k++) {
+        for (int i = 1; i <= 5; i++) {
+            const int n = (i - 1) * 6 + k;
+            for (int m = 1; m <= m_isave; m++) {
+                const int j = (m - 1) * 30 + n;
+                pselem[k] += m_p[j];
+                m_spdhat += static_cast<float>(m_ilrsav[j]) * m_p[j];
+                if (k <= 2) m_px += m_p[j];
+            }
+        }
+    }
+    m_pelm = 0.0f;
+    for (int k = 1; k <= 6; k++) {
+        if (pselem[k] >= m_pelm) {
+            m_pelm = pselem[k];
+            m_elmhat = k;
+        }
+    }
+}
+
+// SAVEP (p. 180–183): keep the best node of each element type, then the
+// best of the rest until POPT of the mass or PATHS nodes are kept; merge
+// nodes with the same (λ, duration, speed), keeping the more probable.
+void BellDecoder::savep() {
+    const int np = m_cfg.paths;
+    std::vector<float> psav(np + 1, 0.0f);
+    int nsav = 0;
+    double psum = 0.0;
+    int jsav = 0, ipsav = 0;
+
+    for (int k = 1; k <= 6; k++) {
+        float pmax = 0.0f;
+        for (int ip = 1; ip <= m_isave; ip++) {
+            for (int i = 1; i <= 5; i++) {
+                const int j = (ip - 1) * 30 + (i - 1) * 6 + k;
+                if (m_p[j] >= pmax) {
+                    pmax = m_p[j];
+                    jsav = j;
+                    ipsav = ip;
+                }
+            }
+        }
+        if (pmax >= 0.000001f) {
+            nsav++;
+            psum += pmax;
+            psav[nsav] = pmax;
+            m_pathsv[nsav] = ipsav;
+            m_sort[nsav] = jsav;
+        }
+    }
+
+    do {
+        float pmax = 0.0f;
+        bool found = false;
+        for (int ip = 1; ip <= m_isave; ip++) {
+            for (int n = 1; n <= 30; n++) {
+                const int j = (ip - 1) * 30 + n;
+                if (std::find(m_sort.begin() + 1, m_sort.begin() + nsav + 1, j) !=
+                    m_sort.begin() + nsav + 1)
+                    continue;
+                if (m_p[j] > pmax) {
+                    pmax = m_p[j];
+                    jsav = j;
+                    ipsav = ip;
+                    found = true;
+                }
+            }
+        }
+        // (The listing saves the previous JSAV again when nothing is left;
+        // the merge below then drops the copy. Stop instead.)
+        if (!found) break;
+        psum += pmax;
+        nsav++;
+        psav[nsav] = pmax;
+        m_pathsv[nsav] = ipsav;
+        m_sort[nsav] = jsav;
+    } while (psum < m_cfg.popt && nsav < np);
+
+    m_isave = nsav;
+    for (int i = 1; i <= m_isave; i++) {
+        m_p[i] = static_cast<float>(psav[i] / psum);
+        m_lambda[i] = m_lamsav[m_sort[i]];
+        m_dur[i] = m_dursav[m_sort[i]];
+        m_ilrate[i] = m_ilrsav[m_sort[i]];
+        m_ykkip[i] = m_ykksv[m_sort[i]];
+        m_pkkip[i] = m_pkksv[m_sort[i]];
+    }
+
+    // Merge identical nodes: the first of each kind stays, the others go,
+    // and their mass with them.
+    std::vector<char> iconv(m_isave + 1, 1);
+    for (int n = 1; n < m_isave; n++) {
+        if (!iconv[n]) continue;
+        for (int k = n + 1; k <= m_isave; k++) {
+            if (iconv[k] && m_ilrate[k] == m_ilrate[n] && m_dur[k] == m_dur[n] &&
+                m_lambda[k] == m_lambda[n])
+                iconv[k] = 0;
+        }
+    }
+    // The listing starts this sum at 0, leaving P(1) out of the normalisation
+    // (line 40800); morse-wip starts it at P(1), as here.
+    psum = m_p[1];
+    int n = 1;
+    for (int i = 2; i <= m_isave; i++) {
+        if (!iconv[i]) continue;
+        n++;
+        m_lambda[n] = m_lambda[i];
+        m_dur[n] = m_dur[i];
+        m_ilrate[n] = m_ilrate[i];
+        m_ykkip[n] = m_ykkip[i];
+        m_pkkip[n] = m_pkkip[i];
+        m_pathsv[n] = m_pathsv[i];
+        m_sort[n] = m_sort[i];
+        m_p[n] = m_p[i];
+        psum += m_p[n];
+    }
+    m_isave = n;
+    float pmax = 0.0f;
+    m_imax = 1;
+    for (int i = 1; i <= m_isave; i++) {
+        m_p[i] = static_cast<float>(m_p[i] / psum);
+        if (m_p[i] > pmax) {
+            pmax = m_p[i];
+            m_imax = i;
+        }
+    }
+}
+
+// TRELIS (p. 184–186): the saved nodes go into a circular trellis of
+// NDELAY stages; when the paths back from every saved node meet, the letter
+// states from the previous meeting point to this one are final. Without a
+// meeting within NDELAY, the best path is read and the others are pruned.
+void BellDecoder::trelis(std::string &out) {
+    const int ndelay = m_cfg.ndelay;
+    auto wrap = [ndelay](int i) { return i <= 0 ? ndelay + i : i; };
+
+    if (++m_n == ndelay + 1) m_n = 1;
+    for (int i = 1; i <= m_isave; i++) {
+        pthtrl(m_n, i) = m_pathsv[i];
+        lmdsav(m_n, i) = m_lambda[i];
+    }
+
+    for (int i = 1; i <= m_isave; i++) m_ipnod[i] = i;
+    int ipmax = m_imax, ndel = 0;
+    for (int k = 1;; k++) {
+        if (k == ndelay) {
+            // No convergence within NDELAY: read the best path.
+            ndel = ndelay;
+            transl(lmdsav(wrap(m_n - ndelay + 1), ipmax), out);
+            for (int j = 1; j <= m_isave; j++)
+                if (m_ipnod[j] != ipmax) m_lambda[j] = 0;
+            break;
+        }
+        const int i = wrap(m_n - k + 1);
+        for (int ip = 1; ip <= m_isave; ip++) {
+            m_ipnod[ip] = pthtrl(i, m_ipnod[ip]);
+            if (ip == m_imax) ipmax = m_ipnod[ip];
+        }
+        bool converged = true;
+        for (int ieq = 2; ieq <= m_isave; ieq++)
+            if (m_ipnod[1] != m_ipnod[ieq]) { converged = false; break; }
+        if (!converged) continue;
+
+        ndel = k + 1;
+        if (ndel == m_ndelst + 1) break;               // nothing new since the last call
+        if (ndel == m_ndelst) {
+            transl(lmdsav(wrap(m_n - ndel + 1), m_ipnod[1]), out);
+            break;
+        }
+        // The meeting point moved closer: read every stage from it back to
+        // the previous one, then translate them in time order.
+        int kd = 0, ipath = m_ipnod[1];
+        for (int kk = ndel; kk <= m_ndelst; kk++) {
+            const int ii = wrap(m_n - kk + 1);
+            m_ltrsv[++kd] = lmdsav(ii, ipath);
+            ipath = pthtrl(ii, ipath);
+        }
+        for (int j = 1; j <= kd; j++) transl(m_ltrsv[kd - j + 1], out);
+        break;
+    }
+    m_ndelst = ndel;
+}
+
+// TRANSL: morse-wip's. The listing's TRANSL (p. 186–188) maps letter states
+// of the tree model through LTRMAP; the 16-state model's states are element
+// pairs, so a code tree assembles them: a mark start steps the tree, a
+// character space, word space or pause after a mark emits the character.
+// (morse-wip writes each character over the previous one in one buffer, so
+// a trellis step that settles several letters keeps only the last; here
+// they are appended.)
+void BellDecoder::transl(int ltr, std::string &out) {
+    if (ltr < 1 || ltr > 16) return;
+    const int ixl = ilamx(ilami(ltr));
+    if (ixl != m_ixlast) {
+        switch (ltr) {
+        case 9: case 11: case 13: case 15:             // ^. ~. w. p.
+            m_newstate = kTree[m_curstate].dit;
+            break;
+        case 10: case 12: case 14: case 16:            // ^- ~- w- p-
+            m_newstate = kTree[m_curstate].dah;
+            break;
+        case 2: case 6:                                // .~ -~
+            out += kTree[m_curstate].chr;
+            m_newstate = 0;
+            break;
+        case 3: case 7: case 4: case 8:                // .w -w .p -p
+            out += kTree[m_curstate].chr;
+            out += ' ';
+            m_newstate = 0;
+            break;
+        default:                                       // .^ -^
+            break;
+        }
+    }
+    m_curstate = m_newstate;
+    m_ixlast = ixl;
+}

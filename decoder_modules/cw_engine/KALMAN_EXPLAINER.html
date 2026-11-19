@@ -1,0 +1,956 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kalman Gain Tracking for CW</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Space+Grotesk:wght@500;600;700&display=swap">
+<style>
+/* Layout: one reading column (~68ch) with wide figures and the two labs breaking out to 1040px. */
+:root {
+  --bg: #f3f6f7;
+  --surface: #ffffff;
+  --sunk: #e8eef1;
+  --fg: #142029;
+  --muted: #566573;
+  --line: #d3dce2;
+  --accent: #0a6a86;
+  --accent-soft: rgba(10, 106, 134, 0.16);
+  --truth: #a85b16;
+  --bad: #b42318;
+  --good: #2b7a4b;
+  --warn: #9a6a00;
+  --shade: rgba(20, 32, 41, 0.07);
+  --f-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e151a; --surface: #152029; --sunk: #1b2933; --fg: #e2e9ee; --muted: #93a3b0; --line: #2a3a45;
+    --accent: #52b6d4; --accent-soft: rgba(82, 182, 212, 0.20); --truth: #e39a55; --bad: #f2776c; --good: #6cc792; --warn: #e0b54a;
+    --shade: rgba(226, 233, 238, 0.07); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e151a; --surface: #152029; --sunk: #1b2933; --fg: #e2e9ee; --muted: #93a3b0; --line: #2a3a45;
+  --accent: #52b6d4; --accent-soft: rgba(82, 182, 212, 0.20); --truth: #e39a55; --bad: #f2776c; --good: #6cc792; --warn: #e0b54a;
+  --shade: rgba(226, 233, 238, 0.07); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 16.5px; line-height: 1.62;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 64px;
+}
+main { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 0; }
+.col { max-width: 68ch; width: 100%; margin: 0 auto; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.2; letter-spacing: -0.01em; }
+h1 { font-size: clamp(2rem, 4.6vw, 3rem); margin: 0 0 12px; font-weight: 700; }
+h2 { font-size: 1.6rem; margin: 56px 0 10px; font-weight: 600; }
+h3 { font-size: 1.15rem; margin: 28px 0 6px; font-weight: 600; }
+p { margin: 0 0 14px; }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code, .mono { font-family: var(--f-mono); font-size: 0.88em; }
+code { background: var(--sunk); padding: 1px 5px; border-radius: 4px; }
+.eyebrow { font-family: var(--f-mono); font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+header.top { padding-block: 48px 8px; }
+.lede { font-size: 1.12rem; color: var(--fg); }
+.sub { color: var(--muted); font-size: 0.95rem; }
+.sec-no { font-family: var(--f-mono); font-size: 0.8rem; color: var(--accent); letter-spacing: 0.06em; display: block; margin-bottom: 4px; }
+.eq {
+  font-family: var(--f-mono); font-size: 0.9rem; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 6px; padding: 12px 14px; margin: 0 0 16px; overflow-x: auto; white-space: pre; line-height: 1.55;
+}
+.eq .c { color: var(--muted); }
+ul, ol { margin: 0 0 14px; padding-left: 1.3em; }
+li { margin-bottom: 6px; }
+li::marker { color: var(--muted); }
+.answers { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px 6px; margin: 18px 0 8px; }
+.answers h2 { margin-top: 0; font-size: 1.15rem; }
+.answers dl { margin: 0; display: grid; grid-template-columns: minmax(0, 14em) minmax(0, 1fr); gap: 10px 18px; }
+.answers dt { font-weight: 600; font-family: var(--f-display); }
+.answers dd { margin: 0; }
+@media (max-width: 640px) { .answers dl { grid-template-columns: minmax(0, 1fr); gap: 2px 0; } .answers dd { margin-bottom: 10px; } }
+figure { margin: 18px 0 22px; }
+figure .svgwrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+figcaption { font-size: 0.88rem; color: var(--muted); margin-top: 6px; }
+svg text { font-family: var(--f-body); fill: var(--fg); }
+svg .m { fill: var(--muted); }
+svg .mono { font-family: var(--f-mono); }
+.tbl { overflow-x: auto; margin: 0 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--f-display); font-weight: 600; font-size: 0.85rem; color: var(--muted); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--f-mono); font-size: 0.86rem; }
+.lab { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 22px 0; }
+.lab h3 { margin-top: 0; }
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 18px; margin-bottom: 14px; }
+.ctl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ctl label { font-size: 0.8rem; color: var(--muted); font-family: var(--f-mono); letter-spacing: 0.02em; display: flex; justify-content: space-between; gap: 8px; }
+.ctl label b { color: var(--fg); font-weight: 500; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+select, button { font: inherit; font-size: 0.9rem; color: var(--fg); background: var(--sunk); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+.seg { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; width: fit-content; max-width: 100%; flex-wrap: wrap; }
+.seg button { border: 0; border-radius: 0; background: transparent; padding: 6px 12px; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
+canvas { display: block; width: 100%; background: var(--bg); border-radius: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.82rem; color: var(--muted); margin: 8px 0 12px; }
+.legend span::before { content: ""; display: inline-block; width: 18px; height: 3px; border-radius: 2px; background: var(--c); vertical-align: middle; margin-right: 6px; }
+.legend span.box::before { height: 10px; background: var(--c); opacity: 0.9; }
+.metrics td.best { color: var(--good); font-weight: 500; }
+.note { font-size: 0.88rem; color: var(--muted); }
+.callout { border-left: 3px solid var(--accent); padding: 4px 0 4px 14px; margin: 0 0 16px; }
+.finding { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.finding:first-of-type { border-top: 1px solid var(--line); }
+.finding .tag { font-family: var(--f-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; height: fit-content; white-space: nowrap; border: 1px solid currentColor; }
+.tag.bug { color: var(--bad); }
+.tag.model { color: var(--warn); }
+.finding h3 { margin: 0 0 4px; font-size: 1.02rem; }
+.finding p { margin: 0 0 8px; }
+.finding .loc { font-family: var(--f-mono); font-size: 0.8rem; color: var(--muted); }
+.steps { counter-reset: s; list-style: none; padding: 0; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 2.2em minmax(0, 1fr); gap: 0 10px; margin-bottom: 12px; }
+.steps li::before { content: counter(s); font-family: var(--f-mono); color: var(--accent); font-size: 0.9rem; padding-top: 2px; }
+.readout { font-family: var(--f-mono); font-size: 0.85rem; background: var(--sunk); border-radius: 6px; padding: 10px 12px; margin-top: 10px; line-height: 1.6; }
+.readout .neg { color: var(--bad); font-weight: 500; }
+.refs li { font-size: 0.9rem; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<main>
+<header class="top col">
+  <p class="eyebrow">cw_engine · fading tracker · explainer</p>
+  <h1>Kalman gain tracking for Morse on a Watterson channel</h1>
+  <p class="lede">How a Kalman filter follows the HF fading gain of a CW signal, what changes when the keying is unknown, why that looks like a chicken-and-egg problem and is not one, and what went wrong with E.&nbsp;L.&nbsp;Bell's 1977 Bayesian Morse decoder.</p>
+  <p class="sub">Grounded in <code>FADING_TRACKER.md</code>, <code>BAYESIAN_DECODING.md</code> and <code>ALGORITHM.md</code> §5.2–5.4, in Bell's thesis listing, and in AG1LE's C port of it (<code>ag1le/morse-wip</code>, last commit 2014-08-29). The corrected decoder is the bench backend <code>bell</code>; <code>BELL.md</code> has the routine-by-routine comparison. The simulations on this page run in your browser.</p>
+</header>
+
+<section class="col">
+<div class="answers">
+  <h2>Short answers</h2>
+  <dl>
+    <dt>Steady carrier, coherent</dt>
+    <dd>Linear and Gaussian, so the Kalman filter is the exact optimum. The state is the complex gain as an AR(2) process whose poles come from the Doppler spread B.</dd>
+    <dt>Steady carrier, non-coherent</dt>
+    <dd>The envelope is Rician, not Gaussian, so a Kalman filter on it is an approximation (an EKF) and it throws away the phase continuity. With I/Q samples there is no reason to use it: the complex filter already turns into an energy detector by itself when the gain stops being predictable.</dd>
+    <dt>Morse, keying known</dt>
+    <dd>Still exact: the measurement matrix becomes the keying k<sub>t</sub> ∈ {0, 1}. In a space the filter only predicts, and its uncertainty grows.</dd>
+    <dt>Morse, keying unknown</dt>
+    <dd>A switching state-space model. The loop between "gain needs keying" and "keying needs gain" exists only if you estimate one and plug it into the other. If you condition instead (one Kalman filter per keying hypothesis, scored by its own innovation), the loop goes away. The price is a hypothesis tree that grows exponentially and has to be pruned or merged.</dd>
+    <dt>Does non-coherent make sense?</dt>
+    <dd>Only where phase is unavailable or not trustworthy (an audio envelope, an uncorrected frequency drift), or as a cheap level estimate. In this page's simulator it loses to the plain untracked energy detector below about 0 dB SNR<sub>500</sub>.</dd>
+    <dt>How Bell did it</dt>
+    <dd>Exactly the conditioning route. Each surviving path through a Morse element/speed/duration trellis carries its own scalar Kalman filter on the envelope amplitude. Up to 750 extensions per 5&nbsp;ms are scored, and the best 7–25 are kept.</dd>
+    <dt>Why it failed in practice</dt>
+    <dd>The C port added a sign error to the duration model that the thesis listing does not have. It forbids any element from outlasting its nominal length at most speeds, and it runs words together. Fixed, the decoder makes 1.4–5× fewer errors than the port. What remains is Bell's own: noise constants fitted to his receiver, no idle state, and an amplitude model that grows overconfident in spaces.</dd>
+  </dl>
+</div>
+</section>
+
+<!-- 1 -->
+<section class="col">
+  <span class="sec-no">§1 · the channel</span>
+  <h2>What the Watterson model looks like inside one CW channel</h2>
+  <p>ITU-R F.1487 describes the HF channel as a tapped delay line. Each path has a complex Gaussian gain with a Gaussian Doppler spectrum. Inside a 125&nbsp;Hz CW channel the delay spread (0.5–7&nbsp;ms) smears each key edge by at most two samples, and the unbiased dit already cancels that. So the paths collapse into one complex gain h<sub>t</sub>:</p>
+  <div class="eq">z<sub>t</sub> = k<sub>t</sub> · h<sub>t</sub> + n<sub>t</sub>      <span class="c">k_t ∈ {0,1} keying, h_t complex gain, n_t ~ CN(0, σ²)</span>
+E[h<sub>t</sub> h*<sub>t−τ</sub>] = P · exp(−2π² σ<sub>f</sub>² τ²)      <span class="c">Gaussian Doppler spectrum, B = 2σ_f</span></div>
+  <p>Two equal paths with the same spread sum to one Gaussian process with the same spectrum. That is why ITU good, moderate and poor (0.1 / 0.5 / 1&nbsp;Hz) are each a single fading process to this decoder. The number that matters is how long the gain stays predictable compared with a Morse element:</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th>Doppler spread B</th><th class="num">half-correlation time</th><th class="num">dits at 25 WPM</th><th>regime</th></tr></thead>
+    <tbody>
+      <tr><td>0.1 Hz (ITU good)</td><td class="num">3.7 s</td><td class="num">78</td><td>gain known across many characters</td></tr>
+      <tr><td>0.5 Hz (moderate)</td><td class="num">0.75 s</td><td class="num">16</td><td>known across a few elements</td></tr>
+      <tr><td>1 Hz (poor)</td><td class="num">0.37 s</td><td class="num">8</td><td>known from one element to the next</td></tr>
+      <tr><td>3 Hz</td><td class="num">0.125 s</td><td class="num">2.6</td><td>barely across a space</td></tr>
+      <tr><td>10 Hz (high latitude)</td><td class="num">37 ms</td><td class="num">0.8</td><td>not predictable: energy detection</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">The half-correlation time is τ½ = √(ln 2 / 2π²σ<sub>f</sub>²) = 0.375 / B.</p>
+  <figure>
+    <div class="svgwrap">
+    <svg viewBox="0 0 900 190" width="100%" style="min-width:640px" role="img" aria-label="Signal model: keying times complex fading gain plus noise gives the observation, which feeds either a coherent or a non-coherent tracker">
+      <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+      <g style="stroke:var(--line);fill:var(--sunk)" stroke-width="1.2">
+        <rect x="10" y="20" width="170" height="56" rx="6"/>
+        <rect x="10" y="112" width="170" height="56" rx="6"/>
+        <rect x="370" y="112" width="120" height="56" rx="6"/>
+        <rect x="600" y="20" width="290" height="56" rx="6"/>
+        <rect x="600" y="112" width="290" height="56" rx="6"/>
+      </g>
+      <circle cx="270" cy="48" r="16" style="fill:var(--surface);stroke:var(--muted)"/>
+      <circle cx="430" cy="48" r="16" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="263" y="54" font-size="18">×</text><text x="423" y="54" font-size="18">+</text>
+      <text x="22" y="44" font-size="14" font-weight="600">keying k_t ∈ {0,1}</text>
+      <text x="22" y="64" font-size="12" class="m">semi-Markov, unknown speed</text>
+      <text x="22" y="136" font-size="14" font-weight="600">gain h_t (complex)</text>
+      <text x="22" y="156" font-size="12" class="m">Gaussian Doppler, spread B</text>
+      <text x="382" y="136" font-size="14" font-weight="600">noise n_t</text>
+      <text x="382" y="156" font-size="12" class="m">CN(0, σ²)</text>
+      <text x="612" y="44" font-size="14" font-weight="600">coherent: use z_t (I/Q)</text>
+      <text x="612" y="64" font-size="12" class="m">complex KF, linear-Gaussian given k_t</text>
+      <text x="612" y="136" font-size="14" font-weight="600">non-coherent: use |z_t| or |z_t|²</text>
+      <text x="612" y="156" font-size="12" class="m">phase discarded, Rician, needs EKF/UKF</text>
+      <g style="stroke:var(--muted)" stroke-width="1.4" fill="none" marker-end="url(#ar)">
+        <path d="M180,48 H252"/><path d="M180,140 H270 V66"/><path d="M286,48 H412"/><path d="M430,112 V66"/>
+        <path d="M446,48 H520 V48 H596"/><path d="M520,48 V140 H596"/>
+      </g>
+      <text x="470" y="40" font-size="13" class="mono">z_t</text>
+    </svg>
+    </div>
+    <figcaption>The observation model. Everything below is about estimating h<sub>t</sub> when k<sub>t</sub> is, or is not, known.</figcaption>
+  </figure>
+  <h3>A state model for the gain</h3>
+  <p>The Kalman filter needs a finite-order Markov model of h<sub>t</sub>. AR(1) has a Lorentzian spectrum: it trusts the gain too little at short lags and too much at long ones. AR(2) fits the flat-topped Gaussian correlation much better, and higher orders are numerically fragile (Baddour &amp; Beaulieu 2005). The labs below use AR(2) with a double real pole p, chosen so that its correlation matches the Gaussian one at ρ = 0.5:</p>
+  <div class="eq">x<sub>t</sub> = [h<sub>t</sub>, h<sub>t−1</sub>]ᵀ,   x<sub>t</sub> = F x<sub>t−1</sub> + [w<sub>t</sub>, 0]ᵀ
+F = | 2p  −p² |      var(w) = P (1−p²)³ / (1+p²)    <span class="c">keeps E|h|² = P</span>
+    | 1    0  |
+ρ<sub>AR2</sub>(k) = p<sup>k</sup> (1 + k (1−p²)/(1+p²))</div>
+  <p>A residual carrier offset δf rotates the gain. Folding it in means multiplying the first row of F by e<sup>jω</sup> and e<sup>j2ω</sup>, with ω = 2πδf·T. If it is left out, the filter reads the rotation as fast fading. That is one reason the cw_engine AFC stays in front of the tracker.</p>
+</section>
+
+<!-- 2 -->
+<section class="col">
+  <span class="sec-no">§2 · steady carrier, coherent</span>
+  <h2>A steady carrier with I/Q samples: the textbook case</h2>
+  <p>With k<sub>t</sub> = 1 and complex samples, the model is linear with Gaussian noise. The Kalman filter computes the exact posterior p(h<sub>t</sub> | z<sub>1:t</sub>) = CN(μ<sub>t</sub>, V<sub>t</sub>). The recursion is the familiar one, with H = [1, 0]:</p>
+  <div class="eq"><span class="c">predict</span>   x⁻ = F x̂,     Σ⁻ = F Σ Fᵀ + Q             μ = x⁻[0],  V = Σ⁻[0,0]
+<span class="c">update</span>    s = V + σ²,   K = Σ⁻[:,0] / s,   x̂ = x⁻ + K (z − μ),   Σ = Σ⁻ − K Σ⁻[0,:]</div>
+  <p>Because F, Q and H are real and the noise is circular, Σ stays real. Only the mean is complex, so this is cheap: about 100 flops per observation, or about 40 Mflop/s for 1536 channels at 250&nbsp;Hz (FADING_TRACKER.md §5).</p>
+  <p>The equilibrium uncertainty V/P is the useful single number. It is small when B·T is small and the SNR is high, because many past samples then predict the next one. It rises toward 1 when the gain decorrelates faster than the noise can be averaged out. The lab below prints V/P for both coherent trackers.</p>
+</section>
+
+<!-- 3 -->
+<section class="col">
+  <span class="sec-no">§3 · steady carrier, non-coherent</span>
+  <h2>Without phase: what a non-coherent Kalman filter can and cannot do</h2>
+  <p>"Non-coherent" here means the tracker sees only y<sub>t</sub> = |z<sub>t</sub>| (or |z<sub>t</sub>|²), as Bell's receiver did: a band-pass filter, an envelope detector and a 200&nbsp;Hz sampler. Three things go wrong for a Kalman filter on y.</p>
+  <ol>
+    <li><b>The amplitude is not Gauss-Markov.</b> |h| is Rayleigh distributed and bounded at zero. A Gaussian state around a mean of √(πP)/2 is a moment fit that cannot represent a deep fade well.</li>
+    <li><b>The observation is not Gaussian.</b> Given A = |h|, y is Rician. At high SNR it is close to N(A, σ²/2). At low SNR it is skewed and biased upward (E[y | A = 0] = 0.886σ), which is exactly where the decoder needs the evidence. An EKF with a mean function √(A² + πσ²/4) fixes the bias but not the shape.</li>
+    <li><b>Phase continuity is lost.</b> With I/Q samples, the filter predicts the next complex value, phase included, so its evidence works like a matched filter against the prediction. On the envelope it can only say "about this strong", and its noise is the full envelope noise.</li>
+  </ol>
+  <p>The coherent filter does not need a separate non-coherent mode. Its key-down log-likelihood ratio, given the predicted gain, is</p>
+  <div class="eq">llr<sub>t</sub> = ln CN(z<sub>t</sub>; μ, σ² + V) − ln CN(z<sub>t</sub>; 0, σ²)</div>
+  <p>When the gain is well known (V ≪ P) this is a matched filter against μ. When the gain is unknown (V → P, μ → 0) it becomes |z|²·(1/σ² − 1/(σ²+P)) − ln(1 + P/σ²), which is the energy detector for a Rayleigh-faded mark. A correctly specified complex tracker therefore moves between the coherent and non-coherent regimes by itself, as the Doppler spread changes.</p>
+  <div class="callout">
+    <p><b>So does a non-coherent Kalman filter make sense?</b> As the main evidence source with I/Q samples available, no: it is strictly less informed and needs an approximate likelihood. It does make sense in three narrower roles:</p>
+    <ul>
+      <li>when there is no phase, as in Bell's audio front end;</li>
+      <li>when the phase cannot be trusted, for example chirp or drift faster than the AFC follows;</li>
+      <li>as a cheap level estimate for a squelch or an SNR readout.</li>
+    </ul>
+    <p>A principled non-coherent tracker would put a Gamma-type filter on |z|² (exponential observations) or use a particle filter, rather than a Gaussian Kalman filter on |z|.</p>
+  </div>
+</section>
+
+<!-- 4 -->
+<section class="col">
+  <span class="sec-no">§4 · keyed carrier, keying known</span>
+  <h2>Morse with known keying: still exact</h2>
+  <p>If someone hands you k<sub>t</sub>, the model stays linear-Gaussian with a time-varying measurement matrix H<sub>t</sub> = [k<sub>t</sub>, 0]. In a space the update is skipped: the filter coasts on its prediction and V grows toward P at the rate the Doppler spread sets. In a mark it updates. Through a long word space at 1&nbsp;Hz spread, the filter forgets most of the phase but keeps a useful idea of the level.</p>
+  <p>This is the pilot-symbol situation of FreeDV and the MIL-STD-188-110 modems, where key-down periods are known in advance. It is the "oracle" curve in the lab, an upper bound that no real decoder reaches.</p>
+</section>
+
+<!-- 5 -->
+<section class="col">
+  <span class="sec-no">§5 · keyed carrier, keying unknown</span>
+  <h2>Unknown keying: the cyclic dependency, and why conditioning removes it</h2>
+  <p>Now k<sub>t</sub> is what we want to decode. The tracker needs k<sub>t</sub> to know when to update, and the keying detector needs h<sub>t</sub> to know how strong a mark should be. On top of that the keying model (the dit length, the fist) is itself unknown at the start of an over.</p>
+  <figure>
+    <div class="svgwrap">
+    <svg viewBox="0 0 900 250" width="100%" style="min-width:640px" role="img" aria-label="Left: the plug-in loop between gain tracker and keying detector. Right: the joint posterior factorised into a Kalman filter per keying hypothesis.">
+      <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+      <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+      <text x="20" y="24" font-size="13" font-weight="600" class="m">PLUG-IN (decision-directed)</text>
+      <g style="stroke:var(--line);fill:var(--sunk)"><rect x="20" y="50" width="160" height="60" rx="6"/><rect x="250" y="50" width="160" height="60" rx="6"/></g>
+      <text x="34" y="76" font-size="14" font-weight="600">gain tracker</text><text x="34" y="96" font-size="12" class="m">needs k̂_t</text>
+      <text x="264" y="76" font-size="14" font-weight="600">keying decoder</text><text x="264" y="96" font-size="12" class="m">needs ĥ_t, dit</text>
+      <path d="M180,66 C210,40 222,40 248,66" fill="none" style="stroke:var(--muted)" stroke-width="1.4" marker-end="url(#ar2)"/>
+      <path d="M250,96 C220,124 208,124 182,96" fill="none" style="stroke:var(--muted)" stroke-width="1.4" marker-end="url(#ar2)"/>
+      <text x="196" y="38" font-size="12" class="m mono">ĥ</text><text x="196" y="136" font-size="12" class="m mono">k̂</text>
+      <text x="20" y="170" font-size="12.5">Hard estimates go round the loop.</text>
+      <text x="20" y="188" font-size="12.5">A wrong fixed point (noise tracked as signal,</text>
+      <text x="20" y="206" font-size="12.5">wrong speed) is self-confirming.</text>
+      <line x1="450" y1="20" x2="450" y2="230" style="stroke:var(--line)"/>
+      <text x="480" y="24" font-size="13" font-weight="600" style="fill:var(--accent)">CONDITIONED (Rao-Blackwellised)</text>
+      <text x="480" y="52" font-size="13.5" class="mono">p(h_t, k_1:t | z) = p(h_t | k_1:t, z) · P(k_1:t | z)</text>
+      <text x="530" y="74" font-size="12" class="m">Kalman filter, exact</text><text x="726" y="74" font-size="12" class="m">tree / lattice</text>
+      <g fill="none" style="stroke:var(--accent)" stroke-width="1.5">
+        <path d="M500,150 L560,110"/><path d="M500,150 L560,190"/>
+        <path d="M580,110 L640,92"/><path d="M580,110 L640,128"/><path d="M580,190 L640,172"/><path d="M580,190 L640,208"/>
+      </g>
+      <g style="fill:var(--surface);stroke:var(--accent)" stroke-width="1.5">
+        <circle cx="500" cy="150" r="9"/><circle cx="570" cy="110" r="9"/><circle cx="570" cy="190" r="9"/>
+        <circle cx="650" cy="92" r="9"/><circle cx="650" cy="128" r="9"/><circle cx="650" cy="172" r="9"/><circle cx="650" cy="208" r="9"/>
+      </g>
+      <text x="676" y="96" font-size="12" class="mono">KF(μ,V) · P(path)</text>
+      <text x="676" y="132" font-size="12" class="mono">KF(μ,V) · P(path)</text>
+      <text x="676" y="176" font-size="12" class="mono">KF(μ,V) · P(path)</text>
+      <text x="676" y="212" font-size="12" class="mono">KF(μ,V) · P(path)</text>
+      <text x="480" y="242" font-size="12.5">Each branch's filter assumes that branch's keying; its innovation scores the branch.</text>
+    </svg>
+    </div>
+    <figcaption>The loop on the left is a property of plug-in estimation, not of the problem. On the right, nothing is estimated and then fed back: the gain is integrated out per hypothesis.</figcaption>
+  </figure>
+  <h3>Why there is no real cycle</h3>
+  <p>Write the joint posterior over the continuous gain and the discrete keying history. Given a keying history k<sub>1:t</sub>, the gain is linear-Gaussian (§4), so the Kalman filter for that history gives p(h<sub>t</sub> | k<sub>1:t</sub>, z<sub>1:t</sub>) exactly. It also gives the history's marginal likelihood, one innovation at a time:</p>
+  <div class="eq">p(z<sub>t</sub> | k<sub>1:t</sub>, z<sub>1:t−1</sub>) = CN(z<sub>t</sub>; k<sub>t</sub>·μ<sub>t|t−1</sub>, k<sub>t</sub>·V<sub>t|t−1</sub> + σ²)
+P(k<sub>1:t</sub> | z<sub>1:t</sub>) ∝ P(k<sub>1:t</sub>) · ∏ p(z<sub>τ</sub> | k<sub>1:τ</sub>, z<sub>1:τ−1</sub>)        <span class="c">Morse prior × filter likelihoods</span></div>
+  <p>Nothing is guessed and fed back. Each hypothesis carries the gain belief that its own keying implies, and the hypotheses compete on how well they predicted the data (Magill 1965 for the filter bank, Ackerson &amp; Fu 1970 for switching models). This is Rao-Blackwellisation: sample or enumerate the discrete part, integrate the Gaussian part analytically.</p>
+  <p>The cost is that the exact form keeps one Gaussian per keying history, 2<sup>t</sup> of them. Every practical decoder is defined by how it cuts that down:</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th>Approximation</th><th>Gaussians kept</th><th>Who uses it</th></tr></thead>
+    <tbody>
+      <tr><td><b>Pruned filter bank</b>: keep the most probable histories</td><td>7–25 paths</td><td>Bell 1977</td></tr>
+      <tr><td><b>Per-survivor processing</b>: each lattice node keeps the belief of its best predecessor</td><td>one per node</td><td>Raheli, Polydoros &amp; Tzou 1995; cw_engine K6 (W4)</td></tr>
+      <tr><td><b>Merge (GPB / IMM)</b>: moment-match the Gaussians entering each state</td><td>one per state</td><td>target tracking; fits a forward (sum) pass</td></tr>
+      <tr><td><b>Soft data association (PDA)</b>: one filter, each update weighted by P(key down)</td><td>one</td><td>Bar-Shalom &amp; Tse 1975; cw_engine K2, first step</td></tr>
+      <tr><td><b>Decision-directed</b>: update only on committed marks</td><td>one</td><td>cw_engine v2/v3 today (held peak, µ_mark); too late at 1 Hz</td></tr>
+      <tr><td><b>EM / smoothing</b>: alternate forward–backward over keying with an RTS smoother over gain</td><td>one, iterated</td><td>cw_engine K4, soft feedback (ALGORITHM.md §5.2)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>Synchronising with a keying model that is not known yet</h3>
+  <p>The tracker runs at the observation rate and never waits for a Morse decision. The keying model enters only through P(key down at t), and that comes in three increasingly sharp forms:</p>
+  <ol>
+    <li><b>Duty only</b> (π ≈ 0.45): the PDA weight is σ(llr<sub>t</sub> + logit π). It needs no clock and no speed, so it works from the first sample.</li>
+    <li><b>The lattice's forward prediction</b> P(k<sub>t</sub> = 1 | z<sub>1:t−1</sub>). It knows that the middle of a dah is almost surely key-down and the middle of a word space almost surely not (BAYESIAN_DECODING.md C2, item 5).</li>
+    <li><b>Joint state</b>: the speed and duration live inside the hypothesis, as in Bell's decoder, so the timing and the gain are inferred together.</li>
+  </ol>
+  <p>Two rules keep the feedback safe:</p>
+  <ul>
+    <li><b>Exchange predictions, never posteriors.</b> The tracker combines the lattice's probability before t with its own likelihood of z<sub>t</sub>. The lattice reads the LLR computed from the tracker's prediction before its update. Otherwise z<sub>t</sub> is counted twice and both sides become overconfident.</li>
+    <li><b>Start in the regime that needs nothing.</b> Before the first mark the prior is μ = 0, V = P, so the LLR is exactly the energy detector. It needs neither a gain nor a clock. The speed can be bootstrapped from the energy's autocorrelation, and the coherent gain comes in as the filter locks, after about one coherence time of marks.</li>
+  </ul>
+  <p>The remaining real risk is the plug-in loop for the slow parameters (σ², P, B, the dit clock), which are re-estimated from committed decisions. FADING_TRACKER.md's advice holds: make them first-class estimates with their own robust estimators, and when in doubt assume faster fading.</p>
+</section>
+
+<!-- LAB 1 -->
+<section>
+<div class="lab" id="lab1">
+  <h3>Lab 1: four trackers on the same fading Morse signal</h3>
+  <p class="note">12&nbsp;s of "CQ CQ DE OK1RR OK1RR K" through a single Watterson path (64-sinusoid Gaussian Doppler), 5&nbsp;ms observations, complex noise. All trackers are given the true σ², P = 1 and B; only the keying is hidden. "Element errors" sums each tracker's LLR over every true element and calls it a mark if the sum is positive. It isolates the quality of the evidence from the timing problem; it is not a character error rate.</p>
+  <div class="controls">
+    <div class="ctl"><label for="mode">signal</label>
+      <div class="seg" id="mode" role="group" aria-label="signal"><button type="button" data-v="morse" aria-pressed="true">Morse</button><button type="button" data-v="carrier" aria-pressed="false">steady carrier</button></div></div>
+    <div class="ctl"><label for="bsl">Doppler spread B <b id="bval"></b></label><input id="bsl" type="range" min="0" max="100" value="50"></div>
+    <div class="ctl"><label for="snr">SNR in 500 Hz <b id="snrval"></b></label><input id="snr" type="range" min="-12" max="20" value="0" step="1"></div>
+    <div class="ctl"><label for="wpm">speed <b id="wpmval"></b></label><input id="wpm" type="range" min="12" max="40" value="20" step="1"></div>
+    <div class="ctl"><label for="show">plotted tracker</label>
+      <select id="show"><option value="pda" selected>coherent KF, soft association</option><option value="oracle">coherent KF, keying known</option><option value="env">envelope EKF, soft association</option><option value="energy">untracked energy detector</option></select></div>
+    <div class="ctl"><label for="zoom">zoom window start <b id="zoomval"></b></label><input id="zoom" type="range" min="0" max="9" value="1" step="0.25"></div>
+    <div class="ctl" style="justify-content:flex-end"><button type="button" id="reseed">New fading and noise</button></div>
+  </div>
+  <canvas id="c1" height="210" aria-label="Amplitude of the true gain and the tracker estimate over 12 seconds"></canvas>
+  <div class="legend"><span style="--c:var(--truth)">true |h|</span><span style="--c:var(--accent)">tracker |μ|</span><span class="box" style="--c:var(--accent-soft)">± √V</span><span class="box" style="--c:var(--shade)">key down</span></div>
+  <canvas id="c2" height="150" aria-label="Posterior probability of key down in a 3 second window"></canvas>
+  <div class="legend"><span style="--c:var(--truth)">true keying</span><span style="--c:var(--accent)">P(key down | z_t, prediction)</span></div>
+  <div class="tbl metrics">
+    <table>
+      <thead><tr><th>tracker</th><th class="num">|h| RMS error (marks)</th><th class="num">element errors</th><th class="num">mean V/P</th></tr></thead>
+      <tbody id="mt"></tbody>
+    </table>
+  </div>
+  <p class="note">Things to try. (1) Steady carrier: the envelope EKF trails the complex KF at every spread. (2) Morse at 0&nbsp;dB, B = 0.1&nbsp;Hz: the untracked detector misses whole faded stretches, while both coherent trackers ride through them. (3) Push B to 10&nbsp;Hz: mean V/P climbs toward 1 and the coherent filter's advantage shrinks to its energy limit. (4) Below about 0&nbsp;dB the envelope EKF does worse than no tracking at all, because its Gaussian likelihood is wrong exactly where the decision is close.</p>
+</div>
+</section>
+
+<section class="col">
+  <h3>What the lab shows over many runs</h3>
+  <p>Element error rate in %, 8 seeds × 12&nbsp;s at 20 WPM (736 elements per cell), from the same code that runs above:</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th>B</th><th class="num">SNR<sub>500</sub></th><th class="num">KF, keying known</th><th class="num">KF, soft (PDA)</th><th class="num">envelope EKF</th><th class="num">untracked energy</th></tr></thead>
+    <tbody>
+      <tr><td>0.1 Hz</td><td class="num">−6 dB</td><td class="num">10.7</td><td class="num">11.3</td><td class="num">32.3</td><td class="num">29.3</td></tr>
+      <tr><td>0.1 Hz</td><td class="num">0 dB</td><td class="num">4.1</td><td class="num">4.8</td><td class="num">14.9</td><td class="num">20.8</td></tr>
+      <tr><td>0.1 Hz</td><td class="num">+10 dB</td><td class="num">0.5</td><td class="num">0.3</td><td class="num">2.6</td><td class="num">5.6</td></tr>
+      <tr><td>1 Hz</td><td class="num">−6 dB</td><td class="num">9.4</td><td class="num">9.6</td><td class="num">25.1</td><td class="num">22.7</td></tr>
+      <tr><td>1 Hz</td><td class="num">0 dB</td><td class="num">3.0</td><td class="num">3.0</td><td class="num">9.8</td><td class="num">11.7</td></tr>
+      <tr><td>1 Hz</td><td class="num">+10 dB</td><td class="num">0.0</td><td class="num">0.3</td><td class="num">1.0</td><td class="num">2.3</td></tr>
+      <tr><td>5 Hz</td><td class="num">−6 dB</td><td class="num">12.8</td><td class="num">13.0</td><td class="num">24.2</td><td class="num">22.0</td></tr>
+      <tr><td>5 Hz</td><td class="num">0 dB</td><td class="num">2.3</td><td class="num">3.5</td><td class="num">9.0</td><td class="num">8.7</td></tr>
+      <tr><td>5 Hz</td><td class="num">+10 dB</td><td class="num">0.1</td><td class="num">0.1</td><td class="num">0.4</td><td class="num">1.0</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <ul>
+    <li><b>Soft association is nearly as good as knowing the keying.</b> This supports the order FADING_TRACKER.md chose: PDA first (K2), per-survivor beliefs only if a gap remains (K6).</li>
+    <li><b>The envelope filter is the weakest tracker at low SNR.</b> That is the regime Bell's decoder ran in.</li>
+    <li><b>The untracked detector's floor at +10&nbsp;dB and 0.1&nbsp;Hz</b> (5.6&nbsp;%) is the "faded marks read as spaces" failure that motivated the whole tracker plan.</li>
+  </ul>
+  <p class="note">Caveats: true boundaries are given, σ², P and B are known, and the signal is one path with no AFC error, so absolute numbers are optimistic. The ranking is the point.</p>
+</section>
+
+<!-- 6 Bell -->
+<section class="col">
+  <span class="sec-no">§6 · Bell 1977</span>
+  <h2>How E. L. Bell's decoder solves it</h2>
+  <p>Bell's NPS Doctor of Engineering thesis, <i>Optimal Bayesian estimation of the state of a probabilistically mapped memory-conditional Markov process with application to manual Morse decoding</i> (DTIC ADA046503), takes the conditioning route of §5 literally, in the envelope domain. The title describes the model:</p>
+  <ul>
+    <li><b>Markov process</b>: the hidden state is (letter-memory state λ, element type, speed, time in element).</li>
+    <li><b>Memory-conditional</b>: transition probabilities depend on the previous element and on how long the current one has lasted, which makes it a semi-Markov model.</li>
+    <li><b>Probabilistically mapped</b>: the observation depends on the state only through the key state and a random amplitude.</li>
+  </ul>
+  <p>The description below follows the thesis's Fortran listing (pages 159–190), which AG1LE translated to C.</p>
+  <figure>
+    <div class="svgwrap">
+    <svg viewBox="0 0 900 300" width="100%" style="min-width:700px" role="img" aria-label="One 5 ms step of Bell's decoder: saved paths, 30 extensions each, transition probabilities, per-extension Kalman filter, posterior, pruning, merging, trellis decision">
+      <defs><marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+      <g style="stroke:var(--line);fill:var(--sunk)">
+        <rect x="10" y="30" width="190" height="110" rx="6"/>
+        <rect x="240" y="30" width="190" height="110" rx="6"/>
+        <rect x="470" y="30" width="190" height="110" rx="6"/>
+        <rect x="700" y="30" width="190" height="110" rx="6"/>
+        <rect x="470" y="180" width="190" height="100" rx="6"/>
+        <rect x="700" y="180" width="190" height="100" rx="6"/>
+        <rect x="240" y="180" width="190" height="100" rx="6"/>
+      </g>
+      <text x="22" y="54" font-size="14" font-weight="600">≤ 25 saved paths</text>
+      <text x="22" y="76" font-size="12" class="mono">λ letter state (memfcn)</text>
+      <text x="22" y="94" font-size="12" class="mono">ilrate speed (WPM)</text>
+      <text x="22" y="112" font-size="12" class="mono">dur ms in element</text>
+      <text x="22" y="130" font-size="12" class="mono">ŷ, P amplitude KF</text>
+      <text x="252" y="54" font-size="14" font-weight="600">× 30 extensions</text>
+      <text x="252" y="76" font-size="12">6 elements (. − ^ ~ w p)</text>
+      <text x="252" y="94" font-size="12">× 5 speed steps (−2…+2)</text>
+      <text x="252" y="112" font-size="12" class="m mono">path.c</text>
+      <text x="482" y="54" font-size="14" font-weight="600">transition prob</text>
+      <text x="482" y="76" font-size="12">stay: duration hazard</text>
+      <text x="482" y="94" font-size="12">leave: elemtr × rtrans</text>
+      <text x="482" y="112" font-size="12" class="m mono">trprob, xtrans, ptrans</text>
+      <text x="712" y="54" font-size="14" font-weight="600">scalar KF per ext.</text>
+      <text x="712" y="76" font-size="12">z = x·a + v on envelope</text>
+      <text x="712" y="94" font-size="12">lkhd = N(z; x·ŷ⁻, x·P⁻+rn)</text>
+      <text x="712" y="112" font-size="12" class="m mono">model.c, kalfil.c</text>
+      <text x="712" y="204" font-size="14" font-weight="600">posterior</text>
+      <text x="712" y="226" font-size="12">p ∝ p_prev · pin · lkhd</text>
+      <text x="712" y="244" font-size="12">P(key), element, E[speed]</text>
+      <text x="712" y="262" font-size="12" class="m mono">probp, sprob</text>
+      <text x="482" y="204" font-size="14" font-weight="600">prune and merge</text>
+      <text x="482" y="226" font-size="12">best per element, then</text>
+      <text x="482" y="244" font-size="12">add until Σp ≥ 0.99, max 25</text>
+      <text x="482" y="262" font-size="12" class="m mono">savep.c</text>
+      <text x="252" y="204" font-size="14" font-weight="600">trellis decision</text>
+      <text x="252" y="226" font-size="12">letter emitted when saved</text>
+      <text x="252" y="244" font-size="12">paths share an ancestor</text>
+      <text x="252" y="262" font-size="12" class="m mono">trelis.c, 1 s window</text>
+      <g fill="none" style="stroke:var(--muted)" stroke-width="1.4" marker-end="url(#ar4)">
+        <path d="M200,85 H236"/><path d="M430,85 H466"/><path d="M660,85 H696"/><path d="M795,140 V176"/><path d="M700,230 H664"/><path d="M470,230 H434"/>
+        <path d="M335,280 V292 H105 V144"/>
+      </g>
+      <text x="22" y="20" font-size="12" class="m">every 5 ms sample of the detected envelope</text>
+    </svg>
+    </div>
+    <figcaption>One 5&nbsp;ms step of Bell's decoder (PROCES in the listing). Up to 25 paths × 30 extensions = 750 Kalman updates per sample; the port keeps 20.</figcaption>
+  </figure>
+  <h3>The pieces</h3>
+  <ul>
+    <li><b>Duration model.</b> The probability of staying in an element is the ratio of a survival function S(b) at b = dur/nominal, a Laplace-like density centred on 1, 3, 1, 3, 7 or 14 dit units with sharpness α = 3m (dit, dah, element and character spaces), 10.5 (word space) or 14 (pause). See Lab 2.</li>
+    <li><b>Element and speed transitions.</b> A second-order element table (Bell's Table XII: the next element given the previous mark and space). A speed change of 0, ±1 or ±2 steps at every element boundary, with probabilities 0.4 / 0.2 / 0.1. The step is 2 WPM, rising to 5 or 10 WPM after word spaces and pauses.</li>
+    <li><b>Letter memory.</b> λ indexes the dot/dash prefix so far (<code>memfcn</code>, 400 states), so only valid Morse sequences survive.</li>
+    <li><b>Amplitude Kalman filter.</b> Scalar, on the envelope, with H = key state (0 or 1).
+      <ul>
+        <li>During a mark: a random walk with q = 10<sup>−4</sup> per sample.</li>
+        <li>During a space: the mean decays (φ &lt; 1) with q = 0.</li>
+        <li>At a space-to-mark transition: a burst of variance that grows with how long the space lasted.</li>
+      </ul>
+      The likelihood is the Gaussian innovation density.</li>
+    <li><b>Pruning.</b> Keep the most probable extension of each of the six element types, so that a word space is never pruned out by a run of marks. Then add the next most probable ones until 99&nbsp;% of the mass is saved, up to 25 paths (the port: 20). Paths with the same (λ, duration, speed) are merged.</li>
+  </ul>
+  <p>This is the same structure as the cw_engine plan, built 45 years earlier. Bell's bank of filters on a trellis is the exact form that per-survivor processing (K6) approximates. Its weakness was cost and robustness, not the idea. It also leaves noise, signal level and frequency to fixed front-end heuristics, which FADING_TRACKER.md lists as first-class estimates (σ², P, B, δf).</p>
+</section>
+
+<!-- 7 why it failed -->
+<section class="col">
+  <span class="sec-no">§7 · what goes wrong</span>
+  <h2>Why it did not work in practice: the listing against the port</h2>
+  <p>AG1LE's testers reported missed word spaces, no AFC, and a noise estimator that could not track real noise (FADING_TRACKER.md §6). Each routine of the C port was compared with the Fortran listing in the thesis scan (pages 159–190). One bug comes from the port. The rest of the weaknesses are Bell's own model. Line numbers refer to <code>ag1le/morse-wip</code> <code>src/</code> at commit 5eb011e. <code>BELL.md</code> has the full table.</p>
+
+  <div class="finding">
+    <span class="tag bug">port bug</span>
+    <div>
+      <h3>The duration hazard turns negative when an element crosses its nominal length</h3>
+      <p>In the branch b0 &lt; 1 &lt; b1 the listing has <code>P1=0.5*EXP(-ALPHA*(B1-1.))</code>. The port writes <code>p1 = exp(-alpha*(b1-1.f)) * -.5f</code>, so the "stay" probability comes out negative (−0.75 for a 25 WPM dit). On the 5&nbsp;ms sample where an element passes its nominal length, every path that stays in it gets a negative weight. <code>savep</code> never keeps one, and the leaving transitions are inflated to compensate. In effect, no element may outlast its nominal duration at the path's current speed.</p>
+      <ul>
+        <li><b>It is hidden at some speeds.</b> When the nominal duration is an exact multiple of 5&nbsp;ms (for the dit, at speeds that divide 240: 10, 12, 15, 16, 20, 24, 30, 40, 48 and 60 WPM), b0 lands exactly on 1 and the correct branch runs. The port starts its paths at 10–40 WPM, so a test at 20 WPM looks fine.</li>
+        <li><b>At other speeds</b> a slow dah, a long character space or a hesitant word space can only be explained by a speed jump at the next boundary. Words run together (<code>OK1RRDL5ABC</code>, <code>G3XYZRST</code>): the missed word spaces.</li>
+        <li><b>Measured:</b> on its own, the sign error raises CER 1.4–1.7× at 20 and 25 WPM.</li>
+      </ul>
+      <p class="loc">xtrans.cxx:78; listing line 23600 (thesis p. 170)</p>
+    </div>
+  </div>
+  <div class="finding">
+    <span class="tag bug">port bug</span>
+    <div>
+      <h3>Smaller port errors</h3>
+      <ul>
+        <li><b>Speed limits and path count.</b> The port uses 5–80 WPM, 20 paths and starting speeds 10–40. The listing has 10–60 WPM, 25 paths and starting speeds 10–50.</li>
+        <li><b>Trellis start.</b> The trellis starts at zero, so for the first second it reads path 0, out of bounds. <code>ndel</code> is read before it is set. The listing starts both with 5.</li>
+        <li><b>Character tree.</b> Z has no dah child, so <code>,</code> can never be decoded. Q's dit child points at <code>0</code>. A trellis step that settles several letters writes each over the last.</li>
+        <li><b>Shared state.</b> The noise estimator, the trellis and the driver keep state in function statics, so two decoders cannot run side by side.</li>
+      </ul>
+      <p class="loc">bmorse.h:29, spdtr.cxx, trelis.cxx, transl.cxx, noise.cxx</p>
+    </div>
+  </div>
+  <div class="finding">
+    <span class="tag model">Bell's model</span>
+    <div>
+      <h3>The noise constants fit only Bell's receiver</h3>
+      <p>NOISE takes the smoothed minimum of the envelope over 1&nbsp;s and 0.25&nbsp;s (ymavg). It sets rn = 0.3·ymavg, subtracts 2.4·ymavg + 0.05 and scales by 1.1. These are Bell's empirical constants, fitted to his envelope: two resonators at about ±35&nbsp;Hz, a rectifier, a 100&nbsp;Hz low-pass.</p>
+      <p>Any other front end gives a different noise envelope. On a 250&nbsp;Hz channel the envelope's minimum falls, NOISE reads the noise far too low, and noise decodes as text: CER above 1 at 6&nbsp;dB SNR<sub>500</sub>. The port's clamp of NOISE's output to [0, 1] is a patch over the same mismatch. The bench backend emulates Bell's IF filter and keeps the clamp.</p>
+      <p class="loc">listing p. 190 (NOISE); morse-wip noise.cxx:116–120, bmorse.cxx:352</p>
+    </div>
+  </div>
+  <div class="finding">
+    <span class="tag model">Bell's model</span>
+    <div>
+      <h3>The amplitude filter becomes more confident while it sees nothing</h3>
+      <p>In a space, MODEL sets φ = 10<sup>−2/(22.4·dit_ms)</sup> &lt; 1 and q = 0. So the predicted variance φ²P shrinks during the very intervals that carry no information about the amplitude. The variance is restored only by an ad hoc term at the space-to-mark transition. A correct model has the variance grow toward the prior during a space (§4).</p>
+      <p>In marks, a random walk with q = 10<sup>−4</sup> per 5&nbsp;ms gives about 0.14 amplitude units of drift per second. That is far too slow for 1&nbsp;Hz fading, where the gain changes completely within 0.4&nbsp;s. None of these constants is tied to a measured Doppler spread.</p>
+      <p class="loc">listing p. 177–178 (MODEL)</p>
+    </div>
+  </div>
+  <div class="finding">
+    <span class="tag model">Bell's model</span>
+    <div>
+      <h3>Merging drops mass, and there is no idle state</h3>
+      <ul>
+        <li><b>Merging.</b> When two saved paths share (λ, duration, speed), SAVEP keeps the first and discards the second, together with its probability. A Bayesian merge would add the probabilities and moment-match the two Kalman states.</li>
+        <li><b>No idle state.</b> After 14 dits of pause the model must start a mark, so noise before and between overs decodes as characters. That is most of the error left in the corrected decoder.</li>
+        <li><b>Loose speed prior.</b> Only 40&nbsp;% of element boundaries keep the speed.</li>
+        <li><b>A model the listing leaves out.</b> Bell's richer letter-tree model reads 300 more states from a file, <code>MORSEM</code>, that the thesis does not print. The port and the bench backend run the printed 16-state model.</li>
+      </ul>
+      <p class="loc">listing p. 180–183 (SAVEP), p. 160–161 (INITL)</p>
+    </div>
+  </div>
+</section>
+
+<!-- LAB 2 -->
+<section>
+<div class="lab" id="lab2">
+  <h3>Lab 2: Bell's duration hazard, as ported and as intended</h3>
+  <p class="note">Per-sample probability of staying in the current element, from <code>xtrans_()</code>, at the port's 5&nbsp;ms grid. The lower curve is the resulting survival, the probability that the element lasts at least this long. In the port it is cut to zero at the crossing.</p>
+  <div class="controls">
+    <div class="ctl"><label for="el">element</label>
+      <select id="el"><option value="0">dit (1 unit, α = 3)</option><option value="1" selected>dah (3 units, α = 9)</option><option value="2">element space (1, α = 3)</option><option value="3">character space (3, α = 9)</option><option value="4">word space (7, α = 10.5)</option><option value="5">pause (14, α = 14)</option></select></div>
+    <div class="ctl"><label for="hw">path speed <b id="hwval"></b></label><input id="hw" type="range" min="10" max="50" value="25" step="1"></div>
+  </div>
+  <canvas id="c3" height="260" aria-label="Stay probability and survival against element duration"></canvas>
+  <div class="legend"><span style="--c:var(--bad)">port (xtrans.cxx:78)</span><span style="--c:var(--accent)">corrected: ½·e^(−α(b1−1))</span><span style="--c:var(--muted)">nominal duration</span></div>
+  <div class="readout" id="hro"></div>
+</div>
+</section>
+
+<!-- 8 bench backend -->
+<section class="col">
+  <span class="sec-no">§8 · on the bench</span>
+  <h2>Bell's decoder in cw_engine</h2>
+  <p>The corrected decoder is the bench backend <code>bell</code> (<code>src/engine/bell/</code>, <code>decode_bell.*</code>). It follows the listing routine by routine and keeps Bell's names and 1-based indices. Per channel it has its own state, an emulation of Bell's IF filter, |IQ| at 200&nbsp;Hz and a peak AGC. <code>bell:port</code> reproduces morse-wip, and <code>bell:listing</code> drops the two clamps, which are not in Bell's design.</p>
+  <p>On a synthetic keyed carrier with white noise, the corrected decoder makes 1.4–5× fewer errors than the port on the main copy. At 25 WPM:</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th class="num">SNR<sub>500</sub></th><th class="num">morse-wip</th><th class="num">corrected</th></tr></thead>
+    <tbody>
+      <tr><td class="num">+10 dB</td><td class="num">0.071</td><td class="num">0.013</td></tr>
+      <tr><td class="num">+3 dB</td><td class="num">0.093</td><td class="num">0.030</td></tr>
+      <tr><td class="num">0 dB</td><td class="num">0.376</td><td class="num">0.168</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">Main-copy CER: characters decoded from the noise before and after the over are not counted. 8 seeds, no fading. <code>BELL.md</code> has 20 and 32 WPM and the totals.</p>
+  <h3>What is left to do</h3>
+  <ol class="steps">
+    <li><div><b>Fading.</b> Run <code>bell</code>, <code>bell:port</code> and <code>v3</code> through <code>cw_bench</code>'s ITU presets and the flat 0.1–3&nbsp;Hz grid.</div></li>
+    <li><div><b>Fix Bell's model one part at a time</b>, with an A/B run for each:
+      <ul>
+        <li>variance that grows in spaces, with q from the Doppler spread;</li>
+        <li>merging that adds probability mass;</li>
+        <li>an idle state;</li>
+        <li>noise from the band floor instead of NOISE's minimum tracker.</li>
+      </ul></div></li>
+    <li><div><b>Swap the observation.</b> Replace the envelope filter with the complex AR(2) filter of this page, on the ½-dit block sums. That makes Bell's decoder the exact (pruned) form of cw_engine's K6, to measure against the soft-association tracker (K2).</div></li>
+  </ol>
+  <p>Either way the result is a reference point. If a repaired Bell decoder with a complex tracker clearly beats soft association plus the lattice, per-survivor beliefs (K6) are worth building. If it does not, the plan can stop at K2–K5 with evidence behind that choice. Bell's decoder stays on the bench: up to 750 Kalman updates per 5&nbsp;ms is about 150&nbsp;k per second per channel, far too much for 1536 channels.</p>
+</section>
+
+<section class="col">
+  <h2>References</h2>
+  <ul class="refs">
+    <li>E. L. Bell, <i>Optimal Bayesian estimation of the state of a probabilistically mapped memory-conditional Markov process with application to manual Morse decoding</i>, D.Eng. thesis, Naval Postgraduate School, 1977 (DTIC ADA046503; scan and OCR on NPS Calhoun, hdl 10945/18334; the Fortran listing is on pages 159–190).</li>
+    <li>M. Niininen (AG1LE), <code>morse-wip</code>, C port of Bell's decoder, <a href="https://github.com/ag1le/morse-wip">github.com/ag1le/morse-wip</a>, 2013–14; <a href="http://ag1le.blogspot.com/2013/01/towards-bayesian-morse-decoder.html">Towards Bayesian Morse Decoder</a>, 2013.</li>
+    <li>C. C. Watterson, J. R. Juroshek, W. D. Bensema, "Experimental confirmation of an HF channel model", IEEE Trans. Comm. Technol. 18(6), 1970; ITU-R F.1487.</li>
+    <li>K. E. Baddour, N. C. Beaulieu, "Autoregressive modeling for fading channel simulation", IEEE Trans. Wireless Comm. 4(4), 2005.</li>
+    <li>D. T. Magill, "Optimal adaptive estimation of sampled stochastic processes", IEEE Trans. Automatic Control 10(4), 1965.</li>
+    <li>G. A. Ackerson, K. S. Fu, "On state estimation in switching environments", IEEE Trans. Automatic Control 15(1), 1970.</li>
+    <li>Y. Bar-Shalom, E. Tse, "Tracking in a cluttered environment with probabilistic data association", Automatica 11, 1975.</li>
+    <li>R. Raheli, A. Polydoros, C.-K. Tzou, "Per-survivor processing: a general approach to MLSE in uncertain environments", IEEE Trans. Comm. 43, 1995.</li>
+    <li>T. Kailath, "A general likelihood-ratio formula for random signals in Gaussian noise", IEEE Trans. Inf. Theory 15(3), 1969.</li>
+    <li>cw_engine: <code>FADING_TRACKER.md</code> (K0–K6), <code>BAYESIAN_DECODING.md</code> (B1, C2), <code>ALGORITHM.md</code> §5.2–5.4, <code>BELL.md</code>.</li>
+  </ul>
+</section>
+</main>
+
+<script>
+// ---- simulation core (pure; shared by the page and the node check) ----
+const SIM_T = 0.005;              // 5 ms observations, Bell's 200 Hz
+const SIM_N = 2400;               // 12 s
+const MORSE = {A:'.-',B:'-...',C:'-.-.',D:'-..',E:'.',F:'..-.',G:'--.',H:'....',I:'..',J:'.---',K:'-.-',L:'.-..',M:'--',N:'-.',O:'---',P:'.--.',Q:'--.-',R:'.-.',S:'...',T:'-',U:'..-',V:'...-',W:'.--',X:'-..-',Y:'-.--',Z:'--..',0:'-----',1:'.----',2:'..---',3:'...--',4:'....-',5:'.....',6:'-....',7:'--...',8:'---..',9:'----.'};
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function gaussFn(rng) {
+  return function () {
+    let u = 0; while (u === 0) u = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
+  };
+}
+
+// keying in dit units, then sampled at SIM_T
+function keying(text, wpm, n) {
+  const segs = [];               // [on, units]
+  segs.push([0, 0]);
+  const words = text.trim().split(/\s+/);
+  words.forEach((w, wi) => {
+    [...w].forEach((ch, ci) => {
+      const code = MORSE[ch] || '';
+      [...code].forEach((el, ei) => {
+        segs.push([1, el === '.' ? 1 : 3]);
+        if (ei < code.length - 1) segs.push([0, 1]);
+      });
+      if (ci < w.length - 1) segs.push([0, 3]);
+    });
+    segs.push([0, wi < words.length - 1 ? 7 : 10]);
+  });
+  const dit = 1.2 / wpm, k = new Uint8Array(n);
+  const lead = 0.4;
+  let t0 = lead, si = 1;
+  const edges = [];
+  for (let rep = 0; t0 < n * SIM_T && rep < 50; rep++) {
+    for (let i = 1; i < segs.length; i++) {
+      const [on, u] = segs[i];
+      edges.push([t0, t0 + u * dit, on]);
+      t0 += u * dit;
+    }
+  }
+  let e = 0;
+  for (let i = 0; i < n; i++) {
+    const t = (i + 0.5) * SIM_T;
+    while (e < edges.length && edges[e][1] <= t) e++;
+    k[i] = (e < edges.length && t >= edges[e][0]) ? edges[e][2] : 0;
+  }
+  return k;
+}
+
+// Watterson single path: Gaussian Doppler spectrum, B = 2*sigma_f, unit power
+function fading(B, n, rng, gauss) {
+  const re = new Float64Array(n), im = new Float64Array(n);
+  const M = 64, sf = B / 2;
+  const f = [], ph = [];
+  for (let i = 0; i < M; i++) { f.push(sf * gauss()); ph.push(2 * Math.PI * rng()); }
+  const g = 1 / Math.sqrt(M);
+  for (let t = 0; t < n; t++) {
+    let r = 0, q = 0;
+    const tt = t * SIM_T;
+    for (let i = 0; i < M; i++) {
+      const a = 2 * Math.PI * f[i] * tt + ph[i];
+      r += Math.cos(a); q += Math.sin(a);
+    }
+    re[t] = r * g; im[t] = q * g;
+  }
+  return { re, im };
+}
+
+// AR(2) with a double real pole p, matched to the Gaussian correlation at rho = 0.5
+function ar2Pole(B) {
+  const sf = B / 2;
+  const kh = Math.sqrt(Math.LN2 / (2 * Math.PI * Math.PI * sf * sf)) / SIM_T;
+  const rho = (p) => Math.pow(p, kh) * (1 + kh * (1 - p * p) / (1 + p * p));
+  let lo = 0, hi = 1 - 1e-12;
+  for (let i = 0; i < 80; i++) { const m = (lo + hi) / 2; if (rho(m) < 0.5) lo = m; else hi = m; }
+  return (lo + hi) / 2;
+}
+
+function runCoherent(z, k, sig2, B, prior, oracle) {
+  const n = z.re.length, p = ar2Pole(B);
+  const a1 = 2 * p, a2 = -p * p, q = Math.pow(1 - p * p, 3) / (1 + p * p);
+  const r1 = 2 * p / (1 + p * p);
+  let m0r = 0, m0i = 0, m1r = 0, m1i = 0, P00 = 1, P01 = r1, P11 = 1;
+  const amp = new Float64Array(n), band = new Float64Array(n), llr = new Float64Array(n), w = new Float64Array(n);
+  const lp = prior >= 1 ? Infinity : Math.log(prior / (1 - prior));
+  let vsum = 0, vcnt = 0;
+  for (let t = 0; t < n; t++) {
+    const n0r = a1 * m0r + a2 * m1r, n0i = a1 * m0i + a2 * m1i, n1r = m0r, n1i = m0i;
+    const Q00 = a1 * a1 * P00 + 2 * a1 * a2 * P01 + a2 * a2 * P11 + q;
+    const Q01 = a1 * P00 + a2 * P01, Q11 = P00;
+    const zr = z.re[t], zi = z.im[t];
+    const s = Q00 + sig2, dr = zr - n0r, di = zi - n0i, d2 = dr * dr + di * di;
+    const L = -d2 / s - Math.log(s) + (zr * zr + zi * zi) / sig2 + Math.log(sig2);
+    llr[t] = L;
+    const wp = lp === Infinity ? 1 : 1 / (1 + Math.exp(-(L + lp)));
+    w[t] = wp;
+    const wu = oracle ? k[t] : wp;
+    vsum += Q00; vcnt++;
+    const K0 = Q00 / s, K1 = Q01 / s;
+    const u0r = n0r + K0 * dr, u0i = n0i + K0 * di, u1r = n1r + K1 * dr, u1i = n1i + K1 * di;
+    const U00 = Q00 - K0 * Q00, U01 = Q01 - K0 * Q01, U11 = Q11 - K1 * Q01;
+    m0r = wu * u0r + (1 - wu) * n0r; m0i = wu * u0i + (1 - wu) * n0i;
+    m1r = wu * u1r + (1 - wu) * n1r; m1i = wu * u1i + (1 - wu) * n1i;
+    const c = wu * (1 - wu) * d2;
+    P00 = wu * U00 + (1 - wu) * Q00 + c * K0 * K0;
+    P01 = wu * U01 + (1 - wu) * Q01 + c * K0 * K1;
+    P11 = wu * U11 + (1 - wu) * Q11 + c * K1 * K1;
+    amp[t] = Math.hypot(m0r, m0i); band[t] = Math.sqrt(Math.max(P00, 0));
+  }
+  return { amp, band, llr, w, vp: vsum / vcnt };
+}
+
+// non-coherent: EKF on the envelope y = |z|; key-up likelihood is the exact Rayleigh
+function runEnvelope(z, k, sig2, B, prior) {
+  const n = z.re.length, sf = B / 2;
+  const Abar = Math.sqrt(Math.PI) / 2, varA = 1 - Math.PI / 4;
+  const ke = Math.sqrt(Math.log(Math.SQRT2) / (2 * Math.PI * Math.PI * sf * sf)) / SIM_T;
+  const phi = Math.pow(0.5, 1 / ke), qA = varA * (1 - phi * phi);
+  const r = sig2 / 2, off = Math.PI * sig2 / 4;
+  let A = Abar, V = varA;
+  const amp = new Float64Array(n), band = new Float64Array(n), llr = new Float64Array(n), w = new Float64Array(n);
+  const lp = prior >= 1 ? Infinity : Math.log(prior / (1 - prior));
+  for (let t = 0; t < n; t++) {
+    const Ap = Abar + phi * (A - Abar), Vp = phi * phi * V + qA;
+    const y = Math.hypot(z.re[t], z.im[t]);
+    const g = Math.sqrt(Ap * Ap + off), H = Ap / g, S = H * H * Vp + r * (1 - 0.57 * Math.exp(-Ap * Ap / sig2));
+    const e = y - g;
+    const L = -e * e / (2 * S) - 0.5 * Math.log(2 * Math.PI * S) - Math.log(2 * Math.max(y, 1e-12) / sig2) + y * y / sig2;
+    llr[t] = L;
+    const wp = lp === Infinity ? 1 : 1 / (1 + Math.exp(-(L + lp)));
+    w[t] = wp;
+    const Kg = Vp * H / S, Au = Math.max(0, Ap + Kg * e), Vu = (1 - Kg * H) * Vp;
+    A = wp * Au + (1 - wp) * Ap;
+    V = wp * Vu + (1 - wp) * Vp + wp * (1 - wp) * (Kg * e) * (Kg * e);
+    amp[t] = A; band[t] = Math.sqrt(V);
+  }
+  return { amp, band, llr, w };
+}
+
+function runEnergy(z, sig2, prior) {
+  const n = z.re.length, llr = new Float64Array(n), w = new Float64Array(n);
+  const lp = prior >= 1 ? Infinity : Math.log(prior / (1 - prior));
+  const c = 1 / sig2 - 1 / (sig2 + 1), l0 = Math.log(1 + 1 / sig2);
+  for (let t = 0; t < n; t++) {
+    const e = z.re[t] * z.re[t] + z.im[t] * z.im[t];
+    llr[t] = e * c - l0;
+    w[t] = lp === Infinity ? 1 : 1 / (1 + Math.exp(-(llr[t] + lp)));
+  }
+  return { llr, w };
+}
+
+// per true element: sum the LLR over it, decide mark if > 0
+function elementErrors(k, llr) {
+  let errs = 0, tot = 0, i = 0;
+  const n = k.length;
+  while (i < n && k[i] === 0) i++;          // skip the lead
+  while (i < n) {
+    let j = i, s = 0;
+    while (j < n && k[j] === k[i]) { s += llr[j]; j++; }
+    if (j >= n) break;                     // drop the cut-off last element
+    tot++;
+    if ((s > 0 ? 1 : 0) !== k[i]) errs++;
+    i = j;
+  }
+  return { errs, tot };
+}
+
+function ampRmse(k, h, amp) {
+  let s = 0, c = 0;
+  for (let t = 100; t < k.length; t++) if (k[t]) { const d = amp[t] - Math.hypot(h.re[t], h.im[t]); s += d * d; c++; }
+  return c ? Math.sqrt(s / c) : NaN;
+}
+
+function simulate(o) {
+  const rng = mulberry32(o.seed), gauss = gaussFn(rng);
+  const n = SIM_N;
+  const k = o.carrier ? new Uint8Array(n).fill(1) : keying(o.text, o.wpm, n);
+  const h = fading(o.B, n, rng, gauss);
+  const sig2 = 1 / (Math.pow(10, o.snr500 / 10) * 2.5);   // 200 Hz sample bandwidth vs 500 Hz
+  const sn = Math.sqrt(sig2 / 2);
+  const z = { re: new Float64Array(n), im: new Float64Array(n) };
+  for (let t = 0; t < n; t++) { z.re[t] = k[t] * h.re[t] + sn * gauss(); z.im[t] = k[t] * h.im[t] + sn * gauss(); }
+  const prior = o.carrier ? 1 : 0.45;
+  const oracle = runCoherent(z, k, sig2, o.B, prior, true);
+  const pda = runCoherent(z, k, sig2, o.B, prior, false);
+  const env = runEnvelope(z, k, sig2, o.B, prior);
+  const en = runEnergy(z, sig2, prior);
+  const res = { k, h, z, sig2, est: { oracle, pda, env, energy: en } };
+  res.metrics = {};
+  for (const [name, e] of Object.entries(res.est)) {
+    res.metrics[name] = {
+      rmse: e.amp ? ampRmse(k, h, e.amp) : NaN,
+      el: o.carrier ? null : elementErrors(k, e.llr),
+      vp: e.vp,
+    };
+  }
+  return res;
+}
+// ---- end of simulation core ----
+
+
+// ---------------- UI ----------------
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const css = () => { const s = getComputedStyle(document.documentElement); const g = (n) => s.getPropertyValue(n).trim(); return { bg: g('--bg'), fg: g('--fg'), muted: g('--muted'), line: g('--line'), accent: g('--accent'), soft: g('--accent-soft'), truth: g('--truth'), bad: g('--bad'), shade: g('--shade'), mono: g('--f-mono') }; };
+  const state = { mode: 'morse', seed: 7, res: null };
+  const bFromSlider = (v) => Math.pow(10, -1.3 + 2.3 * v / 100);   // 0.05 … 10 Hz
+  const NAMES = { oracle: 'coherent KF, keying known', pda: 'coherent KF, soft association', env: 'envelope EKF, soft association', energy: 'untracked energy detector' };
+
+  function setupCanvas(c) {
+    if (!c.dataset.h) c.dataset.h = c.getAttribute('height');   // canvas.height is the attribute: keep the CSS height separately
+    const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = +c.dataset.h;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); c.style.height = h + 'px';
+    const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); return { g, w, h };
+  }
+  function axes(g, w, h, pad, col, xmax, ymin, ymax, yticks, xlabel) {
+    g.strokeStyle = col.line; g.lineWidth = 1; g.fillStyle = col.muted; g.font = '11px ' + col.mono;
+    yticks.forEach((v) => { const y = pad.t + (h - pad.t - pad.b) * (1 - (v - ymin) / (ymax - ymin)); g.beginPath(); g.moveTo(pad.l, y + 0.5); g.lineTo(w - pad.r, y + 0.5); g.stroke(); g.fillText(String(v), 4, y + 4); });
+    g.fillText(xlabel, w - pad.r - g.measureText(xlabel).width, h - 4);
+  }
+
+  function run() {
+    const B = bFromSlider(+$('bsl').value), snr = +$('snr').value, wpm = +$('wpm').value;
+    $('bval').textContent = (B < 1 ? B.toFixed(2) : B.toFixed(1)) + ' Hz';
+    $('snrval').textContent = (snr > 0 ? '+' : '') + snr + ' dB';
+    $('wpmval').textContent = wpm + ' WPM';
+    state.res = simulate({ seed: state.seed, carrier: state.mode === 'carrier', B, snr500: snr, wpm, text: 'CQ CQ DE OK1RR OK1RR K' });
+    table(); draw();
+  }
+
+  function table() {
+    const m = state.res.metrics, carrier = state.mode === 'carrier';
+    const keys = ['oracle', 'pda', 'env', 'energy'];
+    const ers = keys.map((k) => (m[k].el ? m[k].el.errs / Math.max(1, m[k].el.tot) : NaN));
+    const rms = keys.map((k) => m[k].rmse);
+    const minE = Math.min(...ers.slice(1).filter((x) => !isNaN(x))), minR = Math.min(...rms.slice(1).filter((x) => !isNaN(x)));
+    $('mt').innerHTML = keys.map((k, i) => {
+      const e = m[k].el;
+      const eTxt = carrier || !e ? '—' : `${e.errs} / ${e.tot} (${(100 * ers[i]).toFixed(1)} %)`;
+      const rTxt = isNaN(rms[i]) ? '—' : rms[i].toFixed(3);
+      const vTxt = m[k].vp === undefined ? '—' : m[k].vp.toFixed(2);
+      const bE = i > 0 && !carrier && ers[i] === minE ? ' best' : '', bR = i > 0 && rms[i] === minR ? ' best' : '';
+      return `<tr><td>${NAMES[k]}${k === 'oracle' ? ' <span class="note">(bound)</span>' : ''}</td><td class="num${bR}">${rTxt}</td><td class="num${bE}">${eTxt}</td><td class="num">${vTxt}</td></tr>`;
+    }).join('');
+  }
+
+  function draw() {
+    if (!state.res) return;
+    const col = css(), r = state.res, sel = $('show').value, e = r.est[sel];
+    const n = r.k.length, T = SIM_T;
+    // panel 1: amplitude over 12 s
+    {
+      const { g, w, h } = setupCanvas($('c1')); g.clearRect(0, 0, w, h);
+      const pad = { l: 30, r: 8, t: 8, b: 18 }, ymax = 2.6;
+      const X = (t) => pad.l + (w - pad.l - pad.r) * t / n, Y = (v) => pad.t + (h - pad.t - pad.b) * (1 - Math.min(v, ymax) / ymax);
+      g.fillStyle = col.shade;
+      if (state.mode === 'morse') { let i = 0; while (i < n) { if (r.k[i]) { let j = i; while (j < n && r.k[j]) j++; g.fillRect(X(i), pad.t, Math.max(1, X(j) - X(i)), h - pad.t - pad.b); i = j; } else i++; } }
+      axes(g, w, h, pad, col, n, 0, ymax, [0, 1, 2], '12 s');
+      const z0 = +$('zoom').value / T, z1 = z0 + 3 / T;
+      g.strokeStyle = col.muted; g.setLineDash([3, 3]); g.strokeRect(X(z0), pad.t + 0.5, X(z1) - X(z0), h - pad.t - pad.b - 1); g.setLineDash([]);
+      if (e.amp) {
+        g.fillStyle = col.soft; g.beginPath();
+        for (let t = 0; t < n; t++) g.lineTo(X(t), Y(e.amp[t] + e.band[t]));
+        for (let t = n - 1; t >= 0; t--) g.lineTo(X(t), Y(Math.max(0, e.amp[t] - e.band[t])));
+        g.closePath(); g.fill();
+      }
+      g.strokeStyle = col.truth; g.lineWidth = 1.6; g.beginPath();
+      for (let t = 0; t < n; t++) g.lineTo(X(t), Y(Math.hypot(r.h.re[t], r.h.im[t]))); g.stroke();
+      if (e.amp) { g.strokeStyle = col.accent; g.lineWidth = 1.6; g.beginPath(); for (let t = 0; t < n; t++) g.lineTo(X(t), Y(e.amp[t])); g.stroke(); }
+      else { g.fillStyle = col.muted; g.font = '12px ' + col.mono; g.fillText('no gain estimate: the energy detector assumes E|h|² = P', pad.l + 8, pad.t + 16); }
+    }
+    // panel 2: posterior in a 3 s window
+    {
+      const { g, w, h } = setupCanvas($('c2')); g.clearRect(0, 0, w, h);
+      const pad = { l: 30, r: 8, t: 8, b: 18 };
+      const z0 = Math.floor(+$('zoom').value / T), len = Math.round(3 / T), z1 = Math.min(n, z0 + len);
+      const X = (t) => pad.l + (w - pad.l - pad.r) * (t - z0) / len, Y = (v) => pad.t + (h - pad.t - pad.b) * (1 - v);
+      axes(g, w, h, pad, col, len, 0, 1, [0, 0.5, 1], `${(z0 * T).toFixed(2)}–${(z1 * T).toFixed(2)} s`);
+      g.strokeStyle = col.truth; g.lineWidth = 1.4; g.beginPath();
+      for (let t = z0; t < z1; t++) { g.lineTo(X(t), Y(r.k[t] * 0.98 + 0.01)); g.lineTo(X(t + 1), Y(r.k[t] * 0.98 + 0.01)); } g.stroke();
+      g.strokeStyle = col.accent; g.lineWidth = 1.3; g.beginPath();
+      for (let t = z0; t < z1; t++) g.lineTo(X(t + 0.5), Y(e.w[t])); g.stroke();
+    }
+    $('zoomval').textContent = (+$('zoom').value).toFixed(2) + ' s';
+  }
+
+  // ---- lab 2: Bell's hazard ----
+  const ELS = [[1, 3], [3, 9], [1, 3], [3, 9], [7, 10.5], [14, 14]];
+  function hazard(b0, b1, alpha, fixed) {
+    if (b1 <= 1) return (1 - 0.5 * Math.exp(alpha * (b1 - 1))) / (1 - 0.5 * Math.exp(alpha * (b0 - 1)));
+    if (b0 < 1 && b1 > 1) { const p1 = fixed ? 0.5 * Math.exp(-alpha * (b1 - 1)) : -0.5 * Math.exp(-alpha * (b1 - 1)); return p1 / (1 - 0.5 * Math.exp(alpha * (b0 - 1))); }
+    return Math.exp(-alpha * (b1 - b0));
+  }
+  function drawHazard() {
+    const col = css(), [m, alpha] = ELS[+$('el').value], wpm = +$('hw').value;
+    $('hwval').textContent = wpm + ' WPM';
+    // float32 like the port
+    const f = Math.fround, rscale = f(1200 / wpm), nom = f(m * rscale);
+    const dmax = Math.ceil(1.7 * nom / 5) * 5;
+    const pts = [];
+    let sP = 1, sF = 1, cross = null;
+    for (let d = 5; d <= dmax; d += 5) {
+      const b0 = f(d / nom), b1 = f((d + 5) / nom);
+      const hp = hazard(b0, b1, alpha, false), hf = hazard(b0, b1, alpha, true);
+      if (b0 < 1 && b1 > 1) cross = { d, hp, hf };
+      sP = Math.max(0, sP * hp); sF = sF * hf;
+      pts.push({ d, hp, hf, sP, sF });
+    }
+    const { g, w, h } = setupCanvas($('c3')); g.clearRect(0, 0, w, h);
+    const pad = { l: 34, r: 10, t: 10, b: 22 }, ph = (h - pad.t - pad.b);
+    const X = (d) => pad.l + (w - pad.l - pad.r) * d / dmax, Y = (v) => pad.t + ph * (1 - (v + 1) / 2);
+    g.strokeStyle = col.line; g.fillStyle = col.muted; g.font = '11px ' + col.mono; g.lineWidth = 1;
+    [-1, -0.5, 0, 0.5, 1].forEach((v) => { g.beginPath(); g.moveTo(pad.l, Y(v) + 0.5); g.lineTo(w - pad.r, Y(v) + 0.5); g.stroke(); g.fillText(String(v), 2, Y(v) + 4); });
+    for (let d = 0; d <= dmax; d += 50) g.fillText(String(d), X(d) - 6, h - 6);
+    g.fillText('ms in element', w - pad.r - 90, h - 6);
+    g.strokeStyle = col.muted; g.setLineDash([4, 3]); g.beginPath(); g.moveTo(X(nom), pad.t); g.lineTo(X(nom), h - pad.b); g.stroke(); g.setLineDash([]);
+    const line = (key, c, lw, dash) => { g.strokeStyle = c; g.lineWidth = lw; g.setLineDash(dash || []); g.beginPath(); pts.forEach((p) => g.lineTo(X(p.d), Y(p[key]))); g.stroke(); g.setLineDash([]); };
+    line('sF', col.accent, 1.2, [5, 4]); line('sP', col.bad, 1.2, [5, 4]);
+    line('hf', col.accent, 2); line('hp', col.bad, 2);
+    pts.forEach((p) => { g.fillStyle = col.bad; g.fillRect(X(p.d) - 1.5, Y(p.hp) - 1.5, 3, 3); });
+    g.fillStyle = col.muted; g.fillText('solid: P(stay) per 5 ms   dashed: survival', pad.l + 6, pad.t + 12);
+    const safe = []; for (let v = 10; v <= 60; v++) if (Number.isInteger(240 * m / v)) safe.push(v);
+    const names = ['dit', 'dah', 'element space', 'character space', 'word space', 'pause'];
+    let txt = `${names[+$('el').value]} at ${wpm} WPM: nominal ${(+nom.toFixed(2))} ms.<br>`;
+    if (cross) txt += `It crosses nominal between ${cross.d} and ${cross.d + 5} ms. Port: P(stay) = <span class="neg">${cross.hp.toFixed(3)}</span>, corrected: ${cross.hf.toFixed(3)}. Every path that stays is dropped.`;
+    else txt += `The 5 ms grid lands exactly on the nominal length, so the faulty branch never runs. This speed hides the bug.`;
+    txt += `<br>Speeds (10–60 WPM) that hide it for this element: ${safe.join(', ')}.`;
+    $('hro').innerHTML = txt;
+  }
+
+  document.querySelectorAll('#mode button').forEach((b) => b.addEventListener('click', () => {
+    document.querySelectorAll('#mode button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+    state.mode = b.dataset.v; run();
+  }));
+  ['bsl', 'snr', 'wpm'].forEach((id) => $(id).addEventListener('input', run));
+  $('show').addEventListener('change', draw);
+  $('zoom').addEventListener('input', draw);
+  $('reseed').addEventListener('click', () => { state.seed = (state.seed * 48271 + 11) % 2147483647; run(); });
+  $('el').addEventListener('change', drawHazard);
+  $('hw').addEventListener('input', drawHazard);
+  let rz; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { draw(); drawHazard(); }, 120); });
+  try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { draw(); drawHazard(); }); } catch (e) {}
+  new MutationObserver(() => { draw(); drawHazard(); }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  run(); drawHazard();
+})();
+</script>

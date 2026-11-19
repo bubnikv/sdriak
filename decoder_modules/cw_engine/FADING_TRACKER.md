@@ -205,7 +205,10 @@ channel until K6.
   of Bell's decoder (`kalfil.c` among others), integrated into fldigi as a
   "Bayes decoding" option. It stayed alpha-stage: testers reported missed
   word spaces and no AFC, and its noise estimator could not track the real
-  noise. It is the only open source Kalman-based CW decoder found.
+  noise. It is the only open source Kalman-based CW decoder found. Checked
+  against the listing, it carries a sign error in the duration model that
+  forbids elements longer than nominal and merges words. The corrected
+  decoder is the bench backend "bell" (BELL.md).
 - **VE3NEA/DeepCW:** the `RayleighFading` generator, Gaussian Doppler
   spectrum validated against Watterson. A channel model only.
 - **Coherent CW:** R. Petit, QST September 1975; C. Woodson, QST May and

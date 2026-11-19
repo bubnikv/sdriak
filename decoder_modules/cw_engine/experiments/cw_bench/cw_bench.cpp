@@ -19,6 +19,7 @@
 //
 // Part of SDRIAK. GPL-3.0-or-later.
 #include "engine/decode_cw.h"
+#include "engine/decode_bell.h"
 #ifdef CW_ENGINE_DEEPCW
 #include "engine/decode_deepcw.h"
 #include "engine/decode_deepcw2.h"
@@ -453,6 +454,27 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
         return be;
     }
 #endif
+    // E. L. Bell's 1977 decoder (BELL.md). "bell" as corrected against the
+    // thesis listing, with the front end's clamps; "bell:listing" without
+    // them; "bell:port" as morse-wip has it. Further suffixes switch one
+    // part each: ":sign" morse-wip's xtrans sign, ":noclamp" neither clamp,
+    // ":paths<N>", ":noif" no emulation of Bell's IF filter.
+    if (name.rfind("bell", 0) == 0) {
+        BellBackendConfig c;
+        for (size_t at = name.find(':'); at != std::string::npos;) {
+            const size_t next = name.find(':', at + 1);
+            const std::string suf = name.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
+            if (suf == "port") c = BellBackendConfig::port();
+            else if (suf == "listing") c = BellBackendConfig::listing();
+            else if (suf == "sign") c.decoder.port_xtrans_sign = true;
+            else if (suf == "noclamp") { c.decoder.clamp_z = false; c.agc_clamp = false; }
+            else if (suf == "noif") c.if_filter = false;
+            else if (suf.rfind("paths", 0) == 0) c.decoder.paths = std::atoi(suf.c_str() + 5);
+            else { std::fprintf(stderr, "unknown bell switch: %s\n", suf.c_str()); std::exit(2); }
+            at = next;
+        }
+        return std::make_unique<SkimBellBackend>(c);
+    }
     CwDecoderConfig cfg;
     const bool v3 = name.rfind("v3", 0) == 0;
     cfg = v3 ? cw_preset_v3() : cw_preset_v2();
