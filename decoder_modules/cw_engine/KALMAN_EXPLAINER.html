@@ -555,7 +555,7 @@ P(k<sub>1:t</sub> | z<sub>1:t</sub>) ∝ P(k<sub>1:t</sub>) · ∏ p(z<sub>τ</s
 <section class="col">
   <span class="sec-no">§8 · on the bench</span>
   <h2>Bell's decoder in cw_engine</h2>
-  <p>The corrected decoder is the bench backend <code>bell</code> (<code>src/engine/bell/</code>, <code>decode_bell.*</code>). It follows the listing routine by routine and keeps Bell's names and 1-based indices. Per channel it has its own state, an emulation of Bell's IF filter, |IQ| at 200&nbsp;Hz and a peak AGC. <code>bell:port</code> reproduces morse-wip, and <code>bell:listing</code> drops the two clamps, which are not in Bell's design.</p>
+  <p>The corrected decoder is the bench backend <code>bell</code> (<code>src/engine/bell/</code>, <code>decode_bell.*</code>). It follows the listing routine by routine and keeps Bell's names, with indices from 0. Per channel it has its own state, an emulation of Bell's IF filter, |IQ| at 200&nbsp;Hz and a peak AGC. <code>bell:port</code> reproduces morse-wip, and <code>bell:listing</code> drops the two clamps, which are not in Bell's design.</p>
   <p>On a synthetic keyed carrier with white noise, the corrected decoder makes 1.4–5× fewer errors than the port on the main copy. At 25 WPM:</p>
   <div class="tbl">
   <table>
