@@ -93,8 +93,11 @@ constexpr int memdel(int ilelm, int iselm) { return kMemdel[iselm][ilelm]; }
 constexpr int mempr(int ilelm, int iselm) { return kMempr[iselm][ilelm]; }
 
 // TRANSL's code tree (morse-wip transl.cxx): node → dit child, dah child,
-// text. 0 is the root. Two links differ from morse-wip: Z's dah child (Z
-// had none, so ',' could never be read) and Q's dit child (pointed at '0').
+// text. 0 is the root, and a child 0 means none: a code that goes there
+// lands in kSink, which keeps it until the character ends (morse-wip goes
+// on from the root; BellConfig::port_tree). Two links differ from
+// morse-wip: Z's dah child (Z had none, so ',' could never be read) and
+// Q's dit child (pointed at '0').
 struct TreeNode {
     int dit, dah;
     const char *chr;
@@ -167,13 +170,17 @@ constexpr TreeNode kTree[] = {
     {0, 65, "*--..-*"},       // 64 --..-
     {0, 0, ","},              // 65 --..--
     {0, 0, "'"},              // 66 .----.
+    {67, 67, "#"},            // 67 sink: no such code
 };
+constexpr int kSink = 67;
+static_assert(std::size(kTree) == kSink + 1, "the sink is the tree's last node");
 
 }  // namespace
 
 BellConfig BellConfig::listing() {
     BellConfig c;
     c.clamp_z = false;
+    c.wpm_min = 10;
     return c;
 }
 
@@ -183,6 +190,7 @@ BellConfig BellConfig::port() {
     c.wpm_min = 5;
     c.wpm_max = 80;
     c.port_xtrans_sign = true;
+    c.port_tree = true;
     c.clamp_z = true;
     return c;
 }
@@ -194,6 +202,19 @@ BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
 }
 
 void BellDecoder::reset() {
+    restart();
+
+    // NOISE's DATA.
+    std::fill(std::begin(m_ylong), std::end(m_ylong), 1.0f);
+    std::fill(std::begin(m_yshort), std::end(m_yshort), 1.0f);
+    m_kl = m_ks = 0;
+    m_kkl = m_kks = 1;
+    m_ymin1 = m_ymin2 = 1.0f;
+    m_ymavg = 0.05f;
+    m_rn = 0.1f;
+}
+
+void BellDecoder::restart() {
     const int np = m_cfg.paths, nn = kNodes * np;
     // PROCES's DATA: ISAVE/25/, LAMBDA/25*5/, ILRATE/5*10,5*20,…,5*50/,
     // P/750*1./, LAMSAV/750*5/, DUR/25*1000./, ILRSAV/750*20/, PATHSV/25*5/.
@@ -221,21 +242,12 @@ void BellDecoder::reset() {
     m_xhat = 0;
     m_elmhat = kDit;
     m_px = m_spdhat = m_pelm = 0.0f;
-    m_rn = 0.1f;
 
     // KALFIL's DATA: YKKIP/25*.5/, PKKIP/25*.1/.
     m_ykkip.assign(np, 0.5f);
     m_pkkip.assign(np, 0.1f);
     m_ykksv.assign(nn, 0.5f);
     m_pkksv.assign(nn, 0.1f);
-
-    // NOISE's DATA.
-    std::fill(std::begin(m_ylong), std::end(m_ylong), 1.0f);
-    std::fill(std::begin(m_yshort), std::end(m_yshort), 1.0f);
-    m_kl = m_ks = 0;
-    m_kkl = m_kks = 1;
-    m_ymin1 = m_ymin2 = 1.0f;
-    m_ymavg = 0.05f;
 
     // TRELIS's DATA: PTHTRL/5000*5/, LMDSAV/5000*5/, N/0/: path 4 and letter
     // state 4 here. (morse-wip zeroes both, and its first NDELAY samples read
@@ -293,9 +305,11 @@ void BellDecoder::proces(float z, float rn, std::string &out) {
         likhd(z, rn, i, m_lambda[i], m_dur[i], m_ilrate[i]);
     }
     // Posterior of each new node, of the key state, element and speed.
-    // When every node scores zero the listing divides by zero; start over.
+    // When every node scores zero (the products underflow single precision)
+    // the listing divides by zero. The paths start over; NOISE's estimate
+    // stays, and the letters still in the trellis are lost.
     if (!probp()) {
-        reset();
+        restart();
         return;
     }
     sprob();
@@ -689,13 +703,14 @@ void BellDecoder::transl(int ltr, std::string &out) {
     if (ltr < 0 || ltr >= kStates) return;
     const int elm = ilami(ltr);
     const int ixl = ilamx(elm);
+    const auto step = [this](int child) { return child != 0 || m_cfg.port_tree ? child : kSink; };
     if (ixl != m_ixlast) {
         switch (elm) {
         case kDit:
-            m_newstate = kTree[m_curstate].dit;
+            m_newstate = step(kTree[m_curstate].dit);
             break;
         case kDah:
-            m_newstate = kTree[m_curstate].dah;
+            m_newstate = step(kTree[m_curstate].dah);
             break;
         case kCharSpace:
             out += kTree[m_curstate].chr;

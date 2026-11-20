@@ -40,8 +40,13 @@ struct BellConfig {
     // SAVEP: save paths until this much posterior mass is kept (POPT).
     double popt     = 0.99;
     // SPDTR: speeds a path may move to, WPM (listing: 10 and 60;
-    // morse-wip: 5 and 80).
-    int    wpm_min  = 10;
+    // morse-wip: 5 and 80). Within a few WPM of the lower limit a character
+    // space before a dit decodes as an element space (TEST as NST at 12–15
+    // WPM with the listing's 10; BELL.md). Part of the reason: SPDTR gives
+    // a step past a limit probability 0 without renormalising the others,
+    // and after a character space RTRANS puts more on the outer steps than
+    // after an element space. 5 keeps the limit below the speeds people send.
+    int    wpm_min  = 5;
     int    wpm_max  = 60;
     // TRELIS: the longest decode delay, in 5 ms samples (NDELAY).
     int    ndelay   = 200;
@@ -61,9 +66,16 @@ struct BellConfig {
     // 5 ms grid lands exactly on it.
     bool port_xtrans_sign = false;
 
-    // The listing alone: no clamp.
+    // morse-wip's code tree, for A/B runs: a code that runs off the tree
+    // goes on from the root, so its tail decodes as a new character (the
+    // 8-dit error sign as "I"). Off, such a code stays in a sink node and
+    // prints one '#'.
+    bool port_tree = false;
+
+    // The listing alone: no clamp, 10–60 WPM.
     static BellConfig listing();
-    // morse-wip as published: 20 paths, 5–80 WPM, the sign error, the clamp.
+    // morse-wip as published: 20 paths, 5–80 WPM, the sign error, its code
+    // tree, the clamp.
     static BellConfig port();
 };
 
@@ -106,6 +118,10 @@ private:
     static constexpr int kNone     = -1;
     static constexpr int kLong     = 200;               // NOISE's windows, samples
     static constexpr int kShort    = 50;
+
+    // PROCES, KALFIL, TRELIS and TRANSL back to their DATA state; NOISE
+    // keeps its own.
+    void   restart();
 
     // Bell's subroutines, in the listing's order.
     void   noise(float zin, float &rn, float &z);

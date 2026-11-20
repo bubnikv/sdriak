@@ -458,7 +458,8 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
     // thesis listing, with the front end's clamps; "bell:listing" without
     // them; "bell:port" as morse-wip has it. Further suffixes switch one
     // part each: ":sign" morse-wip's xtrans sign, ":noclamp" neither clamp,
-    // ":paths<N>", ":noif" no emulation of Bell's IF filter.
+    // ":paths<N>", ":noif" no emulation of Bell's IF filter, ":wpm<lo>-<hi>"
+    // the speeds a path may move to.
     if (name.rfind("bell", 0) == 0) {
         BellBackendConfig c;
         for (size_t at = name.find(':'); at != std::string::npos;) {
@@ -470,6 +471,10 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf == "noclamp") { c.decoder.clamp_z = false; c.agc_clamp = false; }
             else if (suf == "noif") c.if_filter = false;
             else if (suf.rfind("paths", 0) == 0) c.decoder.paths = std::atoi(suf.c_str() + 5);
+            else if (suf.rfind("wpm", 0) == 0 && suf.find('-') != std::string::npos) {
+                c.decoder.wpm_min = std::atoi(suf.c_str() + 3);
+                c.decoder.wpm_max = std::atoi(suf.c_str() + suf.find('-') + 1);
+            }
             else { std::fprintf(stderr, "unknown bell switch: %s\n", suf.c_str()); std::exit(2); }
             at = next;
         }
