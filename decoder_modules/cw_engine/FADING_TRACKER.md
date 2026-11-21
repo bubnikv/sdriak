@@ -3,8 +3,10 @@
 A plan for tracking the HF fading channel in the CW decoder, so that faded
 marks stay weak evidence instead of reading as spaces. Section and table
 numbers refer to `ALGORITHM.md`. The measurements come from
-`experiments/cw_bench` (E0, E3). Nothing here is built yet.
-[PLAN.md](PLAN.md) schedules these steps (P1.1, P2.1, P3.1, P5).
+`experiments/cw_bench` (E0, E3). Nothing here is built in v3 yet; §7
+records what a reference built on Bell's decoder measured, and the
+decisions it supports. [PLAN.md](PLAN.md) schedules these steps (P1.1,
+P2.1, P3.1, P5).
 
 ## Why
 
@@ -166,13 +168,13 @@ bench. The gates stay byte-identical with the switch off.
 
 | Step | Work | Pass criterion |
 |---|---|---|
-| K0 | Bench: output the true gain and keying; add a long continuous-stream mode (minutes of one station, many overs) for a fairer comparison with CW Skimmer's rates; add two-path presets with Doppler shifts (beating), and drift and chirp | — |
-| K1 | Prototype in Python on bench dumps of the channel output and truth: AR(1) against AR(2), the block length, the data-association weighting, the parameter estimators | tracker error against the true gain; B estimated within 30 % from 0.1 to 10 Hz |
-| K2 | `CwGainTracker` in C++ next to `CwPowerStats`, supplying the evidence of §4 (one view when on) | fading table at +10 dB clearly below v2 (ITU moderate < 0.19); no-fading ladder within 0.2 dB; false characters on noise not up; gates pass |
-| K3 | Slow parameters: B, δf, P and the beating indicator, kept per channel and per station | B and δf followed on the beating and drift presets |
+| K0 | Bench: output the true gain and keying; add a long continuous-stream mode (minutes of one station, many overs) for a fairer comparison with CW Skimmer's rates; add drift and chirp. (Two-path presets with Doppler shifts exist: `--fade paths:…`, §7) | — |
+| K1 | Prototype the tracker and its parameter estimators against the true gain. The coherent Bell decoder (`bell:coh`, §7) already prototypes the filter itself in C++; K1 is left with the data-association weighting and the estimators of B and δf | tracker error against the true gain; B estimated within 30 % from 0.1 to 10 Hz |
+| K2 | `CwGainTracker` in C++ next to `CwPowerStats`, supplying the evidence of §4 (one view when on): complex AR(1) gain, B fixed at 0.5 Hz, σ² from the band floor, P learned from marks, an ε-contaminated LLR (scoring only) | fading at +10 dB, 24 WPM: ITU moderate < 0.19 and ITU poor < 0.30 (v3 0.32 and 0.47; `bell:coh` with the {0.3, 1, 3} Hz bank 0.13 and 0.14); no-fading ladder within 0.2 dB; false characters on noise not up; gates pass |
+| K3 | Slow parameters: B, δf, P, kept per channel and per station and re-acquired after a gap in the keying | flat 3 Hz at +10 dB < 0.25 (v3 0.57, `bell:coh` with the true spread 0.12); slow fading not worse than with B fixed |
 | K4 | Smoother at commit, feeding the parameters and an amplitude-aware clock update | — |
 | K5 | Coherence-limited coherent blocks with B and the tracked phase (§5.3.4) | about +1 dB on dits, as simulated |
-| K6 | Per-survivor beliefs (§5.4 W4), only if K2–K5 leave a measurable gap | — |
+| K6 | Per-survivor beliefs (§5.4 W4), only if K2–K5 leave a measurable gap | the gap to `bell:coh` on the fading grid, which is K6's ceiling on the bench (§7) |
 
 **Cost.** An AR(2) complex Kalman filter per observation is on the order of
 100 floating-point operations. For 1536 channels at 250 Hz that is about
@@ -185,7 +187,7 @@ channel until K6.
   the innovation's phase drift should catch it.
 - QRM inside the channel can be taken for the station's own fading.
 - Impulses: reject or down-weight observations with an implausible
-  innovation (§5.7).
+  innovation (§5.7). §7 shows the limit of doing this inside one channel.
 - Overconfident spread estimates. Prefer the faster assumption.
 
 ## 6. Prior work
@@ -260,3 +262,77 @@ channel until K6.
 - AG1LE's experience says the filter is only as good as its noise and
   signal-power inputs, which is why σ², P and B are first-class estimates
   here.
+
+## 7. What the Bell reference measured
+
+BELL.md has the details; all figures are payload CER on `cw_engine_bench`
+(24–25 WPM, 20–50 overs a point, tone 10 Hz off the channel centre).
+`bell:coh` keeps Bell's trellis and replaces his envelope filter with a
+complex Kalman filter on the channel gain, one per survivor path: the
+exact form of K6, so it shows what this plan can reach on the bench.
+
+**The tracker is worth building.**
+
+| | v3 | `bell:coh` | |
+|---|---|---|---|
+| white noise, SNR500 for 10 % CER at 12 / 18 / 25 / 35 WPM | −1.1 / −1.0 / −0.6 / +0.2 dB | −4.5 / −3.0 / −1.4 / +0.7 dB | coherence: 1–3.5 dB at 12–25 WPM |
+| ITU moderate, 10 dB | 0.316 | 0.129 | spread bank {0.3, 1, 3} Hz |
+| ITU poor, 10 dB | 0.470 | 0.138 (0.093 with the true spread) | |
+| flat 3 Hz, 10 dB | 0.569 | 0.119 | |
+| ITU poor, 20 dB | 0.132 | 0.033 | v3's fading floor gone |
+| beating paths ±1 Hz, 10 dB | 0.539 | 0.140 | the bank's fast classes absorb the beat |
+
+**What it says about the design.**
+
+- **AR(1) is enough to start.** An AR(1) gain whose correlation matches
+  the Gaussian Doppler spectrum at 40 ms carried every result above; AR(2)
+  (§1) is not needed for K2.
+- **The spread must be estimated, and shared.** A fixed 0.5 Hz is best on
+  slow fading and fails at 3 Hz (0.63); letting every survivor pick its
+  own spread class from a bank gets the fast cases back but costs
+  0.02–0.05 on slow fading, because a wrong hypothesis can use a fast
+  class to explain noise. One spread per station, measured over seconds of
+  marks (K3), is the design. It should measure how fast the gain actually
+  decorrelates: with beating paths that is faster than either path's
+  spread, and a fast estimate covers the beat without a second model
+  component.
+- **A floor under the spread.** With a small spread the model cannot
+  absorb the AFC's residual frequency error: `bell:coh` with the true
+  spread of ITU good (0.1 Hz) loses to a fixed 0.5 Hz (0.079 against
+  0.047 at 10 dB). Until δf is tracked (K3), keep B at 0.3–0.5 Hz or more.
+- **σ² from the band floor, P learned.** With the noise from
+  `set_floor()` and the signal power averaged over marks the likelihoods
+  are calibrated: `bell:coh` decodes 80–150 characters an hour from noise
+  where Bell's envelope filter makes 400 (v3: 3, with its squelch).
+- **The tone must sit still.** An AR(1) gain cannot follow a steady
+  rotation; `bell:coh` needed an AFC (a 4 s periodogram, followed every
+  0.5 s) that sees each sample 2 s before the decoder. v3's own AFC feeds
+  K2; its residual is what δf in K3 is for.
+- **Impulses: score them, repair them before the channelizer, but do not
+  let one channel's filter decide.** A heavy-tailed noise term in the LLR
+  (§4's ε-contamination; ε = 0.05, κ = 30) halves the impulse damage. Using
+  the same posterior to hold back the state update removes almost all of
+  it but breaks fast fading (ITU poor at 10 dB 0.20 → 0.40): one channel
+  cannot tell an impulse from a quick fade. So K2 uses the term in the LLR
+  only, and impulses are repaired before the channelizer
+  (`ImpulseRepair`, ALGORITHM.md §5.7), where they are short and land in
+  every channel at once. With that stage v3 alone goes from 0.755 to 0.030
+  on sferics and 0.995 to 0.028 on clipped strong pulses;
+  `set_repair_weights()` can tell the tracker which samples were rebuilt.
+- **Samples.** `bell:coh` runs on every second channel sample (125 Hz,
+  noise nearly white). At 35 WPM a dit is four such samples and it falls
+  0.5 dB behind v3; faster sampling with the noise counted as correlated
+  did worse. v3's ½-dit blocks (§3) avoid the question.
+
+**Revised order of work.**
+
+1. K2 with B fixed at 0.5 Hz, σ² from the floor, the ε-term in the LLR
+   only, AR(1). Measure on the fading grid against v3 and `bell:coh`.
+2. K3's spread estimate, shared per station and re-acquired after a gap
+   in the keying, with a 0.3 Hz floor until δf is tracked.
+3. `ImpulseRepair` in the skimmer's front end once a pipeline exists, and
+   the repair weights into the tracker's LLR.
+4. K6 only if K2–K3 stay clearly behind `bell:coh` on the fading grid:
+   soft data association (K2) against per-survivor beliefs is the one
+   question the Bell reference cannot answer, because it is per-survivor
+   throughout.
