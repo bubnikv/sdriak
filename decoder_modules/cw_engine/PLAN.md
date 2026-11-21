@@ -176,8 +176,9 @@ measured against v3 + K2 and DeepCW v2 narrow:
 |---|---|---|
 | R1 | v3's carrier detector as Bell's gate: text passes only while a carrier was seen within 4 s (`BellBackendConfig::gate`, bench `:gate`) | built: false characters on noise 97 → 0 an hour, nothing else moves |
 | R2 | v3's AFC ahead of the decimation (`coarse_afc`, `:cafc`); the station's spread measured and shared | the edge fixed (62.5 Hz 0.70 → 0.04) at a cost on centred tones (12 WPM 1 dB, 25 WPM 0.3 dB: the estimate's moves disturb every path's filter); holding, stepping, per-over, smoothed and a 250 Hz decoder all worse; off. The spread measured (`measure_spread`, `:mspread`): built, below |
-| R3 | observations at 250 Hz with correlated noise, an edge-aware model | 250 Hz as it stands breaks (25 WPM threshold +2.2 dB) |
-| R4 | the beam: 25 / 50 / 100 paths | — |
+| R3 | observations at 250 Hz with correlated noise, an edge-aware model | not needed as planned: keying edges of 1–10 ms move Bell by ≤ 0.4 dB, and its threshold rises with the speed as the energy per dit falls (12 → 35 WPM: 4.9 dB against 4.6 dB of energy); DeepCW's rises only 3.7 dB, its context helps it at speed. 250 Hz as it stands breaks (25 WPM +2.2 dB) |
+| R4 | the beam: 25 / 50 / 100 paths (`BellConfig::paths`, `:paths<n>`) | built, below: 100 paths 0.2–0.8 dB better at 18–35 WPM, nothing at 12 |
+| R4b | a noise floor in the score at the path's predicted mark power over 1000 (`coh_floor_ratio`, `:floor1000`), as K2's | built: 60 dB 0.099 → 0.004, 20–40 dB ≤ 0.012, fading and weak signals unchanged |
 | R5 | impulses: repair weights, the sferic anomaly | — |
 | R6 | within 1.5 dB of `dcw2n` at 12–25 WPM, no false characters: a v4 backend | — |
 
@@ -207,8 +208,21 @@ AFC:
 - Slow and moderate fading as the bank or better; fast fading weaker (the
   estimator reads 3 Hz as about 0.8 Hz; 10 Hz is beyond the per-sample
   filters); no false characters on noise.
-- Strong stations: 0.099 at 60 dB (one spread 0.718): the score needs
-  K2's kind of floor.
+- Strong stations: 0.099 at 60 dB (one spread 0.718), fixed by R4b.
+
+With R4b and the beam (gate, measured spread, floor 1000), white noise,
+SNR500 for 10 % / 3 %:
+
+| paths | 12 | 18 | 25 | 35 | CPU per 27 s over |
+|---|---|---|---|---|---|
+| 25 | −4.56 / −3.24 | −3.23 / −1.97 | −1.48 / −0.39 | +0.38 / +1.54 | 0.16 s |
+| 50 | −4.40 / −2.63 | | −1.66 / −0.37 | | 0.30 s |
+| 100 | −4.37 / −2.91 | −3.41 / −2.04 | −2.09 / −0.41 | −0.43 / +0.99 | 0.60 s |
+| `dcw2n` | −5.82 / −4.01 | about −4.3 | −3.67 / −1.70 | −2.13 / −0.51 | |
+
+v3 takes 0.08 s, the channelizer included. 100 paths are within 1.5–1.7 dB
+of `dcw2n` at 12–35 WPM; fading at 10 dB as with 25 (ITU poor 0.123, flat
+3 Hz 0.291, beat 0.359); no false characters on noise.
 
 **The order from here.** It replaces §3's order for the steps it names;
 each step keeps its pass criteria and its switch, byte-identical when off.

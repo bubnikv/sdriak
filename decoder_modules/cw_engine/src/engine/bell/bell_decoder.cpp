@@ -578,16 +578,27 @@ float BellDecoder::kalfil_coh(int ip, int ixs, int jnode, float pin, int c) {
     // A sample the impulse repair rebuilt (weight m_wt) carries 1 − m_wt of
     // its evidence: its log-likelihood and its Kalman gain are scaled by it.
     const float tw = 1.0f - m_wt;
+    // The noise both hypotheses score with: 1, or the path's predicted mark
+    // power over coh_floor_ratio where that is more. Without it a strong
+    // station's samples mismatch either hypothesis by far more than the
+    // unit noise allows at every keying edge (as v3's tracker,
+    // SKIM_V3_TRACK_RATIO).
+    const float sn = m_cfg.coh_floor_ratio > 0.0f
+                         ? std::max(1.0f, (gr * gr + gi * gi + ppred) / m_cfg.coh_floor_ratio) : 1.0f;
     if (ixs == 0) {
         m_ykksv[jnode] = gr;
         m_yiksv[jnode] = gi;
         m_pkksv[jnode] = ppred;
         const float y2 = m_yr * m_yr + m_yi * m_yi;
+        if (sn > 1.0f && !imp) {
+            const float l = -y2 / sn - std::log(sn);
+            return m_wt > 0.0f ? tw * l : l;
+        }
         if (!imp) return m_wt > 0.0f ? -tw * y2 : -y2;
         const float l = lse(m_ln_gauss - y2, m_ln_imp - y2 / kappa - m_ln_kappa);
         return m_wt > 0.0f ? tw * l : l;
     }
-    const float s = ppred + 1.0f, er = m_yr - gr, ei = m_yi - gi, e2 = er * er + ei * ei;
+    const float s = ppred + sn, er = m_yr - gr, ei = m_yi - gi, e2 = er * er + ei * ei;
     const float k = m_wt > 0.0f ? tw * (ppred / s) : ppred / s;
     if (!imp) {
         m_ykksv[jnode] = gr + k * er;

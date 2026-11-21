@@ -677,6 +677,8 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf == "gate") c.gate = true;
             else if (suf == "cafc") c.coarse_afc = true;
             else if (suf == "mspread") c.measure_spread = true;
+            else if (suf.rfind("paths", 0) == 0) c.decoder.paths = std::atoi(suf.c_str() + 5);
+            else if (suf.rfind("floor", 0) == 0) c.decoder.coh_floor_ratio = static_cast<float>(std::atof(suf.c_str() + 5));
             else if (suf == "impscore") c.decoder.coh_imp_update = false;
             else if (suf == "repw") c.decoder.coh_repair_weight = true;
             else if (suf.rfind("imp", 0) == 0) c.decoder.coh_imp_eps = static_cast<float>(std::atof(suf.c_str() + 3));

@@ -81,6 +81,10 @@ struct BellConfig {
     std::vector<float> coh_spreads;
     float  coh_match_ms  = 40.0f;
     float  coh_omega0    = 10.0f;     // Ω before any mark, per sample
+    // The noise both hypotheses score with is at least the path's predicted
+    // mark power (|g|² + P) over this; 0: the unit noise alone. The
+    // impulse mixture keeps the unit noise.
+    float  coh_floor_ratio = 0.0f;
     // Impulses: the noise is w ~ (1 − coh_imp_eps)·CN(0, 1) +
     // coh_imp_eps·CN(0, coh_imp_kappa). A sample far outside the Gaussian
     // part then counts as weak evidence for either key state instead of
