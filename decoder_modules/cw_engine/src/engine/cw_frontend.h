@@ -41,6 +41,7 @@
 #include "cw_clock.h"
 #include "cw_debug.h"
 #include "cw_gain_tracker.h"
+#include "cw_spread_estimator.h"
 #include "cw_preroll.h"
 #include "decode_cw_config.h"
 
@@ -632,6 +633,8 @@ public:
         m_power.init(rate);
         m_matched.init(cfg.lowpass_hz, cfg.sum_dits, cfg.max_sum);
         m_track = cfg.track_hz > 0;
+        m_measure = m_track && cfg.track_measure;
+        if (m_measure) { m_spread.init(rate); }
         if (m_track) {
             m_tracker.init(rate, cfg.track_hz, cfg.track_narrow_hz, cfg.track_eps, cfg.track_kappa, cfg.track_adapt,
                            cfg.track_ratio);
@@ -645,6 +648,21 @@ public:
                                                   // matched LLR; above it v2's
                                                   // own view, verbatim
     bool   tracking() const { return m_track; }               // SKIM_V3_TRACK
+    bool   measuring() const { return m_measure; }            // SKIM_V3_SPREAD
+    float  sum_re() const { return static_cast<float>(m_matched.out_re()); }  // the last frame's u
+    float  sum_im() const { return static_cast<float>(m_matched.out_im()); }
+    // K3: u at lattice time t, and a committed mark (start, end] of it.
+    void   spread_push(uint64_t t, float re, float im, bool valid) { m_spread.push(t, re, im, valid); }
+    void   spread_mark(uint64_t start, uint64_t end) {
+        m_spread.mark(start, end, m_matched.length(), m_power.noise());
+        if (m_spread.spread() > 0) {
+            // "when in doubt, assume faster": the committed marks favour the
+            // moments the gain is up, and a beat is no Gaussian spectrum
+            m_tracker.set_spread(std::max(kSpreadFloorHz, kSpreadMargin * m_spread.spread()));
+            m_tracker.set_rotation(m_spread.residual_hz());
+        }
+    }
+    double measured_spread() const { return m_spread.spread(); }
     float  tracker_llr() const { return m_tracker_llr; }      // its llr, last frame
     bool   candidate() const { return m_detector.candidate(); }
     double carrier_hz() const { return m_detector.carrier_hz(); }
@@ -695,6 +713,7 @@ public:
             track(r);
             pre.set_matched(pre_head - (k - 1), r);
             if (m_track) { pre.set_llr(pre_head - (k - 1), m_tracker_llr); }
+            if (m_measure) { pre.set_sum(pre_head - (k - 1), sum_re(), sum_im()); }
         }
         m_keep_presence = false;
     }
@@ -743,6 +762,10 @@ private:
                                           // backfill)
     bool   m_track = false;               // SKIM_V3_TRACK
     float  m_tracker_llr = 0.0f;
+    static constexpr auto kSpreadMargin = 1.3;   // the measured spread, inflated by this
+    static constexpr auto kSpreadFloorHz = 0.3;  // … and at least this
+    bool   m_measure = false;             // SKIM_V3_SPREAD
+    CwSpreadEstimator m_spread;
     double m_rate = 0;
     double m_weak_db = 0;                 // SKIM_V3_WEAK_DB
 

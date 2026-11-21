@@ -509,6 +509,49 @@ Payload CER at 24 WPM, 50 overs a point, v3 → K2 (B = 1 Hz):
     at or near zero.
   - Cost per 47 s over on an i3-N300: v3 < 0.1 s, DeepCW v2 narrow
     ≈ 0.5 s, v1 ≈ 8.5 s.
+- **K3, the spread measured on the station** (`CwSpreadEstimator`,
+  `SKIM_V3_SPREAD=1` with the tracker; off by default). Inside each
+  committed mark, away from the matched filter's ramps, the tracker's sums
+  pair with the interior samples of the last 0.8 s of marks, at least one
+  sum length apart; the pairs estimate the gain's autocorrelation by 40 ms
+  lag bin, forgetting over 20 s of mark time. B is the fit of
+  −ln|ρ| = π²B²τ²/2 over the lags where 0.2 ≤ |ρ| ≤ 0.95, the rotation δf
+  the slope of arg ρ. It reads 0.2 Hz on a steady signal or 0.1 Hz fading,
+  0.7–1.2 Hz under 1 Hz fading and ITU poor, and 0.8 Hz under 3 Hz: the
+  committed marks favour the moments the gain is up. So the tracker takes
+  1.3× the measured B, at least 0.3 Hz, predicts the measured rotation,
+  and on a strong station keeps at least the configured 1 Hz (the spread
+  follows the SNR from the measured value under 3 dB to that over 10 dB):
+  a narrow spread on a strong signal cannot absorb the AFC's wandering
+  residual, which a constant rotation does not model (strong signals at
+  30–60 dB 0.04–0.05 without that rule, 0.012–0.018 with it).
+  - White noise, SNR500 for 10 % / 3 % at 12 / 25 / 35 WPM, K2 → K2 + K3:
+    −1.07 / −0.20 → −1.11 / −0.49, −0.78 / +0.52 → −0.82 / −0.02,
+    −0.21 / +1.75 → −0.18 / +1.30: the 3 % thresholds 0.3–0.5 dB better,
+    the 10 % ones unchanged.
+  - Fading at 0 / 10 / 20 dB, strong signals, chirp, impulses behind the
+    repair: level with K2 within the noise (beating at 10 dB 0.442 →
+    0.435, 10 Hz 0.191 → 0.192). No false characters on noise; the gate
+    passes.
+  - K3's pass criteria (PLAN.md S2) in part: slow fading not worse, the
+    3 % gap to v3 closed at 12–25 WPM; chirp (0.046 against v3's 0.020)
+    and beating (0.435, target < 0.40) are not met.
+- **K5, coherence-limited blocks, tried and left out.** A mark scored
+  in blocks of the lag at which K3's spread decorrelates the gain to 0.9
+  (0.146/B s: the whole element at 0.3 Hz, about a dit at 3 Hz), each
+  block a known-amplitude, unknown-phase test, −n·A²/σ² + ln I0(2A·|S|/σ²),
+  in place of the per-sample evidence. With A blended from the station's
+  mark power near threshold to the tracker's prediction above 10 dB:
+  white noise mixed (25 WPM at −1 dB 0.113 → 0.089, at −3 dB 0.620 →
+  0.690), ITU poor at 20 dB 0.025 → 0.168. With the block evidence itself
+  blended out above 10 dB: 20 dB back to 0.025, but weak fading worse
+  (ITU poor at 3 dB 0.447 → 0.585, 10 dB 0.162 → 0.310: a fading station
+  reads under its mean SNR, and the steady amplitude is wrong in a fade).
+  On a strong signal a known-amplitude test is brittle (a modest mismatch
+  in amplitude or phase within a block flips its sign); near threshold it
+  needs an amplitude that is both reliable and follows a fade, which
+  neither the mark power nor the diluted tracker estimate is, and an
+  amplitude estimated per block makes false marks cheap.
 - **K6 inside v3's lattice, tried and left out.** A gain belief per lattice
   boundary, each space boundary opening a filter that scores the samples
   after it as a mark against its path's gain, in place of K2's evidence

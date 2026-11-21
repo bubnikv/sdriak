@@ -249,7 +249,7 @@ private:
     void lattice_flush(CwText &text);
     bool carrier_watch();
     void live_emit(CwText &text);
-    void soft_step(float soft_env, float matched_amp, float front_llr, CwText &text);
+    void soft_step(float soft_env, float matched_amp, float front_llr, float sum_re, float sum_im, CwText &text);
     bool preroll_replay(CwText &text);
     void clock_watchdog(CwText &text);
     float front_end_step(float i, float q);
@@ -417,6 +417,7 @@ void CwState::word_close(CwText &text, uint64_t B) {
 // One committed segment of the best path, type ty, d samples over
 // [start, end): the clock, the fist and the character assembly.
 void CwState::on_segment(CwSeg ty, double d, uint64_t start, uint64_t end, CwText &text) {
+    if (is_mark(ty) && m_front.measuring() && weak_view()) { m_front.spread_mark(start, end); }   // K3
     // Did the live rule already emit for the space starting here?
     const bool lived = m_live.lived(start);
     CW_DBG(m_trace, "[commit %s d=%.0f dit=%.1f err=%.2f t=%.2f csp=%.2f wsp=%.2f]\n",
@@ -566,7 +567,8 @@ void CwState::live_emit(CwText &text) {
 // lattice step → lagged commit + live emission. Factored out of the live
 // loop VERBATIM so the pre-roll replay pushes ring samples through the
 // exact same float ops a live sample takes.
-void CwState::soft_step(float soft_env, float matched_amp, float front_llr, CwText &text) {
+void CwState::soft_step(float soft_env, float matched_amp, float front_llr, float sum_re, float sum_im,
+                        CwText &text) {
     const double mid = m_disc.update(soft_env);
     if (carrier_watch())
         return;
@@ -580,6 +582,7 @@ void CwState::soft_step(float soft_env, float matched_amp, float front_llr, CwTe
     }
     m_t++;
     m_lattice.push_llr(m_t, llr);
+    if (m_front.measuring()) { m_front.spread_push(m_t, sum_re, sum_im, matched_amp > 0.0f); }
     m_lattice.step(m_t, segment_priors());
 
     if ((m_t & 7) == 0) {                      // lagged commit, every 8
@@ -624,7 +627,7 @@ bool CwState::preroll_replay(CwText &text) {
     for (unsigned k = start; k < have; k++) {
         const unsigned at = m_preroll.head() - have + k;
         soft_step(m_preroll.env(at), m_front.on() ? m_preroll.matched(at) : 0.0f,
-                  m_front.tracking() ? m_preroll.llr(at) : 0.0f, text);
+                  m_front.tracking() ? m_preroll.llr(at) : 0.0f, m_preroll.sum_re(at), m_preroll.sum_im(at), text);
     }
     return true;
 }
@@ -703,6 +706,9 @@ float CwState::front_end_step(float i, float q) {
     }
     m_preroll.put_matched(matched_amp);
     if (m_front.tracking()) { m_preroll.put_llr(matched_amp > 0.0f ? m_front.tracker_llr() : 0.0f); }
+    if (m_front.measuring()) {
+        m_preroll.put_sum(matched_amp > 0.0f ? m_front.sum_re() : 0.0f, matched_amp > 0.0f ? m_front.sum_im() : 0.0f);
+    }
     return matched_amp;
 }
 
@@ -916,7 +922,8 @@ bool CwState::process(const float *iq, unsigned nframes, SkimDecode *out) {
             continue;
         }
 
-        soft_step(soft_env, matched_amp, m_front.tracking() ? m_front.tracker_llr() : 0.0f, text);
+        soft_step(soft_env, matched_amp, m_front.tracking() ? m_front.tracker_llr() : 0.0f, m_front.sum_re(),
+                  m_front.sum_im(), text);
         if (m_front.on() && m_lattice.active() && !m_paused && m_clock.dit() > 0 && m_cfg.v3.reader.on &&
             m_reader.due(m_t, m_rate)) {
             m_reader.read(read_view(), m_cfg.v3.reader);

@@ -137,6 +137,9 @@ struct CwFrontEndConfig {
     double track_eps = 0.05;
     double track_kappa = 30.0;
     bool   track_adapt = false;
+    // SKIM_V3_SPREAD=1: with the tracker, its spread measured on the station
+    // (CwSpreadEstimator, FADING_TRACKER.md K3) instead of fixed at B.
+    bool   track_measure = false;
     // The matched filter (CwMatchedFilter): SKIM_V3_LP_HZ the low-pass ahead
     // of the coherent sum (60), SKIM_V3_SUM_DITS its length in dits (½),
     // SKIM_V3_SUM_MAX its cap in frames (10); 0 keeps the default.

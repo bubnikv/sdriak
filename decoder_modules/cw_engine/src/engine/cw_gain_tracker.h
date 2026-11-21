@@ -65,6 +65,7 @@ public:
         m_ratio = ratio;
         m_rate = rate;
         m_wide_hz = spread_hz;
+        m_config_hz = spread_hz;
         m_narrow_hz = narrow_hz > 0 ? narrow_hz : spread_hz;
         m_a = coefficient(m_wide_hz);
         m_eps = eps;
@@ -73,6 +74,24 @@ public:
         m_imp_share = eps;
         m_imp_power = eps * kappa;
         reset();
+    }
+
+    // The spread measured on the station (CwSpreadEstimator), in place of
+    // the configured one.
+    // A weak station takes it as it is; a strong one at least the configured
+    // spread, which absorbs the AFC's wandering residual (the spread then
+    // follows the SNR between kNarrowDb and kWideDb, as with narrow_hz).
+    void set_spread(double b) {
+        m_narrow_hz = b;
+        m_wide_hz = std::max(m_config_hz, b);
+    }
+    double spread() const { return m_wide_hz; }
+    // The gain's mean rotation, Hz (the AFC's residual, measured on the
+    // station): predicted, not left to the spread.
+    void set_rotation(double hz) {
+        m_rotate = true;
+        m_rot_re = std::cos(2.0 * SKIM_PI * hz / m_rate);
+        m_rot_im = std::sin(2.0 * SKIM_PI * hz / m_rate);
     }
 
     // A fresh gain; the impulse term, a property of the band, is kept.
@@ -95,8 +114,14 @@ public:
         }
         const double P = std::max(mark - noise, kMinMarkToNoise * noise);
         // predict one frame
-        m_mu_re *= m_a;
-        m_mu_im *= m_a;
+        if (m_rotate) {
+            const double r = m_a * (m_mu_re * m_rot_re - m_mu_im * m_rot_im);
+            m_mu_im = m_a * (m_mu_re * m_rot_im + m_mu_im * m_rot_re);
+            m_mu_re = r;
+        } else {
+            m_mu_re *= m_a;
+            m_mu_im *= m_a;
+        }
         m_rel = m_a * m_a * m_rel + (1.0 - m_a * m_a);
         // the score against the prediction
         const double var = m_rel * P;
@@ -167,7 +192,10 @@ private:
 
     double   m_a = 1.0;                   // AR(1) coefficient per frame
     double   m_rate = 250.0;
+    bool     m_rotate = false;            // set_rotation()
+    double   m_rot_re = 1.0, m_rot_im = 0.0;
     double   m_wide_hz = 1.0, m_narrow_hz = 1.0;  // the spread, strong and weak
+    double   m_config_hz = 1.0;           // B as configured
     double   m_ratio = 0.0;               // the score's noise ≥ (|µ|² + V) / this
     double   m_eps = 0.0, m_kappa = 30.0; // the impulse term
     bool     m_adapt = false;             // … learned

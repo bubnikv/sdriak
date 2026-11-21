@@ -46,6 +46,15 @@ public:
     // The fading tracker's llr, likewise (v3 with SKIM_V3_TRACK).
     void put_llr(float l) { m_llr[m_head & (m_size - 1)] = l; }
     void set_llr(unsigned at, float l) { m_llr[at & (m_size - 1)] = l; }
+    // … and the tracker's sum u (K3; allocated on first use).
+    void put_sum(float re, float im) { set_sum(m_head, re, im); }
+    void set_sum(unsigned at, float re, float im) {
+        if (m_sum.empty()) { m_sum.resize(2 * static_cast<size_t>(m_size)); }
+        m_sum[2 * (at & (m_size - 1))] = re;
+        m_sum[2 * (at & (m_size - 1)) + 1] = im;
+    }
+    float sum_re(unsigned at) const { return m_sum.empty() ? 0.0f : m_sum[2 * (at & (m_size - 1))]; }
+    float sum_im(unsigned at) const { return m_sum.empty() ? 0.0f : m_sum[2 * (at & (m_size - 1)) + 1]; }
     // The sample's soft-path envelope; the head moves on.
     void push(float ms) { m_env[m_head++ & (m_size - 1)] = ms; }
     // Everything so far was decoded or squelched: a replay may only reach
@@ -147,6 +156,7 @@ private:
     std::vector<float> m_env;             // the soft path's envelope
     std::vector<float> m_matched;         // v3: the matched amplitude
     std::vector<float> m_llr;             // v3: the fading tracker's llr
+    std::vector<float> m_sum;             // v3, K3: the tracker's sums, 2 floats each
     unsigned m_size = 0;                  // power of two
     unsigned m_head = 0;                  // total writes; index = & (size-1)
     unsigned m_from = 0;                  // replay window fence (write count)
