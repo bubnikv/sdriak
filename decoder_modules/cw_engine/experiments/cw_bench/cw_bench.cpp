@@ -84,6 +84,10 @@ struct Options {
     int imp_shape = 0;                 // ImpShape: delta, receiver-shaped, sferic
     double clip_db = 0.0;              // > 0: ADC clipping, this far over the wideband noise rms
     bool repair = false;               // ImpulseRepair on the wideband stream before the channelizer
+    double drift_hz_s = 0.0;           // the target's frequency drift, Hz/s
+    double chirp_hz = 0.0, chirp_ms = 0.0;   // each key-down's offset and its decay
+    bool cochannel = false;            // a second keyed station in the target's channel
+    double cochannel_db = 0.0, cochannel_hz = 0.0;  // its level over the target, its offset
     int qrm_n = 0;                     // other keyed CW stations in other channels
     double qrm_db = 30.0;              // their SNR500, the strongest
     double qrm_range = 0.0;            // and how far below it they spread
@@ -226,6 +230,20 @@ bool parse_args(int argc, char **argv, Options &o) {
         else if (a.rfind("--repair", 0) == 0) {           // --repair[=<threshold dB>]
             o.repair = true;
             if (a.size() > 9 && a[8] == '=') o.repair_thr_db = std::atof(a.c_str() + 9);
+        }
+        else if (a == "--drift") o.drift_hz_s = std::atof(val());     // Hz/s
+        else if (a == "--chirp") {                                  // <Hz>:<ms>
+            if (std::sscanf(val(), "%lf:%lf", &o.chirp_hz, &o.chirp_ms) != 2 || o.chirp_ms <= 0) {
+                std::fprintf(stderr, "bad --chirp\n");
+                return false;
+            }
+        }
+        else if (a == "--cochannel") {                              // <dB>:<Hz>
+            if (std::sscanf(val(), "%lf:%lf", &o.cochannel_db, &o.cochannel_hz) != 2) {
+                std::fprintf(stderr, "bad --cochannel\n");
+                return false;
+            }
+            o.cochannel = true;
         }
         else if (a == "--classa") {                                 // <A>:<Gamma>
             if (std::sscanf(val(), "%lf:%lf", &o.classa_a, &o.classa_gamma) != 2 || o.classa_a <= 0) {
@@ -666,26 +684,17 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
         env.resize(env.size() + static_cast<size_t>(o.tail_s * o.rate), 0.0f);
     }
 
-    auto ch = SkimChannelizer::create_ex(o.rate, 125.0, o.passband, o.taps);
+    // the wideband impulse repair before the filter bank (--repair)
+    ImpulseRepair::Config rc;
+    rc.thr_db = o.repair_thr_db;
+    rc.split_db = o.repair_split_db;
+    rc.hold_off_ms = o.repair_holdoff_ms;
+    rc.order = o.repair_order;
+    auto ch = SkimChannelizer::create_ex(o.rate, 125.0, o.passband, o.taps, o.repair ? &rc : nullptr);
     if (!ch) { std::fprintf(stderr, "bad channelizer geometry\n"); std::exit(2); }
     auto dec = backend.channel_new(ch->out_rate());
-    // the wideband impulse repair before the channelizer (--repair)
-    std::unique_ptr<ImpulseRepair> repair;
-    if (o.repair) {
-        ImpulseRepair::Config rc;
-        rc.thr_db = o.repair_thr_db;
-        rc.split_db = o.repair_split_db;
-        rc.hold_off_ms = o.repair_holdoff_ms;
-        rc.order = o.repair_order;
-        repair = std::make_unique<ImpulseRepair>(o.rate, rc);
-    }
-    // Its flags per wideband sample, a running count over the channelizer
-    // prototype's span (taps × branches), and the weights handed on.
-    std::vector<unsigned char> rflags(512);
-    std::vector<unsigned char> rring(static_cast<size_t>((o.taps ? o.taps : 8) * std::lround(o.rate / 125.0)), 0);
-    std::vector<float> wpi(512), wch(4096);
-    int rsum = 0;
-    size_t rat = 0;
+    const ImpulseRepair *repair = ch->repair();
+    std::vector<float> wch(4096);           // the channel frames' repair weights
     const double enbw = channel_enbw(o);
     const double chan_hz = ch->offset_hz(o.channel);
 
@@ -813,6 +822,22 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     const size_t pre_n = o.preamble_db > 0 ? static_cast<size_t>((o.lead_s + 40 * 1.2 / wpm) * o.rate) : 0;
     const double pre_gain = o.preamble_db > 0 ? std::pow(10.0, -o.preamble_db / 20.0) : 1.0;
     const double w0 = 2 * SKIM_PI * (chan_hz + foff) / o.rate;
+    // The target's phase beyond w0·k (--drift, --chirp): a linear ramp, and
+    // at each key-down an offset decaying from its onset.
+    std::vector<double> xph;
+    if (o.drift_hz_s != 0.0 || o.chirp_hz != 0.0) {
+        xph.assign(env.size(), 0.0);
+        double acc = 0.0, since = 1e300;
+        const double tau = o.chirp_ms * 1e-3 * o.rate;
+        for (size_t k = 0; k < env.size(); k++) {
+            if (env[k] > 0.0f && (k == 0 || env[k - 1] == 0.0f)) since = 0.0;
+            double f = o.drift_hz_s * static_cast<double>(k) / o.rate;
+            if (o.chirp_hz != 0.0 && since < 50.0 * tau) f += o.chirp_hz * std::exp(-since / tau);
+            xph[k] = acc;
+            acc += 2 * SKIM_PI * f / o.rate;
+            since += 1.0;
+        }
+    }
 
     // other stations (--qrm): keyed CW in other channels, at least two
     // channels away, each with its own text, speed and level
@@ -856,6 +881,23 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             qrm.push_back(std::move(s));
         }
     }
+    // a second station in the target's own channel (--cochannel): its own
+    // text and speed, cochannel_hz from the target, cochannel_db over it
+    if (o.cochannel) {
+        std::mt19937 rc(9500 + seed);
+        std::uniform_real_distribution<double> uc(0.0, 1.0);
+        const double wc = 15.0 + 20.0 * uc(rc);
+        Qrm s;
+        size_t len = 0;
+        while (len < env.size()) {
+            const auto r = envelope_runs(payload(rc), wc, o.rate, o.jitter, 0.3 + uc(rc), o.edge_ms, rc);
+            for (const auto &p : r) len += static_cast<size_t>(p.first);
+            s.key.runs.insert(s.key.runs.end(), r.begin(), r.end());
+        }
+        s.amp = amp * std::pow(10.0, o.cochannel_db / 20.0);
+        s.w = 2 * SKIM_PI * (chan_hz + foff + o.cochannel_hz) / o.rate;
+        qrm.push_back(std::move(s));
+    }
 
     std::string out;
     std::vector<float> iq(2 * 512), cbuf(2 * 4096);
@@ -866,13 +908,13 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             const size_t k = at + i;
             cplx s;
             if (o.paths.empty()) {
-                s = std::polar(amp * env[k], ph);
+                s = std::polar(amp * env[k], xph.empty() ? ph : ph + xph[k]);
             } else {
                 for (size_t pi = 0; pi < o.paths.size(); pi++) {
                     if (k < delay[pi]) continue;
                     const size_t kd = k - delay[pi];
                     s += std::sqrt(o.paths[pi].power) * gain[pi][k] *
-                         std::polar(amp * env[kd], w0 * static_cast<double>(kd));
+                         std::polar(amp * env[kd], w0 * static_cast<double>(kd) + (xph.empty() ? 0.0 : xph[kd]));
                 }
             }
             for (Qrm &q : qrm) {
@@ -913,25 +955,9 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             iq[2 * i + 1] = static_cast<float>(im);
             ph += w0;
         }
-        if (repair) {
-            repair->process(iq.data(), iq.data(), static_cast<unsigned>(n), rflags.data());
-            // Each channel sample's repair weight: the share of repaired
-            // samples in the channelizer prototype's span behind it (its
-            // window is centred on its group delay, so the trailing span
-            // lines up with the sample it produces now).
-            for (size_t i = 0; i < n; i++) {
-                rsum += rflags[i] - rring[rat];
-                rring[rat] = rflags[i];
-                rat = (rat + 1) % rring.size();
-                wpi[i] = static_cast<float>(rsum) / static_cast<float>(rring.size());
-            }
-        }
         ch->push(iq.data(), static_cast<unsigned>(n));
-        const unsigned got = ch->read(o.channel, cbuf.data(), 4096);
-        if (repair && got) {
-            for (unsigned j = 0; j < got; j++) wch[j] = wpi[std::min(n - 1, ((j + 1) * n) / got - 1)];
-            dec->set_repair_weights(wch.data(), got);
-        }
+        const unsigned got = ch->read(o.channel, cbuf.data(), 4096, wch.data());
+        if (repair && got) dec->set_repair_weights(wch.data(), got);
         SkimDecode d{};
         if (got && dec->process(cbuf.data(), got, &d)) out += d.text;
     }
