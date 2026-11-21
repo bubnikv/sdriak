@@ -29,7 +29,10 @@ public:
     void init(unsigned size, bool matched) {
         m_size = size;
         m_env.assign(static_cast<size_t>(m_size), 0.0f);
-        if (matched) { m_matched.assign(static_cast<size_t>(m_size), 0.0f); }
+        if (matched) {
+            m_matched.assign(static_cast<size_t>(m_size), 0.0f);
+            m_llr.assign(static_cast<size_t>(m_size), 0.0f);
+        }
     }
 
     bool     empty() const { return m_env.empty(); }
@@ -40,6 +43,9 @@ public:
     void put_matched(float mr) { m_matched[m_head & (m_size - 1)] = mr; }
     // … written later, at write count `at` (the front end's backfill).
     void set_matched(unsigned at, float r) { m_matched[at & (m_size - 1)] = r; }
+    // The fading tracker's llr, likewise (v3 with SKIM_V3_TRACK).
+    void put_llr(float l) { m_llr[m_head & (m_size - 1)] = l; }
+    void set_llr(unsigned at, float l) { m_llr[at & (m_size - 1)] = l; }
     // The sample's soft-path envelope; the head moves on.
     void push(float ms) { m_env[m_head++ & (m_size - 1)] = ms; }
     // Everything so far was decoded or squelched: a replay may only reach
@@ -49,6 +55,7 @@ public:
     // The samples at write count `at`.
     float env(unsigned at) const { return m_env[at & (m_size - 1)]; }
     float matched(unsigned at) const { return m_matched[at & (m_size - 1)]; }
+    float llr(unsigned at) const { return m_llr[at & (m_size - 1)]; }
 
     // The over's head in the last `have` samples of the ring (the matched one
     // when `use_matched`): true with the replay starting `start` samples into
@@ -139,6 +146,7 @@ public:
 private:
     std::vector<float> m_env;             // the soft path's envelope
     std::vector<float> m_matched;         // v3: the matched amplitude
+    std::vector<float> m_llr;             // v3: the fading tracker's llr
     unsigned m_size = 0;                  // power of two
     unsigned m_head = 0;                  // total writes; index = & (size-1)
     unsigned m_from = 0;                  // replay window fence (write count)

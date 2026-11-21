@@ -126,6 +126,23 @@ struct CwFrontEndConfig {
     // and QSB handling stays where it was earned; the new statistic serves
     // the stations v2 loses (L of R 26-34 % under 10 dB).
     double weak_db = 8.0;              // SKIM_V3_WEAK_DB: weak view below, SNR500
+    // SKIM_V3_TRACK=<B>[,<eps>,<kappa>[,<adapt>]]: the fading tracker
+    // (FADING_TRACKER.md K2, CwGainTracker) with Doppler spread B Hz and the
+    // impulse term eps, kappa, learned from the channel from those values
+    // when adapt is 1 (off: on a strong clean station it learns the marks'
+    // onsets as impulses, FADING_TRACKER.md §8). On, there is one view: the weak view's machinery on the
+    // tracker's evidence. 0: off; 1 Hz is the best fixed spread on the bench
+    // (FADING_TRACKER.md §8).
+    double track_hz = 0.0;             // SKIM_V3_TRACK: B; 0 = no tracker
+    double track_eps = 0.05;
+    double track_kappa = 30.0;
+    bool   track_adapt = false;
+    double track_narrow_hz = 0.0;      // SKIM_V3_TRACK_NARROW: B on a weak signal (0: B)
+    // SKIM_V3_TRACK_RATIO: the score's noise is at least the predicted mark
+    // power over this (30 dB): without it a strong station's score crosses
+    // zero on the matched filter's ramps and its dits fuse (FADING_TRACKER.md
+    // §8); tighter, it reads deep fades as noise. 0: none.
+    double track_ratio = 1000.0;
 };
 
 // --- v3: the decoder in the weak view -------------------------------------------

@@ -249,7 +249,7 @@ private:
     void lattice_flush(CwText &text);
     bool carrier_watch();
     void live_emit(CwText &text);
-    void soft_step(float soft_env, float matched_amp, CwText &text);
+    void soft_step(float soft_env, float matched_amp, float front_llr, CwText &text);
     bool preroll_replay(CwText &text);
     void clock_watchdog(CwText &text);
     float front_end_step(float i, float q);
@@ -566,11 +566,13 @@ void CwState::live_emit(CwText &text) {
 // lattice step → lagged commit + live emission. Factored out of the live
 // loop VERBATIM so the pre-roll replay pushes ring samples through the
 // exact same float ops a live sample takes.
-void CwState::soft_step(float soft_env, float matched_amp, CwText &text) {
+void CwState::soft_step(float soft_env, float matched_amp, float front_llr, CwText &text) {
     const double mid = m_disc.update(soft_env);
     if (carrier_watch())
         return;
-    const double llr = weak_view() ? m_front.llr(matched_amp) : m_disc.llr(soft_env, mid, m_cfg.llr);
+    const double llr = !weak_view()          ? m_disc.llr(soft_env, mid, m_cfg.llr)
+                       : m_front.tracking() ? static_cast<double>(front_llr)
+                                            : m_front.llr(matched_amp);
     const bool trace = m_cfg.diag.trace;
     if (trace) {
         fprintf(stderr, "T %lu %.4f %.4f %.4f %.2f\n",
@@ -621,7 +623,8 @@ bool CwState::preroll_replay(CwText &text) {
         return false;
     for (unsigned k = start; k < have; k++) {
         const unsigned at = m_preroll.head() - have + k;
-        soft_step(m_preroll.env(at), m_front.on() ? m_preroll.matched(at) : 0.0f, text);
+        soft_step(m_preroll.env(at), m_front.on() ? m_preroll.matched(at) : 0.0f,
+                  m_front.tracking() ? m_preroll.llr(at) : 0.0f, text);
     }
     return true;
 }
@@ -699,6 +702,7 @@ float CwState::front_end_step(float i, float q) {
         if (!m_lattice.active() || m_paused) { m_front.update_view(m_t, m_trace); }
     }
     m_preroll.put_matched(matched_amp);
+    if (m_front.tracking()) { m_preroll.put_llr(matched_amp > 0.0f ? m_front.tracker_llr() : 0.0f); }
     return matched_amp;
 }
 
@@ -909,7 +913,7 @@ bool CwState::process(const float *iq, unsigned nframes, SkimDecode *out) {
             continue;
         }
 
-        soft_step(soft_env, matched_amp, text);
+        soft_step(soft_env, matched_amp, m_front.tracking() ? m_front.tracker_llr() : 0.0f, text);
         if (m_front.on() && m_lattice.active() && !m_paused && m_clock.dit() > 0 && m_cfg.v3.reader.on &&
             m_reader.due(m_t, m_rate)) {
             m_reader.read(read_view(), m_cfg.v3.reader);

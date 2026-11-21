@@ -94,6 +94,13 @@ CwDecoderConfig cw_config_from_env(CwDecoderConfig c, int version) {
         c.v3.weak.preroll_x   = num_strict(env("SKIM_V3_PREROLL_X"), c.v3.weak.preroll_x);
         c.v3.front.weak_db     = num_strict(env("SKIM_V3_WEAK_DB"), c.v3.front.weak_db);
         c.v3.weak.min_db      = num_strict(env("SKIM_V3_MIN_DB"), c.v3.weak.min_db);
+        if (set_nonempty(e = env("SKIM_V3_TRACK"))) {
+            int adapt = 0;
+            sscanf(e, "%lf,%lf,%lf,%d", &c.v3.front.track_hz, &c.v3.front.track_eps, &c.v3.front.track_kappa, &adapt);
+            c.v3.front.track_adapt = adapt != 0;
+        }
+        c.v3.front.track_narrow_hz = num_strict(env("SKIM_V3_TRACK_NARROW"), c.v3.front.track_narrow_hz);
+        c.v3.front.track_ratio = num_strict(env("SKIM_V3_TRACK_RATIO"), c.v3.front.track_ratio);
         c.rescore.min_evidence_weak = num_strict(env("SKIM_V3_RS_EV_WEAK"), c.rescore.min_evidence_weak);
         c.v3.weak.fist_hold_s = num_strict(env("SKIM_V3_FIST_HOLD_S"), c.v3.weak.fist_hold_s);
         if ((e = env("SKIM_V3_KWS"))) { c.v3.reader.on = strcmp(e, "0") != 0; }   // kr_cfg()

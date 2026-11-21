@@ -40,6 +40,7 @@
 #include "skim_common.h"
 #include "cw_clock.h"
 #include "cw_debug.h"
+#include "cw_gain_tracker.h"
 #include "cw_preroll.h"
 #include "decode_cw_config.h"
 
@@ -389,8 +390,14 @@ public:
             m_sum_used = m_sum_len;
         }
         const double sr = m_sum_re / m_sum_len, si = m_sum_im / m_sum_len;
+        m_out_re = sr;
+        m_out_im = si;
         return sr * sr + si * si;
     }
+
+    // The last coherent sum u, whose power() returned |u|².
+    double out_re() const { return m_out_re; }
+    double out_im() const { return m_out_im; }
 
 private:
     double   m_phasor_re = 0, m_phasor_im = 0;  // derotator phasor
@@ -401,6 +408,7 @@ private:
     } m_lowpass = {};                     // kLowPassHz biquad history
     std::vector<float> m_sum_ring;        // the coherent sum's ring, 2 floats a frame
     double   m_sum_re = 0, m_sum_im = 0;  // its running sum over m_sum_len
+    double   m_out_re = 0, m_out_im = 0;  // the last sum, over its length
     unsigned m_sum_used = 0;              // the length that sum is over
     unsigned m_sum_len = 0;               // L, frames
     unsigned m_sum_cap = 0;               // the ring's frames
@@ -450,6 +458,7 @@ public:
     }
 
     double   noise() const { return m_noise_power; }            // σ0²; 0 = not measured
+    double   mark_power() const { return m_mark_power; }        // σ1²
     unsigned absent_run() const { return m_absent_run; } // samples with presence
                                                        // < 0 in a row
 
@@ -608,6 +617,12 @@ public:
         m_ring.init(ring_size);
         m_power.init(rate);
         m_matched.init();
+        m_track = cfg.track_hz > 0;
+        if (m_track) {
+            m_tracker.init(rate, cfg.track_hz, cfg.track_narrow_hz, cfg.track_eps, cfg.track_kappa, cfg.track_adapt,
+                           cfg.track_ratio);
+            m_weak = true;                        // one view
+        }
     }
 
     bool   on() const { return m_on; }            // SKIM_V3_FRONT != v2
@@ -615,6 +630,8 @@ public:
                                                   // lattice reads the calibrated
                                                   // matched LLR; above it v2's
                                                   // own view, verbatim
+    bool   tracking() const { return m_track; }               // SKIM_V3_TRACK
+    float  tracker_llr() const { return m_tracker_llr; }      // its llr, last frame
     bool   candidate() const { return m_detector.candidate(); }
     double carrier_hz() const { return m_detector.carrier_hz(); }
     double noise() const { return m_power.noise(); }
@@ -634,6 +651,10 @@ public:
     float sample(float i, float q, const CwClock &clk) {
         const double r2 = m_matched.power(i, q, m_detector.carrier_hz(), m_rate, clk);
         m_power.update(r2, m_rate, m_matched.length(), m_keep_presence || (m_on && m_weak), m_detector.band_floor());
+        if (m_track) {
+            m_tracker_llr = static_cast<float>(m_tracker.step(m_matched.out_re(), m_matched.out_im(), m_matched.length(),
+                                                              m_power.noise(), m_power.mark_power(), snr500()));
+        }
         return static_cast<float>(sqrt(r2));
     }
 
@@ -650,6 +671,7 @@ public:
         m_keep_presence = true;
         m_power.reset();
         m_levels.reset();
+        m_tracker.reset();
         unsigned have = std::min(m_ring.head(), m_ring.size());
         have = std::min(have, std::min(pre_head + 1, pre_size));
         for (unsigned k = have; k > 1; k--) {                 // frames H−have … H−2
@@ -657,6 +679,7 @@ public:
             const float r = sample(m_ring.i(f), m_ring.q(f), clk);
             track(r);
             pre.set_matched(pre_head - (k - 1), r);
+            if (m_track) { pre.set_llr(pre_head - (k - 1), m_tracker_llr); }
         }
         m_keep_presence = false;
     }
@@ -672,7 +695,7 @@ public:
     void hop(uint64_t t, const CwClock &clk, CwPreroll &pre, const CwTrace &tr) {
         if (m_detector.hop(m_ring, m_rate, t, tr) == CwCarrierDetector::Event::Born) {
             backfill(clk, pre);
-            if (m_power.noise() > 0) {
+            if (m_power.noise() > 0 && !m_track) {
                 m_weak = snr500() < m_weak_db + 1.5;
                 CW_DBG(tr, "[%s view at birth: %.1f dB]\n", m_weak ? "weak" : "strong", snr500());
             }
@@ -683,7 +706,7 @@ public:
     // read two likelihood scales in one word): weak under SKIM_V3_WEAK_DB,
     // strong again 3 dB above it.
     void update_view(uint64_t t, const CwTrace &tr) {
-        if ((m_ring.head() & 15) == 0 && m_power.noise() > 0) {
+        if ((m_ring.head() & 15) == 0 && m_power.noise() > 0 && !m_track) {
             const double snr = snr500(), bar = m_weak_db;
             if (!m_weak && snr < bar) {
                 m_weak = true;
@@ -703,6 +726,8 @@ private:
     bool   m_weak = false;
     bool   m_keep_presence = false;       // keep the presence statistic (the
                                           // backfill)
+    bool   m_track = false;               // SKIM_V3_TRACK
+    float  m_tracker_llr = 0.0f;
     double m_rate = 0;
     double m_weak_db = 0;                 // SKIM_V3_WEAK_DB
 
@@ -711,4 +736,5 @@ private:
     CwMatchedFilter   m_matched;
     CwPowerStats      m_power;
     CwMatchedLevels   m_levels;
+    CwGainTracker     m_tracker;
 };
