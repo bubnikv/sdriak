@@ -473,6 +473,13 @@ Payload CER at 24 WPM, 50 overs a point, v3 → K2 (B = 1 Hz):
   does not move; at 9 (v3's ratio, but on the prediction) flat 3 Hz at
   20 dB reads 0.64, at 100 0.12. A floor on V instead (V ≥ 0.01–0.1 P)
   does not help: the cause is the zero crossing, not the phase.
+- **Input level** (25 WPM, 10 overs): the absolute scale (±40 dB) leaves
+  K2's output unchanged; level steps of the target or the noise mid-over
+  cost ≤ 0.012. A receiver AGC pumped by a 60 dB station elsewhere in the
+  band costs it 0.213 / 0.107 at 10 / 20 dB with a 200 ms decay (v3
+  0.350 / 0.189, DeepCW v2 narrow 0.082 / 0.058), 0.080 / 0.042 with 1 s:
+  the noise and mark powers follow the pumped level too slowly. PLAN.md
+  §0, S0.
 - **Against DeepCW**, all five on the same overs (30 a point for fading,
   20 for the rest; DeepCW with `--tail 4`, as it commits late). Payload CER
   at 24 WPM, 10 / 20 dB:

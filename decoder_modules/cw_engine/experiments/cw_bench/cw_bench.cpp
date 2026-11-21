@@ -85,6 +85,10 @@ struct Options {
     double clip_db = 0.0;              // > 0: ADC clipping, this far over the wideband noise rms
     bool repair = false;               // ImpulseRepair on the wideband stream before the channelizer
     double drift_hz_s = 0.0;           // the target's frequency drift, Hz/s
+    double gain_db = 0.0;              // the whole input scaled by this, dB
+    double step_s = -1.0, step_db = 0.0;   // a level step at step_s (< 0: none)
+    bool step_noise = false;           // … of the noise, not the target
+    double agc_db = 0.0, agc_ms = 0.0; // receiver AGC: its threshold over the noise rms, its decay
     double chirp_hz = 0.0, chirp_ms = 0.0;   // each key-down's offset and its decay
     bool cochannel = false;            // a second keyed station in the target's channel
     double cochannel_db = 0.0, cochannel_hz = 0.0;  // its level over the target, its offset
@@ -232,6 +236,21 @@ bool parse_args(int argc, char **argv, Options &o) {
             if (a.size() > 9 && a[8] == '=') o.repair_thr_db = std::atof(a.c_str() + 9);
         }
         else if (a == "--drift") o.drift_hz_s = std::atof(val());     // Hz/s
+        else if (a == "--gain") o.gain_db = std::atof(val());         // dB, the whole input
+        else if (a == "--step") {                                   // <s>:<dB>:<sig|noise>
+            char what[16] = "sig";
+            if (std::sscanf(val(), "%lf:%lf:%15s", &o.step_s, &o.step_db, what) < 2 || o.step_s < 0) {
+                std::fprintf(stderr, "bad --step\n");
+                return false;
+            }
+            o.step_noise = std::strcmp(what, "noise") == 0;
+        }
+        else if (a == "--agc") {                                    // <dB>:<ms>
+            if (std::sscanf(val(), "%lf:%lf", &o.agc_db, &o.agc_ms) != 2 || o.agc_ms <= 0) {
+                std::fprintf(stderr, "bad --agc\n");
+                return false;
+            }
+        }
         else if (a == "--chirp") {                                  // <Hz>:<ms>
             if (std::sscanf(val(), "%lf:%lf", &o.chirp_hz, &o.chirp_ms) != 2 || o.chirp_ms <= 0) {
                 std::fprintf(stderr, "bad --chirp\n");
@@ -732,6 +751,8 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     } else {
         dec->set_floor(2.0 * sigma * sigma * enbw / o.rate);
     }
+    // the floor as told, before --gain, --step and --agc move the noise
+    const double floor0 = bed.empty() ? 2.0 * sigma * sigma * enbw / o.rate : 0.0;
     std::normal_distribution<double> g(0.0, sigma > 0 ? sigma : 1.0);
 
     // fading paths (delayed copies of the keyed tone)
@@ -902,6 +923,20 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     std::string out;
     std::vector<float> iq(2 * 512), cbuf(2 * 4096);
     double ph = 0.0;
+    // --step: from step_s on, the target or the noise this much louder;
+    // --agc: a receiver AGC on the whole band, instant attack, exponential
+    // decay, holding the peak at agc_db over the noise rms; --gain: the
+    // whole input scaled after the ADC.
+    const size_t step_at = o.step_s >= 0 ? static_cast<size_t>(o.step_s * o.rate) : SIZE_MAX;
+    const double step_g = std::pow(10.0, o.step_db / 20.0);
+    const double agc_ref = (sigma > 0 ? sigma * std::sqrt(2.0) : 1.0) * std::pow(10.0, o.agc_db / 20.0);
+    const double agc_decay = o.agc_ms > 0 ? std::exp(-1.0 / (o.agc_ms * 1e-3 * o.rate)) : 0.0;
+    double agc_peak = 0.0;
+    const double out_g = std::pow(10.0, o.gain_db / 20.0);
+    // With any of them on, the band floor follows the noise's true level
+    // block by block, as an ideal floor tracker in the pipeline would.
+    const bool levels = o.gain_db != 0.0 || o.step_s >= 0 || o.agc_ms > 0;
+    double noise_g2 = 0.0;                     // Σ (the noise's gain)² over the block
     for (size_t at = 0; at < env.size(); at += 512) {
         const size_t n = std::min<size_t>(512, env.size() - at);
         for (size_t i = 0; i < n; i++) {
@@ -917,11 +952,12 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                          std::polar(amp * env[kd], w0 * static_cast<double>(kd) + (xph.empty() ? 0.0 : xph[kd]));
                 }
             }
+            if (k >= step_at && !o.step_noise) s *= step_g;
             for (Qrm &q : qrm) {
                 const float e = q.key.next(qw, qsum);
                 if (e > 0.0f) s += std::polar(q.amp * e, q.w * static_cast<double>(k));
             }
-            const double ns = k < pre_n ? pre_gain : 1.0;
+            const double ns = (k < pre_n ? pre_gain : 1.0) * (k >= step_at && o.step_noise ? step_g : 1.0);
             double re = s.real(), im = s.imag();
             if (bed.empty()) {
                 // Middleton Class A: m ~ Poisson(A) impulsive sources at once,
@@ -943,6 +979,16 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                 re += impw[k].real();
                 im += impw[k].imag();
             }
+            if (o.agc_ms > 0) {
+                const double mag = std::hypot(re, im);
+                agc_peak = std::max(mag, agc_peak * agc_decay);
+                const double ag = agc_peak > agc_ref ? agc_ref / agc_peak : 1.0;
+                re *= ag;
+                im *= ag;
+                noise_g2 += ns * ns * ag * ag;
+            } else {
+                noise_g2 += ns * ns;
+            }
             if (o.clip_db > 0) {
                 // ADC saturation: the complex magnitude limited, everything in it.
                 const double mag = std::hypot(re, im);
@@ -951,10 +997,14 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                     im *= clip / mag;
                 }
             }
-            iq[2 * i] = static_cast<float>(re);
-            iq[2 * i + 1] = static_cast<float>(im);
+            iq[2 * i] = static_cast<float>(re * out_g);
+            iq[2 * i + 1] = static_cast<float>(im * out_g);
             ph += w0;
         }
+        if (levels && floor0 > 0) {
+            dec->set_floor(floor0 * out_g * out_g * noise_g2 / static_cast<double>(n));
+        }
+        noise_g2 = 0.0;
         ch->push(iq.data(), static_cast<unsigned>(n));
         const unsigned got = ch->read(o.channel, cbuf.data(), 4096, wch.data());
         if (repair && got) dec->set_repair_weights(wch.data(), got);
