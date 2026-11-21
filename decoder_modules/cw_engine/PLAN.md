@@ -136,6 +136,37 @@ carrier):
   resolution and keying edges (BELL.md: Bell's loss at 35 WPM is the
   edges).
 
+**S4, first measurements** (K2, white noise, 20 overs a step, SNR500 for
+10 % / 3 % CER at 12 / 25 / 35 WPM; none of it is in the code):
+
+- **The decision lag is not it.** Commit lags of 8 / 4 (as now), 16 and 32
+  dits: within 0.2 dB of each other. Best-path decoding rarely revises
+  anything older than 8 dits.
+- **Nor the keying edges.** Raised-cosine edges of 1, 5 and 10 ms move K2
+  by at most 0.3 dB and DeepCW v2 narrow by 0.1 dB.
+- **Whole-element coherent evidence helps on a steady signal and breaks
+  under fading.** A mark scored by the coherent sum of its derotated
+  samples (ahead of the ½-dit sum) over its whole span, with the station's
+  mark power as the amplitude and the phase unknown,
+  −d·A²/σ² + ln I0(2A·|S|/σ²) in place of the per-sample sum: at 3 % CER
+  −0.46 / −0.14 / +1.11 dB against K2's −0.20 / +0.52 / +1.75 (0.3–0.7 dB),
+  at 10 % 0.0–0.2 dB, no false characters on noise. Under fading the
+  steady amplitude reads faded marks as noise: ITU poor at 20 dB 0.024 →
+  0.511, flat 3 Hz 0.018 → 0.664. The tracker's predicted amplitude in its
+  place recovers slow fading (ITU good 0.015) but not fast (ITU poor at
+  20 dB 0.121, flat 3 Hz 0.435) and loses the steady-signal gain (the
+  prediction is diluted near threshold); derotating by the tracker's phase,
+  averaging the two amplitudes, or taking the better of the segment and
+  per-sample scores all lose most of the gain and keep the fading loss;
+  capping the segment score lets marks merge across gaps. A Gaussian gain
+  with unknown amplitude (CN(0, P)) makes false marks cheap (a mark over
+  noise costs only ln(1 + d·SNR)).
+- **What it says.** Coherent combining over an element is worth up to
+  0.7 dB at 3 %, but only with a reliable amplitude, and a single phase
+  per element does not survive fast fading. It needs coherence-limited
+  blocks (several coherent sums per element where the gain moves,
+  combined with the tracked amplitude), which is K5.
+
 **The order from here.** It replaces §3's order for the steps it names;
 each step keeps its pass criteria and its switch, byte-identical when off.
 
@@ -144,7 +175,7 @@ each step keeps its pass criteria and its switch, byte-identical when off.
 | S0 | **Input level and amplitude, all decoders.** Strong signals, SNR500 20–60 dB, steady and under 1 Hz fading, are measured: DeepCW v1 and v2 narrow lose nothing (0.000 steady, 0.014 / 0.044 fading) although v2 narrow's 8-bit input clips about 30 dB over the per-bin noise (v2 wide's about 47 dB; v1 is not quantised); K2 broke (0.34 at 30 dB, 0.83–0.89 at 40–60) until its score got a noise floor at the predicted mark power over 1000 (now 0.012–0.018 steady, 0.002–0.010 fading; FADING_TRACKER.md §8). The absolute input scale (±40 dB) changes no decoder's output at all; level steps of the target (−10, +20 dB) and of the noise (±10 dB) mid-over cost none of them more than 0.02. A receiver AGC pumped by a 60 dB station elsewhere in the band (instant attack, the target's SNR unchanged) costs all of them, the Bayesian ones most: decay 200 ms, at 10 / 20 dB, v3 0.350 / 0.189, K2 0.213 / 0.107, DeepCW v1 0.076 / 0.068, v2 narrow 0.082 / 0.058; decay 1 s v3 0.076 / 0.048, K2 0.080 / 0.042, v1 0.080 / 0.078, v2 narrow 0.012 / 0.010. The decoders' noise estimates follow the level too slowly; v2 narrow's 8 s windows rescale best | whether DeepCW's lead holds at real band levels, and what any decoder needs from the front end (scaling, AGC rules) | 1–2 days |
 | S1 | **Gap attribution** (P1.2, narrowed): on the white-noise ladder at 12 / 25 / 35 WPM, v3 + K2 with the true clock (`oracle.h` `clock`), with the true complex gain in the tracker, and with both; DeepCW on random-letter text against the bench's text | a dB budget: clock, coherence, the rest; it orders S2–S5 | 3–5 days |
 | S2 | **K3, the spread and the frequency offset per station** (P3.1): B measured from committed marks and shared by the station's hypotheses, δf tracked so B can come down from 1 Hz | the 3 % gap on white noise closed (K2 at B = 0.5 Hz already matches v3); chirp 30 Hz / 20 ms at 6 dB ≤ v3; beating ±0.5 Hz at 10 dB < 0.40; slow fading not worse | 1–2 weeks |
-| S3 | **K6, a gain estimate per lattice node** (per-survivor processing): each node carries (µ, V) from its best predecessor and updates it with its own hypothesis's keying; K2's soft estimate seeds new paths | white noise within 1.5 dB of `dcw2n` at 12–25 WPM (at least 1.5 dB over K2); CPU per channel measured; fading not worse | 2–3 weeks |
+| S3 | **K6, a gain estimate per lattice node** (per-survivor processing; tried in v3's lattice and left out, FADING_TRACKER.md §8: the gain either fits the noise inside a false mark or cannot follow a fade; retry after S4, on per-sample observations as `bell:coh`): each node carries (µ, V) from its best predecessor and updates it with its own hypothesis's keying; K2's soft estimate seeds new paths | white noise within 1.5 dB of `dcw2n` at 12–25 WPM (at least 1.5 dB over K2); CPU per channel measured; fading not worse | 2–3 weeks |
 | S4 | **The lattice and the edges** (S1: the clock bound is 0.1–0.6 dB, so the hypothesis bank P3.4 waits): an edge-aware likelihood (the keying edge and the matched filter's ramps modelled, so the evidence can use a longer, narrower window without stretching marks), and the forward-backward pass with a longer lag (P2.3) | at 25–35 WPM within 1 dB of `dcw2n`; no false characters on noise | 3–5 weeks |
 | S5 | **K4, the smoother at commit**: σ², P, B and δf from committed stretches; the state restarted from the smoothed estimate | dense impulse trains without the repair at least v3's (ignition 50/s at 10 dB ≤ 0.02); feeds S2 | 1 week |
 | S6 | **Selectivity**: the matched filter's low-pass tied to the tracked carrier and narrowed with it; a second carrier in the channel tracked or rejected | second station at 30 Hz, same level ≤ 0.30; offsets to 62.5 Hz unchanged | 1–2 weeks |

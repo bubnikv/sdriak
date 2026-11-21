@@ -509,4 +509,20 @@ Payload CER at 24 WPM, 50 overs a point, v3 → K2 (B = 1 Hz):
     at or near zero.
   - Cost per 47 s over on an i3-N300: v3 < 0.1 s, DeepCW v2 narrow
     ≈ 0.5 s, v1 ≈ 8.5 s.
+- **K6 inside v3's lattice, tried and left out.** A gain belief per lattice
+  boundary, each space boundary opening a filter that scores the samples
+  after it as a mark against its path's gain, in place of K2's evidence
+  for marks. Updated inside the hypothesised mark, the gain fits the noise:
+  at 10 dB the Kalman gain is about 0.75, a "mark" over noise drags the
+  prediction to the noise within a sample or two and the rest scores almost
+  free (−3 for a false mark K2 charges −13). Scored against the prediction
+  and updated only at the mark's end, false marks cost as they should, but
+  a fading gain moves away from the prediction within a dah: ITU poor at
+  20 dB 0.024 → 0.589, and white noise near threshold still worse than K2
+  (25 WPM, 1 dB: 0.024 → 0.052). A ramp-aware prediction changed little.
+  `bell:coh` gets its coherence gain from the same idea on per-sample
+  observations at 125 Hz, where each update moves the gain far less than
+  on v3's overlapping ½-dit sums; that is where a second attempt would
+  start, after the edge-aware likelihood (PLAN.md S4) has changed the
+  evidence it builds on.
 - **Not measured yet:** live air. The unit gates (`cw_test`, `call_test`) run with the tracker off.
