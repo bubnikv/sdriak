@@ -113,7 +113,9 @@ public:
     double band_floor() const { return m_band_floor; }
 
     bool   candidate() const { return m_candidate; }    // a carrier is detected here
-    double carrier_hz() const { return m_carrier_hz; }  // the AFC, channel-relative
+    double carrier_hz() const { return m_fixed ? m_fixed_hz : m_carrier_hz; }  // the AFC, channel-relative
+    // The oracle's carrier in place of the AFC (measurement only).
+    void   fix_carrier(double hz) { m_fixed = true; m_fixed_hz = hz; }
 
     // After each raw frame (the ring holds `head` frames): true when a hop is
     // due — every kHopFrames, once a full FFT's worth is in.
@@ -288,6 +290,8 @@ private:
     bool     m_candidate = false;         // a carrier is detected here
     unsigned m_last_detection = 0;        // ring frame of the last detection
     double   m_carrier_hz = 0;            // the carrier (AFC), channel-relative
+    bool     m_fixed = false;             // fix_carrier(): the oracle's
+    double   m_fixed_hz = 0;
 };
 
 // --- the matched filter -----------------------------------------------------------
@@ -301,11 +305,17 @@ class CwMatchedFilter {
     static constexpr auto kMaxSumLength = 10;     // full matched gain down to ~15 WPM
 
 public:
-    void init() {
+    // lowpass_hz, sum_dits, max_sum: the low-pass ahead of the sum, the sum's
+    // length in (unbiased) dits and its cap in frames; 0 keeps kLowPassHz,
+    // ½ dit and kMaxSumLength.
+    void init(double lowpass_hz = 0.0, double sum_dits = 0.0, unsigned max_sum = 0) {
         m_sum_ring.assign(static_cast<size_t>(2 * kSumCapacity), 0.0f);
         m_sum_cap = kSumCapacity;
         m_sum_len = kDefaultSumLength;
         m_phasor_re = 1.0;
+        m_lowpass_hz = lowpass_hz > 0 ? lowpass_hz : kLowPassHz;
+        m_sum_dits = sum_dits > 0 ? sum_dits : 0.5;
+        m_max_sum = max_sum > 0 ? max_sum : static_cast<unsigned>(kMaxSumLength);
     }
 
     // A fresh start (the backfill).
@@ -336,17 +346,17 @@ public:
             m_phasor_im *= g;
         }
         double x[2] = { i * nr - q * ni, i * ni + q * nr };
-        static double b0, b1, b2, a1, a2, for_rate;
-        if (for_rate != rate) {
-            const double k = tan(SKIM_PI * kLowPassHz / rate), q2 = sqrt(2.0);
+        if (m_for_rate != rate) {
+            const double k = tan(SKIM_PI * m_lowpass_hz / rate), q2 = sqrt(2.0);
             const double nrm = 1.0 / (1.0 + q2 * k + k * k);
-            b0 = k * k * nrm;
-            b1 = 2.0 * b0;
-            b2 = b0;
-            a1 = 2.0 * (k * k - 1.0) * nrm;
-            a2 = (1.0 - q2 * k + k * k) * nrm;
-            for_rate = rate;
+            m_b0 = k * k * nrm;
+            m_b1 = 2.0 * m_b0;
+            m_b2 = m_b0;
+            m_a1 = 2.0 * (k * k - 1.0) * nrm;
+            m_a2 = (1.0 - q2 * k + k * k) * nrm;
+            m_for_rate = rate;
         }
+        const double b0 = m_b0, b1 = m_b1, b2 = m_b2, a1 = m_a1, a2 = m_a2;
         for (int r = 0; r < 2; r++) {
             const double y = b0 * x[r] + b1 * m_lowpass.x[r][0] + b2 * m_lowpass.x[r][1] -
                              a1 * m_lowpass.y[r][0] - a2 * m_lowpass.y[r][1];
@@ -365,8 +375,8 @@ public:
         if (clk.dit() > 0) {
             const double u = clk.element_space() > 0.25 * clk.dit() && clk.element_space() < 1.25 * clk.dit()
                                  ? 0.5 * (clk.dit() + clk.element_space()) : clk.dit();
-            m_sum_len = static_cast<unsigned>(std::clamp(lround(0.5 * u), 2L,
-                                      std::min<long>(kMaxSumLength, static_cast<long>(m_sum_cap) - 1)));
+            m_sum_len = static_cast<unsigned>(std::clamp(lround(m_sum_dits * u), 2L,
+                                      std::min<long>(m_max_sum, static_cast<long>(m_sum_cap) - 1)));
         }
         // the running sum: one frame in, the one ma_len back out; summed afresh
         // when the length changes and every 1024 frames (float drift)
@@ -409,6 +419,10 @@ private:
     std::vector<float> m_sum_ring;        // the coherent sum's ring, 2 floats a frame
     double   m_sum_re = 0, m_sum_im = 0;  // its running sum over m_sum_len
     double   m_out_re = 0, m_out_im = 0;  // the last sum, over its length
+    double   m_lowpass_hz = kLowPassHz;   // the low-pass ahead of the sum
+    double   m_sum_dits = 0.5;            // the sum's length, dits
+    unsigned m_max_sum = kMaxSumLength;   // … at most, frames
+    double   m_b0 = 0, m_b1 = 0, m_b2 = 0, m_a1 = 0, m_a2 = 0, m_for_rate = 0;  // the low-pass
     unsigned m_sum_used = 0;              // the length that sum is over
     unsigned m_sum_len = 0;               // L, frames
     unsigned m_sum_cap = 0;               // the ring's frames
@@ -616,7 +630,7 @@ public:
         m_detector.init(cfg);
         m_ring.init(ring_size);
         m_power.init(rate);
-        m_matched.init();
+        m_matched.init(cfg.lowpass_hz, cfg.sum_dits, cfg.max_sum);
         m_track = cfg.track_hz > 0;
         if (m_track) {
             m_tracker.init(rate, cfg.track_hz, cfg.track_narrow_hz, cfg.track_eps, cfg.track_kappa, cfg.track_adapt,
@@ -639,6 +653,7 @@ public:
     double matched_hi() const { return m_levels.hi(); }  // matched-amplitude trackers
     double matched_lo() const { return m_levels.lo(); }
     void   set_floor(double noise_pw) { m_detector.set_floor(noise_pw); }
+    void   fix_carrier(double hz) { m_detector.fix_carrier(hz); }   // the oracle's
 
     // One raw frame into the I/Q ring; true: a detector hop is due.
     bool push_iq(float i, float q) {

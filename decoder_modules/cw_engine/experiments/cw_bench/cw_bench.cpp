@@ -26,6 +26,7 @@
 #endif
 #include "engine/channelizer.h"
 #include "engine/impulse_repair.h"
+#include "engine/oracle.h"
 #include "engine/callsign.h"
 #include "sdriak/fir_bandpass.h"
 
@@ -86,6 +87,7 @@ struct Options {
     bool repair = false;               // ImpulseRepair on the wideband stream before the channelizer
     double drift_hz_s = 0.0;           // the target's frequency drift, Hz/s
     double gain_db = 0.0;              // the whole input scaled by this, dB
+    bool random_text = false;          // random groups in place of the payload
     double step_s = -1.0, step_db = 0.0;   // a level step at step_s (< 0: none)
     bool step_noise = false;           // … of the noise, not the target
     double agc_db = 0.0, agc_ms = 0.0; // receiver AGC: its threshold over the noise rms, its decay
@@ -237,6 +239,11 @@ bool parse_args(int argc, char **argv, Options &o) {
         }
         else if (a == "--drift") o.drift_hz_s = std::atof(val());     // Hz/s
         else if (a == "--gain") o.gain_db = std::atof(val());         // dB, the whole input
+        else if (a == "--text") {                                   // payload | random
+            const std::string t = val();
+            if (t != "payload" && t != "random") { std::fprintf(stderr, "bad --text\n"); return false; }
+            o.random_text = t == "random";
+        }
         else if (a == "--step") {                                   // <s>:<dB>:<sig|noise>
             char what[16] = "sig";
             if (std::sscanf(val(), "%lf:%lf:%15s", &o.step_s, &o.step_db, what) < 2 || o.step_s < 0) {
@@ -295,6 +302,19 @@ const char *morse(char c) {
 }
 
 // 12 tokens: callsign-like (1–2 letters, a digit, 1–3 letters) or traffic words.
+// Random groups in place of the payload (--text random): 12 groups of 2–6
+// characters from A–Z and 0–9, no words, no callsign structure.
+std::string random_payload(std::mt19937 &rng) {
+    const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::string s;
+    for (int t = 0; t < 12; t++) {
+        if (!s.empty()) s += ' ';
+        const int n = 2 + static_cast<int>(rng() % 5);
+        for (int i = 0; i < n; i++) s += A[rng() % 36];
+    }
+    return s;
+}
+
 std::string payload(std::mt19937 &rng) {
     static const char *W[] = {"CQ", "DE", "TEST", "5NN", "TU", "K", "UR", "RST"};
     const char *L = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -684,6 +704,7 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
     cfg = v3 ? cw_preset_v3() : cw_preset_v2();
     if (name.size() > 3 && name[2] == ':') cfg.envelope.narrow_fc = std::atof(name.c_str() + 3);
     cfg = cw_config_from_env(cfg, v3 ? 3 : 2);          // SKIM_V2_* / SKIM_V3_* switches
+    cfg.diag.oracle = SkimOracle::from_env();           // SKIM_ORACLE (null when unset)
     return v3 ? skim_decode_cw_v3_new(cfg, nullptr) : skim_decode_cw_v2_new(cfg, nullptr);
 }
 
@@ -698,7 +719,7 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     if (o.noise_only_s > 0) {
         env.assign(static_cast<size_t>(o.noise_only_s * o.rate), 0.0f);
     } else {
-        r.ref = "VVV " + payload(rng);
+        r.ref = "VVV " + (o.random_text ? random_payload(rng) : payload(rng));
         env = envelope(r.ref, wpm, o.rate, o.jitter, o.lead_s, o.edge_ms, rng);
         env.resize(env.size() + static_cast<size_t>(o.tail_s * o.rate), 0.0f);
     }

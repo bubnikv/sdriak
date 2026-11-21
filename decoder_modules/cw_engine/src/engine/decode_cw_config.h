@@ -137,6 +137,12 @@ struct CwFrontEndConfig {
     double track_eps = 0.05;
     double track_kappa = 30.0;
     bool   track_adapt = false;
+    // The matched filter (CwMatchedFilter): SKIM_V3_LP_HZ the low-pass ahead
+    // of the coherent sum (60), SKIM_V3_SUM_DITS its length in dits (½),
+    // SKIM_V3_SUM_MAX its cap in frames (10); 0 keeps the default.
+    double lowpass_hz = 0.0;
+    double sum_dits = 0.0;
+    unsigned max_sum = 0;
     double track_narrow_hz = 0.0;      // SKIM_V3_TRACK_NARROW: B on a weak signal (0: B)
     // SKIM_V3_TRACK_RATIO: the score's noise is at least the predicted mark
     // power over this (30 dB): without it a strong station's score crosses

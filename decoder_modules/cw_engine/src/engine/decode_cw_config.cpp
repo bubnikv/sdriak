@@ -100,6 +100,9 @@ CwDecoderConfig cw_config_from_env(CwDecoderConfig c, int version) {
             c.v3.front.track_adapt = adapt != 0;
         }
         c.v3.front.track_narrow_hz = num_strict(env("SKIM_V3_TRACK_NARROW"), c.v3.front.track_narrow_hz);
+        c.v3.front.lowpass_hz = num_strict(env("SKIM_V3_LP_HZ"), c.v3.front.lowpass_hz);
+        c.v3.front.sum_dits = num_strict(env("SKIM_V3_SUM_DITS"), c.v3.front.sum_dits);
+        c.v3.front.max_sum = static_cast<unsigned>(num_strict(env("SKIM_V3_SUM_MAX"), c.v3.front.max_sum));
         c.v3.front.track_ratio = num_strict(env("SKIM_V3_TRACK_RATIO"), c.v3.front.track_ratio);
         c.rescore.min_evidence_weak = num_strict(env("SKIM_V3_RS_EV_WEAK"), c.rescore.min_evidence_weak);
         c.v3.weak.fist_hold_s = num_strict(env("SKIM_V3_FIST_HOLD_S"), c.v3.weak.fist_hold_s);

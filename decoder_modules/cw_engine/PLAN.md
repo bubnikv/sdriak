@@ -89,7 +89,52 @@ estimated size:
 | decision lag and max-product | DeepCW reads seconds of context both ways; v3 commits 4–8 dits back, best path only | unmeasured | P2.3 (forward-backward), a longer lag |
 | text prior | DeepCW was trained on text; v3 uses the dictionary only in its re-reads | unmeasured; the bench text is mostly random callsigns | P2.4, P3.5 |
 
-These overlap; the oracle bounds (S1) measure them before more is built.
+These overlap; S1 measured them (below).
+
+**S1: where the gap is.** White noise, SNR500 for 10 % / 3 % payload CER,
+20 overs a step (DeepCW 10), `--lead 2`; the oracles from the over's start
+(`oracle.h` `clock`, `freq`, the latter now also fixing v3's matched-filter
+carrier):
+
+| | 12 WPM | 25 WPM | 35 WPM |
+|---|---|---|---|
+| v3 | −1.08 / −0.16 | −0.39 / +0.27 | +0.86 / — |
+| v3, true clock and carrier | −1.15 / −0.70 | −0.93 / −0.01 | +0.27 / +1.11 |
+| K2 | −1.07 / −0.20 | −0.78 / +0.52 | −0.21 / +1.75 |
+| K2, true clock and carrier | −1.11 / −0.25 | −0.85 / +0.05 | −0.42 / +1.73 |
+| K2, true clock and carrier, B 0.05 Hz (near-known gain) | −1.18 / −1.00 | −1.07 / −0.39 | −0.86 / +0.36 |
+| K2, 20 Hz low-pass ahead of the sum | −1.15 / −0.30 | −0.52 / +0.91 | +0.56 / +3.28 |
+| v3, random groups | −1.05 / −0.12 | −0.40 / +0.45 | +1.57 / +3.55 |
+| DeepCW v2 narrow, the bench's text | −5.82 / −4.01 | −3.67 / −1.70 | −2.13 / −0.51 |
+| DeepCW v2 narrow, random groups | −5.89 / −4.01 | −3.19 / −1.47 | −2.09 / −0.41 |
+| DeepCW v1, random groups | | −3.32 / −1.67 | |
+| `bell:coh` (BELL.md, per-survivor gain) | −4.5 / −2.7 | −1.4 / +0.1 | +0.7 / +1.6 |
+
+- **The clock is not the gap.** The true clock and carrier gain K2 0.1–
+  0.2 dB at 10 % (v3 up to 0.6). The "up to 4.3 dB at 12 WPM" of §2 does
+  not hold on this bench now.
+- **Nor is a better-known gain under soft association.** With the true
+  carrier and clock and a near-static model, K2 gains 0.1 / 0.3 / 0.65 dB
+  at 10 % (0.8–1.4 dB at 3 %): its key-down weights stay uncertain near
+  threshold and V never shrinks. `bell:coh`, updating each survivor with
+  its own hard keying, is 3.4 dB ahead of K2 at 12 WPM, 0.6 at 25: the
+  coherence gain needs per-survivor beliefs (K6).
+- **DeepCW's text prior is small:** random groups cost v2 narrow 0.0–0.5
+  dB, v1 0.1 dB.
+- **The evidence window cannot simply widen.** A whole-dit sum breaks the
+  lattice (CER 0.26–0.36 at 0–4 dB: the sum stretches marks and shrinks
+  spaces by its own length, and the duration priors expect ½ dit); a
+  20 Hz low-pass gains 0.1 dB at 12 WPM and costs 0.3–0.8 dB above. DeepCW
+  reads 80 ms windows and has learned to see through the smearing; the
+  lattice would need an edge-aware likelihood to do the same.
+- **The budget, 25 WPM (K2 → v2 narrow, 2.9 dB):** clock and carrier
+  ≈ 0.1, a better gain under soft association ≈ 0.2, text ≈ 0.5, per-
+  survivor coherence ≈ 0.6 (`bell:coh` against K2); about 1.5 dB left in
+  the sequence model and the evidence's time resolution. At 12 WPM
+  per-survivor coherence is most of it (3.4 of 4.7 dB); at 35 WPM it is
+  none of it (`bell:coh` behind K2), and the gap (1.9 dB) is in time
+  resolution and keying edges (BELL.md: Bell's loss at 35 WPM is the
+  edges).
 
 **The order from here.** It replaces §3's order for the steps it names;
 each step keeps its pass criteria and its switch, byte-identical when off.
@@ -100,7 +145,7 @@ each step keeps its pass criteria and its switch, byte-identical when off.
 | S1 | **Gap attribution** (P1.2, narrowed): on the white-noise ladder at 12 / 25 / 35 WPM, v3 + K2 with the true clock (`oracle.h` `clock`), with the true complex gain in the tracker, and with both; DeepCW on random-letter text against the bench's text | a dB budget: clock, coherence, the rest; it orders S2–S5 | 3–5 days |
 | S2 | **K3, the spread and the frequency offset per station** (P3.1): B measured from committed marks and shared by the station's hypotheses, δf tracked so B can come down from 1 Hz | the 3 % gap on white noise closed (K2 at B = 0.5 Hz already matches v3); chirp 30 Hz / 20 ms at 6 dB ≤ v3; beating ±0.5 Hz at 10 dB < 0.40; slow fading not worse | 1–2 weeks |
 | S3 | **K6, a gain estimate per lattice node** (per-survivor processing): each node carries (µ, V) from its best predecessor and updates it with its own hypothesis's keying; K2's soft estimate seeds new paths | white noise within 1.5 dB of `dcw2n` at 12–25 WPM (at least 1.5 dB over K2); CPU per channel measured; fading not worse | 2–3 weeks |
-| S4 | **Clock or lattice**, by S1's budget: the hypothesis bank (P3.4) if the clock bound exceeds 1 dB; the forward-backward pass and a longer lag (P2.3) if what is left sits in the lattice | its bound reached for the most part, no false characters on noise | 2–4 weeks |
+| S4 | **The lattice and the edges** (S1: the clock bound is 0.1–0.6 dB, so the hypothesis bank P3.4 waits): an edge-aware likelihood (the keying edge and the matched filter's ramps modelled, so the evidence can use a longer, narrower window without stretching marks), and the forward-backward pass with a longer lag (P2.3) | at 25–35 WPM within 1 dB of `dcw2n`; no false characters on noise | 3–5 weeks |
 | S5 | **K4, the smoother at commit**: σ², P, B and δf from committed stretches; the state restarted from the smoothed estimate | dense impulse trains without the repair at least v3's (ignition 50/s at 10 dB ≤ 0.02); feeds S2 | 1 week |
 | S6 | **Selectivity**: the matched filter's low-pass tied to the tracked carrier and narrowed with it; a second carrier in the channel tracked or rejected | second station at 30 Hz, same level ≤ 0.30; offsets to 62.5 Hz unchanged | 1–2 weeks |
 
@@ -118,7 +163,7 @@ each step keeps its pass criteria and its switch, byte-identical when off.
 | Point | After | Question | If yes | If no |
 |---|---|---|---|---|
 | T0 | S0 | does any decoder lose copy at real band levels (above 30 dB, level steps, AGC)? | fix in the front end first (scaling, the noise estimate) | the comparison stands |
-| T1 | S1 | does the clock bound exceed the coherence bound? | S4 (bank) before S3 | S3 first |
+| T1 | S1 | does the clock bound exceed the coherence bound? | the bank (P3.4) before S3 | S3 first. **Answered: no** (clock 0.1–0.6 dB; per-survivor coherence up to 3.4 dB at 12 WPM). S3 (K6) next, then S4 (edges, lattice), S2 alongside |
 | T2 | S3 | is K6 within 1.5 dB of `dcw2n` at 12–25 WPM? | S4 and S6 for the rest | the gap is not in the evidence: measure DeepCW's text prior and context (S1's second half) before more Bayesian work |
 | T3 | S2–S6 | within 1 dB of `dcw2n` on white noise, at or under it on the fading and selectivity tables, at under twice v3's CPU? | v4 preset | the hybrid: DeepCW where the CPU allows |
 

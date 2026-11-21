@@ -840,7 +840,10 @@ bool CwState::process(const float *iq, unsigned nframes, SkimDecode *out) {
     const bool o_clock = ohit && (om & SkimOracle::kClock);
     const bool o_freq  = ohit && (om & SkimOracle::kFreq);
     const double   o_dit   = o_clock ? 1.2 * m_rate / oh->wpm : 0.0;
-    if (o_freq) { m_tone.set_offset_hz(oh->carrier_hz - m_freq_hz); }
+    if (o_freq) {
+        m_tone.set_offset_hz(oh->carrier_hz - m_freq_hz);
+        if (m_front.on()) { m_front.fix_carrier(oh->carrier_hz - m_freq_hz); }   // v3's matched filter too
+    }
     if (o_clock && m_clock.dit() > 0) {
         const double ub = m_clock.unbiased_dit();
         if (fabs(ub / o_dit - 1.0) > 0.25) { m_clock.impose(o_dit); }
