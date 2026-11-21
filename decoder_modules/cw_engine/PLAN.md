@@ -13,9 +13,11 @@ course. It is the schedule; the reasoning lives in three companion documents:
   (tracks A, B, C).
 
 Step names below (P0.1, P2.3 …) are this plan's. Each step says which step
-of the companion documents it implements (K2, B1, C3 …). Nothing here is
-built yet, except the three experiment diffs of Phase 0.
+of the companion documents it implements (K2, B1, C3 …). §0 lists what is
+built, measures the gap to DeepCW's v2 narrow model and sets the order from
+here.
 
+- [0. The target: DeepCW v2 narrow](#0-the-target-deepcw-v2-narrow)
 - [1. Rules for every step](#1-rules-for-every-step)
 - [2. Where the losses are](#2-where-the-losses-are)
 - [3. Overview](#3-overview)
@@ -29,6 +31,96 @@ built yet, except the three experiment diffs of Phase 0.
 - [11. Effort and calendar](#11-effort-and-calendar)
 - [12. Risks](#12-risks)
 - [13. Not in the plan](#13-not-in-the-plan)
+
+---
+
+## 0. The target: DeepCW v2 narrow
+
+The goal is to come close to DeepCW's v2 narrow model (`dcw2n`, DeepCW.md),
+the small model e04 ships: about 0.5 s of CPU per 47 s over, five times
+v3. The bench (`experiments/cw_bench`) runs all decoders on the same overs
+behind the same channelizer; FADING_TRACKER.md §8 has the full tables.
+
+**Built since this plan was written:**
+
+| Step | What | Where | State |
+|---|---|---|---|
+| P2.1 (K2) | the gain tracker, one view on its evidence | `cw_gain_tracker.h`, `SKIM_V3_TRACK=1` | off by default; K2's pass criteria met |
+| P3.2 (part) | impulse repair on the wideband stream, repair weights to the decoders | `impulse_repair.h`, an option of `SkimChannelizer` | measured, no pipeline uses it yet |
+| P1.1 (part) | bench: Watterson paths, impulses, clipping, Class A, crowded band, drift, chirp, a second station in the channel | `cw_bench` | done |
+| — | the Bell (1977) decoder as a reference, envelope and coherent | `decode_bell`, BELL.md | bench only |
+
+**The gap to v2 narrow.** White noise, SNR500 for 10 % / 3 % payload CER:
+
+| WPM | v3 | v3 + K2 | `dcw2n` | K2's gap |
+|---|---|---|---|---|
+| 12 | −1.1 / −0.5 | −1.1 / −0.3 | −5.8 / −4.0 | 4.7 / 3.7 dB |
+| 25 | −0.6 / 0.0 | −0.7 / +0.6 | −3.7 / −1.7 | 3.0 / 2.3 dB |
+| 35 | +0.2 / +1.0 | −0.1 / +1.9 | −2.1 / −0.5 | 2.0 / 2.4 dB |
+
+Payload CER at 10 dB, 24 WPM:
+
+| | v3 | v3 + K2 | `dcw2n` |
+|---|---|---|---|
+| ITU good | 0.121 | 0.054 | 0.032 |
+| ITU poor | 0.459 | 0.147 | 0.125 |
+| ITU low latitude (10 Hz) | 0.635 | 0.191 | 0.272 |
+| flat 3 Hz | 0.560 | 0.203 | 0.200 |
+| two paths beating ±0.5 Hz | 0.621 | 0.442 | 0.397 |
+| a second station 30 Hz away, same level | 0.561 | 0.842 | 0.202 |
+| chirp 30 Hz / 20 ms, 6 dB | 0.020 | 0.043 | 0.000 |
+
+- **Fading is nearly closed.** K2 is level with v2 narrow at 10 dB on
+  ITU poor and flat 3 Hz, ahead at 10 Hz, ahead at 20 dB nearly
+  everywhere.
+- **What is left is weak-signal sensitivity**, 2–5 dB on white noise,
+  and **selectivity**: v2 narrow reads three 18.75 Hz bins, v3 a 60 Hz
+  low-pass, so a second station in the channel costs v3 far more.
+- **Impulses** behind the repair: v2 narrow 0.000–0.004, K2 up to 0.025.
+- **No false characters** on noise for either.
+
+**What could make up the weak-signal gap,** each with a measured or
+estimated size:
+
+| Source | Evidence | Size | Step |
+|---|---|---|---|
+| non-coherent evidence near threshold | `bell:coh` (a gain filter per survivor) against v3 on white noise | 1–3.5 dB at 12–25 WPM | K6 (S3) |
+| clock acquisition at slow speed | §2: the bootstrap learns a wrong dit at the cliff | up to 4.3 dB at 12 WPM, 2.0 at 18, 1.2 at 25 (not re-measured with K2) | P3.4, the hypothesis bank |
+| decision lag and max-product | DeepCW reads seconds of context both ways; v3 commits 4–8 dits back, best path only | unmeasured | P2.3 (forward-backward), a longer lag |
+| text prior | DeepCW was trained on text; v3 uses the dictionary only in its re-reads | unmeasured; the bench text is mostly random callsigns | P2.4, P3.5 |
+
+These overlap; the oracle bounds (S1) measure them before more is built.
+
+**The order from here.** It replaces §3's order for the steps it names;
+each step keeps its pass criteria and its switch, byte-identical when off.
+
+| Step | Work | Pass / decides | Effort |
+|---|---|---|---|
+| S0 | **Input level and amplitude, all decoders.** Strong signals, SNR500 20–60 dB, steady and under 1 Hz fading, are measured: DeepCW v1 and v2 narrow lose nothing (0.000 steady, 0.014 / 0.044 fading) although their 8-bit input clips about 47 and 30 dB over the per-bin noise; K2 broke (0.34 at 30 dB, 0.83–0.89 at 40–60) until its score got a noise floor at the predicted mark power over 1000 (now 0.012–0.018 steady, 0.002–0.010 fading; FADING_TRACKER.md §8). Still to measure: the absolute input scale (`--gain`, ±40 dB at fixed SNR), level steps of the signal and of the noise mid-over, and a receiver AGC that pumps the band with a strong station | whether DeepCW's lead holds at real band levels, and what any decoder needs from the front end (scaling, AGC rules) | 1–2 days |
+| S1 | **Gap attribution** (P1.2, narrowed): on the white-noise ladder at 12 / 25 / 35 WPM, v3 + K2 with the true clock (`oracle.h` `clock`), with the true complex gain in the tracker, and with both; DeepCW on random-letter text against the bench's text | a dB budget: clock, coherence, the rest; it orders S2–S5 | 3–5 days |
+| S2 | **K3, the spread and the frequency offset per station** (P3.1): B measured from committed marks and shared by the station's hypotheses, δf tracked so B can come down from 1 Hz | the 3 % gap on white noise closed (K2 at B = 0.5 Hz already matches v3); chirp 30 Hz / 20 ms at 6 dB ≤ v3; beating ±0.5 Hz at 10 dB < 0.40; slow fading not worse | 1–2 weeks |
+| S3 | **K6, a gain estimate per lattice node** (per-survivor processing): each node carries (µ, V) from its best predecessor and updates it with its own hypothesis's keying; K2's soft estimate seeds new paths | white noise within 1.5 dB of `dcw2n` at 12–25 WPM (at least 1.5 dB over K2); CPU per channel measured; fading not worse | 2–3 weeks |
+| S4 | **Clock or lattice**, by S1's budget: the hypothesis bank (P3.4) if the clock bound exceeds 1 dB; the forward-backward pass and a longer lag (P2.3) if what is left sits in the lattice | its bound reached for the most part, no false characters on noise | 2–4 weeks |
+| S5 | **K4, the smoother at commit**: σ², P, B and δf from committed stretches; the state restarted from the smoothed estimate | dense impulse trains without the repair at least v3's (ignition 50/s at 10 dB ≤ 0.02); feeds S2 | 1 week |
+| S6 | **Selectivity**: the matched filter's low-pass tied to the tracked carrier and narrowed with it; a second carrier in the channel tracked or rejected | second station at 30 Hz, same level ≤ 0.30; offsets to 62.5 Hz unchanged | 1–2 weeks |
+
+**Alongside:**
+
+- **K2 into v3's default**, with the repair in front, once S2 closes the
+  3 % gap: it already halves to quarters v3's fading errors at no cost
+  worth measuring.
+- **DeepCW v2 narrow as an option** where the CPU allows: it is the best
+  decoder on the bench today, and the classical one stays the fallback for
+  a full band.
+
+**Decision points.**
+
+| Point | After | Question | If yes | If no |
+|---|---|---|---|---|
+| T0 | S0 | does any decoder lose copy at real band levels (above 30 dB, level steps, AGC)? | fix in the front end first (scaling, the noise estimate) | the comparison stands |
+| T1 | S1 | does the clock bound exceed the coherence bound? | S4 (bank) before S3 | S3 first |
+| T2 | S3 | is K6 within 1.5 dB of `dcw2n` at 12–25 WPM? | S4 and S6 for the rest | the gap is not in the evidence: measure DeepCW's text prior and context (S1's second half) before more Bayesian work |
+| T3 | S2–S6 | within 1 dB of `dcw2n` on white noise, at or under it on the fading and selectivity tables, at under twice v3's CPU? | v4 preset | the hybrid: DeepCW where the CPU allows |
 
 ---
 
@@ -70,8 +162,8 @@ order of the plan.
 
 | Loss | Size | Cause | Addressed by |
 |---|---|---|---|
-| Fading | 9 dB behind CW Skimmer at 0.1 Hz Doppler, over 10 dB at 1 Hz; 15 % CER floor at +20 dB | no amplitude tracker follows a fade; σ1² held 2 s, µ_mark 0.35 s | P0.1 (part), P2.1 |
-| Impulses | 3/s at 40 dB: CER 1.2 → 32 %; 10/s: 250 false characters per hour | no impulse model at all | P1.5 (part), P3.2 |
+| Fading | 9 dB behind CW Skimmer at 0.1 Hz Doppler, over 10 dB at 1 Hz; 15 % CER floor at +20 dB | no amplitude tracker follows a fade; σ1² held 2 s, µ_mark 0.35 s | P0.1 (part), P2.1: built (K2, §0), ITU poor at 10 dB 0.46 → 0.15 |
+| Impulses | 3/s at 40 dB: CER 1.2 → 32 %; 10/s: 250 false characters per hour | no impulse model at all | P1.5 (part), P3.2: the repair built (§0), sferics at 6 dB 0.755 → 0.030 |
 | Clock acquisition at slow speed | up to 4.3 dB at 12 WPM, 2.0 at 18, 1.2 at 25 | the bootstrap learns a wrong dit at the cliff | P3.4 |
 | The weak-view pause rule | 0.9 dB at 18 WPM | judged on the 45 Hz envelope, not on the matched path | P0.6 |
 | Channel start | 35 WPM: 9 % CER floor at any SNR | zero-history channelizer output, squelch opens on noise | P0.2, P0.3 |
@@ -84,7 +176,8 @@ order of the plan.
 
 ## 3. Overview
 
-Five phases. From Phase 2 on, two lines run side by side: the **main line**
+§0 sets the order from here for the steps it names (S0–S6); the phases
+below keep the rest. Five phases. From Phase 2 on, two lines run side by side: the **main line**
 improves the evidence, and the **side line** builds the Bayesian structure
 (priors, the forward algorithm, the language model) so that it is ready, and
 byte-identical, when the evidence settles. The side line is built and

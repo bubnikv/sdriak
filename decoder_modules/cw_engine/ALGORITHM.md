@@ -1033,7 +1033,7 @@ Others exist in part.
 | Speed-matched linear filters | measured: no gain left (§5.3.6) | `CwMatchedFilter`, `CwEnvelope` |
 | Per-element amplitude, gain tracker, Doppler spread | open | — |
 | Forward–backward, character and callsign posteriors | open | — |
-| Impulse repair before the channelizer, repair weights to the decoders | measured on the bench (§5.7); no pipeline uses it yet; v3 ignores the weights | `ImpulseRepair`, `SkimDecodeChannel::set_repair_weights` |
+| Impulse repair before the channelizer, repair weights to the decoders | an option of the channelizer, measured on the bench (§5.7); no pipeline uses it yet; v3 ignores the weights | `ImpulseRepair`, `SkimChannelizer::create_ex(…, repair)`, `SkimDecodeChannel::set_repair_weights` |
 
 The weak view uses the exponential (Rayleigh-fading) model, so a notch
 sample already costs at most ln(σ1²/σ0²)/L ≤ ln 9/L nats. That bounded
@@ -1744,9 +1744,12 @@ at the same output sample, and a CW station never does.
 Its latency is the split's frame and the look-ahead, 70 ms at 8 kHz; it
 costs 2.4 % of a core at 48 kHz, 10.6 % at 192 kHz without the split
 (the split's FFTs add a few per cent). It hands each output sample
-a repaired flag; `SkimDecodeChannel::set_repair_weights()` gives a backend
-the share of repaired wideband samples in the channelizer prototype's span
-behind each channel sample.
+a repaired flag. It is an option of the channelizer:
+`SkimChannelizer::create_ex(…, &repair_config)` runs it in front of the
+filter bank, and `read(chan, iq, n, weights)` hands out beside each channel
+frame its repair weight, the share of repaired wideband samples in the
+prototype's span behind that frame, taken at the frame's hop. The caller
+passes them on with `SkimDecodeChannel::set_repair_weights()`.
 
 On the bench (`bench.py impulse2`, `--repair`; BELL.md has the tables),
 25 WPM at 6 dB, v3: sferics 3/s at 40 dB 0.755 → 0.030, 10 pulses/s
