@@ -75,15 +75,19 @@ public:
           m_ring(m_afcn), m_fft(m_afcn), m_pow(m_afcn) {}
 
     void set_floor(double noise_pw) override { m_floor = noise_pw; }
+    void set_repair_weights(const float *w, unsigned nframes) override { m_w.assign(w, w + nframes); }
 
     bool process(const float *iq, unsigned nframes, SkimDecode *out) override {
         m_text.clear();
         if (m_cfg.decoder.coherent) {
             for (unsigned k = 0; k < nframes; k++) {
+                if (k < m_w.size()) m_wmax = std::max(m_wmax, m_w[k]);
                 if (++m_phase < m_decim) continue;
                 m_phase = 0;
-                coherent_sample(iq[2 * k], iq[2 * k + 1]);
+                coherent_sample(iq[2 * k], iq[2 * k + 1], m_wmax);
+                m_wmax = 0.0f;
             }
+            m_w.clear();             // the weights belonged to this block
             return emit(out);
         }
         for (unsigned k = 0; k < nframes; k++) {
@@ -125,6 +129,7 @@ public:
         m_afc_lock = false;
         m_afc_hz = m_phi = 0.0;
         m_delay.clear();
+        m_delay_w.clear();
     }
 
     double tone_offset_hz() const override { return m_cfg.decoder.coherent && m_cfg.coh_afc ? afc_hz() : 0.0; }
@@ -137,7 +142,7 @@ private:
         return m_blocks_min > 0.0 ? m_blocks_min : 1e-12;
     }
 
-    void coherent_sample(float re, float im) {
+    void coherent_sample(float re, float im, float w) {
         m_bacc += static_cast<double>(re) * re + static_cast<double>(im) * im;
         if (++m_bcnt == m_block) {
             m_blocks[m_bat] = m_bacc / m_bcnt;
@@ -154,11 +159,14 @@ private:
             // locked estimate.
             afc_push(re, im);
             m_delay.emplace_back(re, im);
+            m_delay_w.push_back(w);
             const size_t look = static_cast<size_t>(std::lround(m_cfg.coh_afc_lookahead_s * 1000.0 / m_dec_dt_ms));
             if (m_delay.size() <= look) return;
             re = m_delay.front().real();
             im = m_delay.front().imag();
             m_delay.pop_front();
+            w = m_delay_w.front();
+            m_delay_w.pop_front();
             m_phi = std::remainder(m_phi + 2.0 * kPi * m_afc_hz * m_dec_dt_ms * 1e-3, 2.0 * kPi);
             const double c = std::cos(m_phi), s = std::sin(m_phi);
             const double r2 = re * c + im * s, i2 = im * c - re * s;
@@ -167,7 +175,7 @@ private:
         }
         if (!(m_floor > 0.0) && m_bfill == 0) return;       // nothing to scale by yet
         const float s = static_cast<float>(1.0 / std::sqrt(n0 * m_noise_scale));
-        m_dec.push_iq(re * s, im * s, m_text);
+        m_dec.push_iq(re * s, im * s, m_text, w);
     }
 
     // AFC: every 0.5 s, the Hann-windowed periodogram of the last m_afcn
@@ -285,6 +293,11 @@ private:
     bool   m_afc_lock = false;
     double m_afc_hz = 0.0, m_phi = 0.0;
     std::deque<std::complex<float>> m_delay;
+    std::deque<float> m_delay_w;             // the repair weight of each delayed sample
+    // Repair weights of the current block (set_repair_weights), and the
+    // largest since the last kept sample.
+    std::vector<float> m_w;
+    float m_wmax = 0.0f;
 };
 
 }  // namespace

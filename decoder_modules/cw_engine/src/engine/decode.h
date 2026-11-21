@@ -118,6 +118,13 @@ public:
     // band floor takes it here (v3). Optional.
     virtual void set_floor(double /*noise_pw*/) {}
 
+    // Impulse repair weights for the next process() block (ALGORITHM.md
+    // §5.7): one per frame, the share in [0, 1] of the wideband samples
+    // behind that frame that an impulse repair stage rebuilt rather than
+    // received. A backend may trust such frames less. Optional; absent
+    // weights mean 0.
+    virtual void set_repair_weights(const float * /*w*/, unsigned /*nframes*/) {}
+
     // Pending DISPLAY-ONLY text (returns it and clears; "" when none —
     // SDRIAK: upstream returns a malloc'd string or NULL). The pipeline shows
     // it (pane, decode log) but must NEVER feed it to the callsign extractor:

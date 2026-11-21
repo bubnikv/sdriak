@@ -305,7 +305,8 @@ void BellDecoder::push(float zin, std::string &out) {
     proces(z, m_rn, out);
 }
 
-void BellDecoder::push_iq(float re, float im, std::string &out) {
+void BellDecoder::push_iq(float re, float im, std::string &out, float w) {
+    m_wt = m_cfg.coh_repair_weight ? std::clamp(w, 0.0f, 1.0f) : 0.0f;
     m_yr = re;
     m_yi = im;
     proces(0.0f, 1.0f, out);
@@ -567,21 +568,26 @@ float BellDecoder::kalfil_coh(int ip, int ixs, int jnode, float pin, int c) {
     const float kappa = m_cfg.coh_imp_kappa;
     // ln(e^a + e^b), for the impulse mixture.
     auto lse = [](float a, float b) { return a > b ? a + std::log1p(std::exp(b - a)) : b + std::log1p(std::exp(a - b)); };
+    // A sample the impulse repair rebuilt (weight m_wt) carries 1 − m_wt of
+    // its evidence: its log-likelihood and its Kalman gain are scaled by it.
+    const float tw = 1.0f - m_wt;
     if (ixs == 0) {
         m_ykksv[jnode] = gr;
         m_yiksv[jnode] = gi;
         m_pkksv[jnode] = ppred;
         const float y2 = m_yr * m_yr + m_yi * m_yi;
-        if (!imp) return -y2;
-        return lse(m_ln_gauss - y2, m_ln_imp - y2 / kappa - m_ln_kappa);
+        if (!imp) return m_wt > 0.0f ? -tw * y2 : -y2;
+        const float l = lse(m_ln_gauss - y2, m_ln_imp - y2 / kappa - m_ln_kappa);
+        return m_wt > 0.0f ? tw * l : l;
     }
     const float s = ppred + 1.0f, er = m_yr - gr, ei = m_yi - gi, e2 = er * er + ei * ei;
-    const float k = ppred / s;
+    const float k = m_wt > 0.0f ? tw * (ppred / s) : ppred / s;
     if (!imp) {
         m_ykksv[jnode] = gr + k * er;
         m_yiksv[jnode] = gi + k * ei;
         m_pkksv[jnode] = (1.0f - k) * ppred;
-        return -e2 / s - std::log(s);
+        const float l = -e2 / s - std::log(s);
+        return m_wt > 0.0f ? tw * l : l;
     }
     // Two updates, one per noise component, mixed by the posterior weight r
     // of the impulse component.
@@ -590,11 +596,11 @@ float BellDecoder::kalfil_coh(int ip, int ixs, int jnode, float pin, int c) {
     const float li = m_ln_imp - e2 / si - std::log(si);
     const float l = lse(lg, li);
     const float r = m_cfg.coh_imp_update ? std::exp(li - l) : 0.0f;
-    const float keff = (1.0f - r) * k + r * ki;
+    const float keff = (1.0f - r) * k + r * (m_wt > 0.0f ? tw * ki : ki);
     m_ykksv[jnode] = gr + keff * er;
     m_yiksv[jnode] = gi + keff * ei;
-    m_pkksv[jnode] = ((1.0f - r) * (1.0f - k) + r * (1.0f - ki)) * ppred;
-    return l;
+    m_pkksv[jnode] = m_wt > 0.0f ? (1.0f - keff) * ppred : ((1.0f - r) * (1.0f - k) + r * (1.0f - ki)) * ppred;
+    return m_wt > 0.0f ? tw * l : l;
 }
 
 // MODEL (p. 177–178): during a mark the amplitude is a slow random walk;

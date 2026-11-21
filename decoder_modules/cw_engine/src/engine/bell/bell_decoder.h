@@ -92,6 +92,9 @@ struct BellConfig {
     // only scores, and the filter always takes the Gaussian update (a fast
     // fade then still updates the gain).
     bool   coh_imp_update = true;
+    // Weigh samples an impulse repair stage rebuilt (push_iq's w) at 1 − w
+    // of their evidence.
+    bool   coh_repair_weight = false;
 
     // Clamp NOISE's output to [0, 1] before PROCES (morse-wip, bmorse.cxx:352;
     // not in the listing). NOISE's variance estimate is fitted to Bell's
@@ -136,7 +139,9 @@ public:
     void push(float zin, std::string &out);
     // The coherent variant: one complex sample every coh_dt_ms, noise
     // variance 1.
-    void push_iq(float re, float im, std::string &out);
+    // w: the share of the sample an impulse repair rebuilt (used with
+    // BellConfig::coh_repair_weight).
+    void push_iq(float re, float im, std::string &out, float w = 0.0f);
 
     // State of the last sample.
     float key_prob() const { return m_px; }             // PX: P(key down)
@@ -212,6 +217,7 @@ private:
     // imaginary part of each filter's mean (the real part is YKKIP/YKKSV).
     static constexpr float kNoLog = -1e30f;
     float m_yr = 0.0f, m_yi = 0.0f;
+    float m_wt = 0.0f;                      // the sample's repair weight
     std::vector<float> m_coha;
     float m_omega = 10.0f;
     std::vector<float> m_yikip, m_yiksv;
