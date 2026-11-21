@@ -202,7 +202,10 @@ fading path; beat = two static paths ±0.5 Hz, 1 ms apart):
   retrained; which of the two matters is not separated.
 
 Cost on one core of an i3-N300, per 47 s over: v3 < 0.1 s, v2 narrow ≈ 0.5 s,
-v2 wide ≈ 4 s, v1 ≈ 8.5 s.
+v2 wide ≈ 4 s, v1 ≈ 8.5 s. On the bench machine (one thread, per 27 s over
+at 25 WPM, the bench and the channelizer subtracted): v3 0.05 s, v2 narrow
+0.39 s, v2 wide 3.0 s, v1 9.4 s; the Bell R-series decoder 0.73 s with
+100 paths, 0.12 s with 25 (BELL.md, "The R-series configuration").
 
 ## Not measured yet
 

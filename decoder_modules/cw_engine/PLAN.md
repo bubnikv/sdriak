@@ -179,7 +179,7 @@ measured against v3 + K2 and DeepCW v2 narrow:
 | R3 | observations at 250 Hz with correlated noise, an edge-aware model | not needed as planned: keying edges of 1–10 ms move Bell by ≤ 0.4 dB, and its threshold rises with the speed as the energy per dit falls (12 → 35 WPM: 4.9 dB against 4.6 dB of energy); DeepCW's rises only 3.7 dB, its context helps it at speed. 250 Hz as it stands breaks (25 WPM +2.2 dB) |
 | R4 | the beam: 25 / 50 / 100 paths (`BellConfig::paths`, `:paths<n>`) | built, below: 100 paths 0.2–0.8 dB better at 18–35 WPM, nothing at 12 |
 | R4b | a noise floor in the score at the path's predicted mark power over 1000 (`coh_floor_ratio`, `:floor1000`), as K2's | built: 60 dB 0.099 → 0.004, 20–40 dB ≤ 0.012, fading and weak signals unchanged |
-| R5 | impulses: repair weights, the sferic anomaly | — |
+| R5 | impulses: repair weights, the sferic anomaly | done, below: the impulse term (ε 0.01, κ 100, scoring only) and the repair weights |
 | R6 | within 1.5 dB of `dcw2n` at 12–25 WPM, no false characters: a v4 backend | — |
 
 Bell with the gate and the coarse AFC, white noise, SNR500 for 10 % / 3 %
@@ -223,6 +223,41 @@ SNR500 for 10 % / 3 %:
 v3 takes 0.08 s, the channelizer included. 100 paths are within 1.5–1.7 dB
 of `dcw2n` at 12–35 WPM; fading at 10 dB as with 25 (ITU poor 0.123, flat
 3 Hz 0.291, beat 0.359); no false characters on noise.
+
+**R5, impulses** (behind the repair, 25 WPM, 3 / 6 / 10 dB, 100 paths).
+Without an impulse term Bell reads what the repair leaves of an impulse
+as an extra element (`#`, `*..--.*`: codes with dits inserted), more so
+the stronger the station, as a stronger gain explains a spike better
+than the unit noise: sferics 0.063 / 0.109 / 0.126. With BellConfig's
+impulse term in the score only (`:imp<ε>:kappa<κ>:impscore`) and the
+repair weights (`:repw`):
+
+| ε / κ | sferics 6 / 10 dB | crashes 6 / 10 dB | 25 WPM 10 % / 3 % | ITU poor 10 / 20 dB |
+|---|---|---|---|---|
+| none | 0.096 / 0.118 | 0.037 / 0.034 | −2.09 / −0.41 | 0.123 / 0.014 |
+| 0.05 / 30 | 0.005 / 0.022 | 0.006 / 0.009 | −1.73 / −0.29 | 0.117 / 0.024 |
+| 0.01 / 100 | 0.010 / 0.014 | 0.008 / 0.014 | −2.05 / −0.34 | 0.106 / 0.016 |
+
+CPU per 27 s over (one thread, bench and channelizer subtracted): v3
+0.05 s, the R-series 0.73 s with 100 paths and 0.12 s with 25, DeepCW v2
+narrow 0.39 s, v2 wide 3.0 s, v1 9.4 s (BELL.md, "The R-series
+configuration", has the full tables).
+
+ε 0.01 / κ 100 is the setting: sferics level with v3 + K2 + K3 (0.002 /
+0.019), crashes better, the clean ladder and fading unchanged. 10 pulses
+a second, ignition and Class A at 0.000–0.012 (with ε 0.05).
+
+**The spread's calibration.** On the decoder's sure marks the estimator
+reads (10 / 20 dB) 0.20 with no fading, 0.23 at 0.1 Hz, 0.25–0.29 at
+0.3, 0.67–0.72 at 1, 0.94–1.14 at 2, 1.18–1.68 at 3, 1.06–1.35 at 5,
+1.30–2.20 at 10: a faded stretch is not a sure mark. The paths take 1.3x
+the measured spread under 0.5 Hz (at least 0.3 Hz) and 2.5x as steep
+above. With 100 paths, the impulse term and the repair weights, payload
+CER at 10 / 20 dB (`dcw2n` in brackets): ITU good 0.042 / 0.009 (0.032 /
+0.011), ITU poor 0.100 / 0.017 (0.125 / 0.047), flat 3 Hz 0.235 / 0.059
+(0.200 / 0.111), beat 0.289 / 0.058 (0.397 / 0.258), 10 Hz 0.479 / 0.247
+(0.272 / 0.241); white noise at 10 % −4.35 / −2.05 / −0.38 dB at 12 / 25
+/ 35 WPM, unchanged.
 
 **The order from here.** It replaces §3's order for the steps it names;
 each step keeps its pass criteria and its switch, byte-identical when off.

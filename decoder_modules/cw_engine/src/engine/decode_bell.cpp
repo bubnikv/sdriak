@@ -217,7 +217,7 @@ private:
             if (!down && m_in_mark && m_kt > m_mark_from + 2) {
                 m_spread.mark(m_mark_from, m_kt - 1, 1, 1.0);
                 if (m_spread.spread() > 0) {
-                    m_dec.set_spread(static_cast<float>(std::max(kSpreadFloorHz, kSpreadMargin * m_spread.spread())));
+                    m_dec.set_spread(static_cast<float>(calibrated_spread(m_spread.spread())));
                 }
             }
             m_in_mark = down;
@@ -356,6 +356,16 @@ private:
     uint64_t m_frames = 0, m_last_carrier = 0, m_hold_frames = 0;
     bool     m_seen = false;
     double   m_cphi = 0.0;                   // the coarse AFC's derotation phase
+    // The spread the paths take from the measured one. The measurement runs
+    // on the stretches the decoder is sure are marks, and in a fast fade the
+    // faded stretches are not: it reads about 0.4–0.6 of the true spread
+    // above 0.5 Hz (1 Hz as 0.7, 3 Hz as 1.2–1.7 at 10–20 dB) and saturates
+    // past 5 Hz. Under 0.5 Hz: 1.3x, at least 0.3 Hz; above, 2.5x as steep.
+    static double calibrated_spread(double b) {
+        if (b < kSpreadKneeHz) return std::max(kSpreadFloorHz, kSpreadMargin * b);
+        return kSpreadMargin * kSpreadKneeHz + kSpreadSlope * (b - kSpreadKneeHz);
+    }
+    static constexpr double kSpreadKneeHz = 0.5, kSpreadSlope = 2.5;
     // The measured spread: the estimator, the decoder's sample count, the
     // key-down run in progress.
     CwSpreadEstimator m_spread;

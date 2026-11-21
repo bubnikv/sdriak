@@ -550,15 +550,71 @@ Switches, after the name and in any order:
 | `:qsw<x>` | the probability that a path changes q class at a change of element (default 0.05) |
 | `:coh` | the coherent variant ("The coherent variant"), with `:spread<B>`, `:spreads<x>/<y>/...`, `:match<ms>`, `:noafc`, `:imp<ε>`, `:kappa<κ>`, `:impscore`, `:repw` |
 
+## The R-series configuration
+
+The coherent variant developed as the candidate for a v4 backend
+(PLAN.md §0, R1–R6), bench configuration
+`bell:coh:gate:mspread:floor1000:paths100:imp0.01:kappa100:impscore:repw`:
+
+- `:gate` (`BellBackendConfig::gate`): v3's carrier detector on the
+  channel's raw IQ; text passes only while a carrier was seen within 4 s.
+- `:mspread` (`measure_spread`): the spread measured on the station
+  (v3's `CwSpreadEstimator` on the runs the decoder holds key-down with
+  P > 0.9) and shared by all paths, calibrated: 1.3x under 0.5 Hz, at
+  least 0.3 Hz, 2.5x as steep above (the measurement reads about half the
+  true spread above 0.5 Hz: a faded stretch is not a sure mark).
+- `:floor1000` (`BellConfig::coh_floor_ratio`): both hypotheses score with
+  the noise at least the path's predicted mark power over 1000.
+- `:paths100`: 100 paths instead of 25.
+- `:imp0.01:kappa100:impscore:repw`: the impulse term in the score only,
+  and the repair stage's weights.
+
+White noise, SNR500 (dB) for 10 % / 3 % payload CER, 20 overs a step:
+
+| | 12 WPM | 18 WPM | 25 WPM | 35 WPM |
+|---|---|---|---|---|
+| R-series | −4.35 / −2.68 | −3.41 / −2.04 | −2.05 / −0.34 | −0.38 / +1.26 |
+| R-series, 25 paths | −4.56 / −3.24 | −3.23 / −1.97 | −1.48 / −0.39 | +0.38 / +1.54 |
+| v3 + K2 + K3 | −1.11 / −0.49 | | −0.82 / −0.02 | −0.18 / +1.30 |
+| DeepCW v2 narrow | −5.82 / −4.01 | about −4.3 | −3.67 / −1.70 | −2.13 / −0.51 |
+
+Payload CER at 24 WPM, 10 / 20 dB, 30 overs:
+
+| | R-series | v3 + K2 + K3 | DeepCW v2 narrow |
+|---|---|---|---|
+| ITU good | 0.042 / 0.009 | 0.049 / 0.014 | 0.032 / 0.011 |
+| ITU poor | 0.100 / 0.017 | 0.152 / 0.025 | 0.125 / 0.047 |
+| ITU low latitude (10 Hz) | 0.479 / 0.247 | 0.192 / 0.049 | 0.272 / 0.241 |
+| flat 3 Hz | 0.235 / 0.059 | 0.202 / 0.023 | 0.200 / 0.111 |
+| beat ±0.5 Hz | 0.289 / 0.058 | 0.435 / 0.126 | 0.397 / 0.258 |
+
+Behind the impulse repair (25 WPM, 6 / 10 dB): sferics 0.010 / 0.014,
+crashes 0.008 / 0.014. No false characters on noise. Strong stations
+(20–60 dB) ≤ 0.012.
+
+CPU on one core, single-threaded, per 27 s over at 25 WPM, the bench's
+synthesis and the channelizer (about 0.07 s) subtracted:
+
+| | per over | of one core |
+|---|---|---|
+| v3, v3 + K2 + K3 | 0.05 s | 0.2 % |
+| R-series, 25 paths | 0.12 s | 0.4 % |
+| R-series, 100 paths | 0.73 s | 2.7 % |
+| DeepCW v2 narrow | 0.39 s | 1.4 % |
+| DeepCW v2 wide | 3.0 s | 11 % |
+| DeepCW v1 | 9.4 s | 35 % |
+
+The decoder runs whether a carrier is there or not; the gate only holds
+back its text. DeepCW infers only where its keyed-line gate sees a signal.
+
 ## Known limits
 
-- **No idle state.** After 14 dits of pause the model must start a mark,
-  so noise before and between overs decodes as characters. Bell tested on
-  continuous simulated text. A squelch would have to come from outside.
-- **No AFC.** The IF emulation is ±35 Hz around the channel centre.
-- **Envelope only.** The amplitude filter sees |z|, with a Gaussian model
-  of a Rician envelope. FADING_TRACKER.md explains why a complex filter on
-  I/Q does better.
-- **Fixed amplitude dynamics.** `MODEL`'s random walk (q = 10⁻⁴ per 5 ms)
-  is not tied to the Doppler spread, and its variance shrinks during
-  spaces. `:q<x>` sets it by hand; nothing estimates the spread.
+- **The channel's edge.** The coherent path keeps every second channel
+  sample (125 Hz) without a low-pass, so a tone near ±62.5 Hz sits on the
+  fold: 0.70 CER at 62.5 Hz. `:cafc` fixes it (0.04) at about 1 dB at
+  12 WPM on a centred tone; off.
+- **Fast fading.** 10 Hz spreads are beyond the per-sample gain filters,
+  and the spread estimate saturates past 5 Hz.
+- **Idle cost.** The decoder runs on every channel, station or not.
+- **Envelope variant.** The original filter sees |z|, with a Gaussian
+  model of a Rician envelope; the coherent variant is the one developed.

@@ -67,8 +67,9 @@ struct BellBackendConfig {
     // The spread measured on the station (PLAN.md R2; CwSpreadEstimator, as
     // v3's K3) and shared by all paths, in place of coh_spread: runs of
     // samples the decoder holds key-down with probability over 0.9 are its
-    // marks. 1.3 × the measured spread, at least 0.3 Hz. One spread class
-    // only (coh_spreads empty).
+    // marks; the paths take it calibrated (calibrated_spread() in
+    // decode_bell.cpp: 1.3x under 0.5 Hz, at least 0.3 Hz, 2.5x as steep
+    // above). One spread class only (coh_spreads empty).
     bool   measure_spread = false;
 
     // The listing alone: BellConfig::listing(), no AGC clamp.
