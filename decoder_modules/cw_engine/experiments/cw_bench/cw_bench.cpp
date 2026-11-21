@@ -51,6 +51,14 @@ struct Path {                          // one Watterson path
     double delay_ms = 0.0;             // differential delay
 };
 
+// Impulse shapes (--impulse ...:<shape>): one wideband sample; the pulse as
+// a receiver delivers it (band-limited, ringing, at a random sub-sample
+// time); a sky-wave sferic (2–4 such pulses 0.5–3 ms apart).
+enum ImpShape { kImpDelta = 0, kImpRx = 1, kImpSferic = 2 };
+// The rx pulse: half-length in samples, low-pass edge as a fraction of the rate.
+constexpr int kImpHalf = 24;
+constexpr double kImpFc = 0.45;
+
 struct Options {
     std::string cfg = "v3";
     std::vector<double> wpm = {25};
@@ -70,6 +78,11 @@ struct Options {
     double imp_rate = 0.0;             // impulses per second
     double imp_db = 0.0;               // impulse amplitude over the wideband noise rms
     bool imp_periodic = false;         // a regular train (ignition) instead of Poisson
+    bool imp_crash = false;            // static crashes: imp_rate flashes per second
+    int imp_shape = 0;                 // ImpShape: delta, receiver-shaped, sferic
+    double clip_db = 0.0;              // > 0: ADC clipping, this far over the wideband noise rms
+    double classa_a = 0.0;             // > 0: Middleton Class A noise, impulsive index A
+    double classa_gamma = 0.0;         //      and Gaussian-to-impulsive power ratio Γ
     std::string bed;                   // cf32 IQ recording at `rate`
     double noise_only_s = 0.0;         // > 0: decode this much noise, count characters
     bool show = false;
@@ -165,12 +178,26 @@ bool parse_args(int argc, char **argv, Options &o) {
         else if (a == "--edge") o.edge_ms = std::atof(val());
         else if (a == "--preamble-db") o.preamble_db = std::atof(val());
         else if (a == "--fade") { if (!parse_fade(val(), o.paths)) { std::fprintf(stderr, "bad --fade\n"); return false; } }
-        else if (a == "--impulse") {            // poisson:<rate>:<dB> | periodic:<rate>:<dB>
+        else if (a == "--impulse") {    // poisson|periodic|crash:<rate>:<dB>[:delta|rx|sferic]
             const std::string s = val();
             o.imp_periodic = s.rfind("periodic:", 0) == 0;
+            o.imp_crash = s.rfind("crash:", 0) == 0;
             const char *p = std::strchr(s.c_str(), ':');
-            if (!p || std::sscanf(p + 1, "%lf:%lf", &o.imp_rate, &o.imp_db) != 2) {
+            char shape[16] = "";
+            if (!p || std::sscanf(p + 1, "%lf:%lf:%15s", &o.imp_rate, &o.imp_db, shape) < 2) {
                 std::fprintf(stderr, "bad --impulse\n");
+                return false;
+            }
+            const std::string sh = shape;
+            if (sh.empty() || sh == "delta") o.imp_shape = kImpDelta;
+            else if (sh == "rx") o.imp_shape = kImpRx;
+            else if (sh == "sferic") o.imp_shape = kImpSferic;
+            else { std::fprintf(stderr, "bad --impulse shape %s\n", shape); return false; }
+        }
+        else if (a == "--clip") o.clip_db = std::atof(val());
+        else if (a == "--classa") {                                 // <A>:<Gamma>
+            if (std::sscanf(val(), "%lf:%lf", &o.classa_a, &o.classa_gamma) != 2 || o.classa_a <= 0) {
+                std::fprintf(stderr, "bad --classa\n");
                 return false;
             }
         }
@@ -590,9 +617,67 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
         delay.push_back(static_cast<size_t>(std::lround(p.delay_ms * 1e-3 * o.rate)));
     }
 
-    // impulses: sample indices and complex amplitudes
+    // impulses: single samples (delta), or a waveform for the shaped kinds
     std::vector<std::pair<size_t, cplx>> imps;
-    if (o.imp_rate > 0) {
+    std::vector<cplx> impw;
+    const bool shaped = o.imp_rate > 0 && (o.imp_shape != kImpDelta || o.imp_crash);
+    if (shaped) {
+        impw.assign(env.size(), cplx());
+        const double rms = sigma > 0 ? sigma * std::sqrt(2.0) : 1.0;
+        const double a = rms * std::pow(10.0, o.imp_db / 20.0);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        // The receiver's pulse response: a low-pass to ±0.45 of the rate,
+        // a Hamming-windowed sinc over ±3 ms at 8 kHz, peak 1.
+        auto h = [](double x) {
+            if (std::fabs(x) >= kImpHalf) return 0.0;
+            const double s = std::fabs(x) < 1e-9 ? 1.0 : std::sin(2 * SKIM_PI * kImpFc * x) / (2 * SKIM_PI * kImpFc * x);
+            return s * (0.54 + 0.46 * std::cos(SKIM_PI * x / kImpHalf));
+        };
+        auto add_rx = [&](double t, cplx c) {          // one receiver-shaped pulse at t seconds
+            const double centre = t * o.rate;
+            const long n0 = static_cast<long>(std::floor(centre));
+            const double d = centre - static_cast<double>(n0);
+            for (int k = -kImpHalf; k <= kImpHalf; k++) {
+                const long idx = n0 + k;
+                if (idx < 0 || idx >= static_cast<long>(impw.size())) continue;
+                impw[static_cast<size_t>(idx)] += c * h(static_cast<double>(k) - d);
+            }
+        };
+        auto add_sferic = [&](double t, double peak) {  // 2–4 copies, 0.5–3 ms apart
+            const int copies = 2 + static_cast<int>(u(rng_ch) * 3.0);
+            for (int i = 0; i < copies; i++) {
+                if (i) t += (0.5 + 2.5 * u(rng_ch)) * 1e-3;
+                const double ai = i ? peak * (0.3 + 0.7 * u(rng_ch)) : peak;
+                add_rx(t, std::polar(ai, 2 * SKIM_PI * u(rng_ch)));
+            }
+        };
+        const double dur = static_cast<double>(env.size()) / o.rate;
+        double t = 0;
+        while (true) {
+            t += o.imp_periodic ? (1.0 / o.imp_rate) * (1.0 + 0.02 * (u(rng_ch) - 0.5))
+                                : -std::log(1.0 - u(rng_ch)) / o.imp_rate;
+            if (t >= dur) break;
+            const double peak = a * (0.5 + u(rng_ch));
+            if (o.imp_crash) {
+                // A flash: 3–6 return strokes 40–60 ms apart, each a sferic,
+                // and 10–30 weaker in-cloud pulses (−5 to −20 dB) over it.
+                const int strokes = 3 + static_cast<int>(u(rng_ch) * 4.0);
+                double ts = t;
+                for (int s = 0; s < strokes; s++) {
+                    if (s) ts += (40.0 + 20.0 * u(rng_ch)) * 1e-3;
+                    add_sferic(ts, a * (0.5 + u(rng_ch)));
+                }
+                const int weak = 10 + static_cast<int>(u(rng_ch) * 21.0);
+                for (int w = 0; w < weak; w++)
+                    add_rx(t + (ts - t) * u(rng_ch), std::polar(a * std::pow(10.0, -(5.0 + 15.0 * u(rng_ch)) / 20.0),
+                                                                2 * SKIM_PI * u(rng_ch)));
+            } else if (o.imp_shape == kImpSferic) {
+                add_sferic(t, peak);
+            } else {
+                add_rx(t, std::polar(peak, 2 * SKIM_PI * u(rng_ch)));
+            }
+        }
+    } else if (o.imp_rate > 0) {
         const double rms = sigma > 0 ? sigma * std::sqrt(2.0) : 1.0;
         const double a = rms * std::pow(10.0, o.imp_db / 20.0);
         std::uniform_real_distribution<double> u(0.0, 1.0);
@@ -606,6 +691,8 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
         }
     }
     size_t next_imp = 0;
+    std::poisson_distribution<int> classa(o.classa_a > 0 ? o.classa_a : 1.0);
+    const double clip = (sigma > 0 ? sigma * std::sqrt(2.0) : 1.0) * std::pow(10.0, o.clip_db / 20.0);
 
     const size_t pre_n = o.preamble_db > 0 ? static_cast<size_t>((o.lead_s + 40 * 1.2 / wpm) * o.rate) : 0;
     const double pre_gain = o.preamble_db > 0 ? std::pow(10.0, -o.preamble_db / 20.0) : 1.0;
@@ -632,8 +719,12 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             const double ns = k < pre_n ? pre_gain : 1.0;
             double re = s.real(), im = s.imag();
             if (bed.empty()) {
-                re += ns * g(rng);
-                im += ns * g(rng);
+                // Middleton Class A: m ~ Poisson(A) impulsive sources at once,
+                // variance (m/A + Γ)/(1 + Γ) of the Gaussian's, the same mean.
+                const double ca = o.classa_a > 0
+                    ? std::sqrt((classa(rng) / o.classa_a + o.classa_gamma) / (1.0 + o.classa_gamma)) : 1.0;
+                re += ns * ca * g(rng);
+                im += ns * ca * g(rng);
             } else {
                 re += bed[2 * (bed_at + k)];
                 im += bed[2 * (bed_at + k) + 1];
@@ -642,6 +733,18 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                 re += imps[next_imp].second.real();
                 im += imps[next_imp].second.imag();
                 next_imp++;
+            }
+            if (!impw.empty()) {
+                re += impw[k].real();
+                im += impw[k].imag();
+            }
+            if (o.clip_db > 0) {
+                // ADC saturation: the complex magnitude limited, everything in it.
+                const double mag = std::hypot(re, im);
+                if (mag > clip) {
+                    re *= clip / mag;
+                    im *= clip / mag;
+                }
             }
             iq[2 * i] = static_cast<float>(re);
             iq[2 * i + 1] = static_cast<float>(im);
