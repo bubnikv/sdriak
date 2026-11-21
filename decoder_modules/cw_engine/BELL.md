@@ -493,6 +493,21 @@ repair:
   detection for only 8 ms: a 64 ms pause leaves impulses unrepaired in a
   crowd (30 stations, sferics 0.217 against 0.153 at 10 overs). A larger
   AR model (48, 64) gives no clear gain.
+- **At a skimmer's width the crowd costs nothing.** At 48 kHz (384
+  channels), v3 at 6 dB, 10 overs, without → with the repair:
+
+  | Stations | none | sferic 3/s | ignition 50/s |
+  |---|---|---|---|
+  | 0 | 0.012 → 0.006 | 0.155 → 0.006 | 0.002 → 0.008 |
+  | 30 | 0.012 → 0.006 | 0.155 → 0.006 | 0.002 → 0.002 |
+  | 100 | 0.012 → 0.004 | 0.155 → 0.004 | 0.002 → 0.014 |
+  | 200 | 0.012 → 0.006 | 0.155 → 0.006 | 0.008 → 0.006 |
+
+  The same stations spread over six times the band: the split sets the
+  strong ones aside (about 190 of 2048 bins with 200 stations) and the
+  weak part left for the AR model stays thin. Ignition is already
+  harmless at 48 kHz (a pulse lasts a sixth as long); its changes with
+  the repair are one or two characters in 10 overs.
 - **The decoder can be told which samples were rebuilt**
   (`SkimDecodeChannel::set_repair_weights()`: per channel sample, the
   share of repaired wideband samples in the channelizer prototype's span

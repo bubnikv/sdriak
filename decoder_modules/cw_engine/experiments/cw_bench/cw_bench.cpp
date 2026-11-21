@@ -316,6 +316,71 @@ std::vector<float> envelope(const std::string &text, double wpm, double rate, do
     return o;
 }
 
+
+// The keying of envelope() as on/off runs, with the same random draws, for
+// keying rendered sample by sample (--qrm: hundreds of stations would not
+// fit in memory as full envelopes).
+std::vector<std::pair<long, unsigned char>> envelope_runs(const std::string &text, double wpm, double rate,
+                                                          double jitter, double lead_s, double /*edge_ms*/,
+                                                          std::mt19937 &rng) {
+    std::uniform_real_distribution<double> uj(-jitter, jitter);
+    const double dit = 1.2 / wpm * rate;
+    std::vector<std::pair<long, unsigned char>> r;
+    auto run = [&](double n, unsigned char v) {
+        n *= 1.0 + uj(rng);
+        r.emplace_back(std::max(0L, std::lround(n)), v);
+    };
+    run(lead_s * rate, 0);
+    for (char c : text) {
+        if (c == ' ') { run(4 * dit, 0); continue; }
+        const char *m = morse(c);
+        if (!m) continue;
+        for (const char *p = m; *p; p++) {
+            run(*p == '-' ? 3 * dit : dit, 1);
+            if (p[1]) run(dit, 0);
+        }
+        run(3 * dit, 0);
+    }
+    run(2.0 * rate, 0);
+    return r;
+}
+
+// envelope()'s output from its runs, one sample at a time: the raised-cosine
+// edge filter computed only where the last L keying samples differ, so the
+// values are envelope()'s exactly.
+struct KeyingRender {
+    std::vector<std::pair<long, unsigned char>> runs;
+    size_t ri = 0;
+    long left = 0;
+    unsigned char cur = 0;
+    std::vector<unsigned char> ring;
+    int pos = 0, ones = 0;
+
+    float next(const std::vector<float> &w, double sum) {
+        unsigned char b = 0;
+        while (left == 0 && ri < runs.size()) {
+            left = runs[ri].first;
+            cur = runs[ri].second;
+            ri++;
+        }
+        if (left > 0) {
+            b = cur;
+            left--;
+        }
+        const int L = static_cast<int>(w.size());
+        if (L < 3) return b;
+        if (ring.empty()) ring.assign(L, 0);
+        ones += b - ring[pos];
+        ring[pos] = b;
+        const int newest = pos;
+        pos = (pos + 1) % L;
+        if (ones == 0) return 0.0f;
+        if (ones == L) return 1.0f;     // envelope() sums the same weights as its normaliser
+        double a = 0;
+        for (int k = 0; k < L; k++) a += w[k] * static_cast<float>(ring[(newest - k + L) % L]);
+        return static_cast<float>(a / sum);
+    }
+};
 // --- the channel ------------------------------------------------------------------
 
 // One Watterson path's complex gain for n samples at rate: complex white
@@ -751,8 +816,21 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
 
     // other stations (--qrm): keyed CW in other channels, at least two
     // channels away, each with its own text, speed and level
-    struct Qrm { std::vector<float> env; double amp, w; };
+    struct Qrm { KeyingRender key; double amp, w; };
     std::vector<Qrm> qrm;
+    // envelope()'s edge filter, for the stations' keying
+    std::vector<float> qw;
+    double qsum = 0;
+    {
+        const int L = std::max(1, static_cast<int>(o.edge_ms * 1e-3 * o.rate));
+        if (L >= 3) {
+            qw.resize(L);
+            for (int i = 0; i < L; i++) {
+                qw[i] = static_cast<float>(0.5f - 0.5f * std::cos(2 * SKIM_PI * i / (L - 1)));
+                qsum += qw[i];
+            }
+        }
+    }
     if (o.qrm_n > 0) {
         std::mt19937 rq(9000 + seed);
         std::uniform_real_distribution<double> uq(0.0, 1.0);
@@ -767,11 +845,12 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             const double lvl = o.qrm_db - o.qrm_range * uq(rq);
             const double wq = 15.0 + 20.0 * uq(rq);
             Qrm s;
-            while (s.env.size() < env.size()) {      // over after over, to the end
-                const std::vector<float> e = envelope(payload(rq), wq, o.rate, o.jitter, 0.3 + uq(rq), o.edge_ms, rq);
-                s.env.insert(s.env.end(), e.begin(), e.end());
+            size_t len = 0;
+            while (len < env.size()) {                // over after over, to the end
+                const auto r = envelope_runs(payload(rq), wq, o.rate, o.jitter, 0.3 + uq(rq), o.edge_ms, rq);
+                for (const auto &p : r) len += static_cast<size_t>(p.first);
+                s.key.runs.insert(s.key.runs.end(), r.begin(), r.end());
             }
-            s.env.resize(env.size());
             s.amp = amp * std::pow(10.0, (lvl - snr500) / 20.0);
             s.w = 2 * SKIM_PI * f / o.rate;
             qrm.push_back(std::move(s));
@@ -796,8 +875,10 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                          std::polar(amp * env[kd], w0 * static_cast<double>(kd));
                 }
             }
-            for (const Qrm &q : qrm)
-                if (q.env[k] > 0.0f) s += std::polar(q.amp * q.env[k], q.w * static_cast<double>(k));
+            for (Qrm &q : qrm) {
+                const float e = q.key.next(qw, qsum);
+                if (e > 0.0f) s += std::polar(q.amp * e, q.w * static_cast<double>(k));
+            }
             const double ns = k < pre_n ? pre_gain : 1.0;
             double re = s.real(), im = s.imag();
             if (bed.empty()) {

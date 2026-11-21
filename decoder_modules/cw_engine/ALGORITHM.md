@@ -1757,7 +1757,10 @@ static crashes 0.229 → 0.020, 70 dB pulses clipped at 60 dB 0.995 →
 0.008, clipped pulses 0.998 → 0.002; measured before the split). In a
 crowded band (`--qrm`: 10–60 other stations at 10–30 dB) it still pays,
 but less: sferics 0.75 → 0.09–0.16, ignition 0.30 → 0.005–0.16, and a
-clean band of 60 stations loses 0.02.
+clean band of 60 stations loses 0.02. At 48 kHz the crowd costs nothing:
+with 30–200 other stations sferics go 0.155 → 0.004–0.006 and a clean
+crowded band is unharmed, since the same stations are spread over six
+times the band.
 
 Not done yet:
 - a skimmer pipeline to run it in (the engine has none);
@@ -1765,8 +1768,7 @@ Not done yet:
 - the pulse-fit subtraction of Linrad's smart blanker, which keeps the
   noise samples a prediction throws away, and would also clean the bins
   the split sets aside (an impulse's energy there passes untouched);
-- a crowded band at 48–192 kHz, where the split's median and the AR
-  model's capacity change again.
+- a crowded band at 192 kHz (measured up to 48 kHz and 200 stations).
 
 ### 5.8 Where small networks fit
 
