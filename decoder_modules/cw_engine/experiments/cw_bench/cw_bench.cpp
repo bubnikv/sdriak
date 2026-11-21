@@ -463,7 +463,9 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
     // noise per 5 ms during a mark, ":qbank" four q classes (1e-4, 3e-4,
     // 1e-3, 3e-3) chosen by the posterior, ":qbank<x>/<y>/..." others,
     // ":qsw<x>" their switch probability at an element change; ":coh" the
-    // coherent variant, ":noafc" without its AFC, ":rate<Hz>" its sample
+    // coherent variant, ":noafc" without its AFC, ":imp<eps>" and
+    // ":kappa<k>" its impulse mixture (":impscore" for scoring only),
+    // ":rate<Hz>" its sample
     // rate (125), ":spread<B>" its Doppler
     // spread (Hz),
     // ":spreads<x>/<y>/..." spread classes, ":match<ms>" its AR(1) match lag.
@@ -490,6 +492,9 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf.rfind("qsw", 0) == 0) c.decoder.q_switch = static_cast<float>(std::atof(suf.c_str() + 3));
             else if (suf == "coh") c.decoder.coherent = true;
             else if (suf == "noafc") c.coh_afc = false;
+            else if (suf == "impscore") c.decoder.coh_imp_update = false;
+            else if (suf.rfind("imp", 0) == 0) c.decoder.coh_imp_eps = static_cast<float>(std::atof(suf.c_str() + 3));
+            else if (suf.rfind("kappa", 0) == 0) c.decoder.coh_imp_kappa = static_cast<float>(std::atof(suf.c_str() + 5));
             else if (suf.rfind("rate", 0) == 0) c.coh_rate_hz = std::atof(suf.c_str() + 4);
             else if (suf.rfind("spreads", 0) == 0) {                // spreads<x>/<y>/...
                 c.decoder.coh_spreads.clear();

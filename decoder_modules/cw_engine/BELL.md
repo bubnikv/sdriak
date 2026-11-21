@@ -358,6 +358,56 @@ fading and level on fast.)
 - **At 0–3 dB under fading every decoder is poor** (0.3–0.7); coherence
   helps most at 6–15 dB.
 
+Impulses, noise and beating paths (`bench.py impulse` and `noise`
+arguments; beating: two fading paths of equal power, `paths:` with
+Doppler shifts ±0.5 Hz at 0.1 Hz spread, and ±1 Hz at 0.3 Hz with 1 ms
+delay; 24 WPM, 30 overs):
+
+| | `bell` | `coh` 0.5 Hz | `coh` bank {0.3, 1, 3} | `v3` |
+|---|---|---|---|---|
+| false characters/h, noise only | 417 | 87 | 144 | 3 |
+| CER 25 WPM 6 dB, no impulses | 0.006 | 0.000 | 0.001 | 0.007 |
+| 1 impulse/s, 40 dB | 0.280 | 0.245 | 0.340 | 0.128 |
+| 3 impulses/s, 40 dB | 0.568 | 0.589 | 0.677 | 0.311 |
+| 50/s periodic, 30 dB (ignition) | 0.690 | 0.752 | 0.941 | 0.228 |
+| false characters/h, noise with 1 impulse/s | 2670 | 1840 | 2280 | 0 |
+| beating ±0.5 Hz, CER at 10 dB | 0.219 | 0.197 | 0.131 | 0.421 |
+| beating ±1 Hz, CER at 10 dB | 0.312 | 0.515 | 0.140 | 0.539 |
+
+- **Impulses break both Bell variants:** each spike decodes as a dit. With
+  Gaussian noise a spike in a space is all but impossible, while a mark of
+  uncertain amplitude can absorb it.
+- **Noise alone still makes characters** (no idle state): 87–144 an hour
+  coherent, 3 for v3.
+- **A heavy-tailed noise model helps against impulses, but a decoder on
+  one channel cannot tell an impulse from a fast fade.** With
+  `:imp<ε>:kappa<κ>` the noise is (1 − ε)·CN(0, 1) + ε·CN(0, κ): a sample
+  far outside the Gaussian part scores as weak evidence for either key
+  state. 25 WPM 6 dB, 20 overs; ITU poor 24 WPM, 30 overs:
+
+  | | 1/s 40 dB | 10/s 40 dB | 50/s 30 dB | ITU poor 10 dB | 15 dB |
+  |---|---|---|---|---|---|
+  | `coh` | 0.245 | 0.742 | 0.752 | 0.202 | 0.086 |
+  | `:imp0.05:kappa30` | 0.003 | 0.078 | 0.215 | 0.401 | 0.334 |
+  | `:imp0.05:kappa30:impscore` | 0.051 | 0.361 | 0.304 | 0.175 | 0.066 |
+  | `v3` | 0.128 | 0.709 | 0.228 | 0.419 | 0.195 |
+
+  Weighting the filter update by the impulse posterior (the default once
+  ε > 0) removes almost every impulse error, but a fast fade also looks
+  like an impulse, the update stops and the filter loses the gain.
+  Scoring only (`:impscore`, the filter always takes the Gaussian update)
+  keeps fading tracked, and even helps there, at half the impulse gain.
+  κ has to match the impulses: 10 suits 30 dB ignition, 1000 suits 40 dB
+  spikes, 30–50 covers both. With the spread bank, `:impscore` hurt ITU
+  poor (0.24 against 0.14), not yet understood. ε = 0 stays the default,
+  so the tables above are Gaussian. An impulse is broadband and lands in
+  every channel at once, a fade is one signal's: a wideband blanker before
+  the channelizer can tell them apart, where this decoder cannot.
+- **Beating paths suit the bank:** the composite gain of two Doppler-
+  shifted paths is not an AR(1) of one spread, but its fast classes absorb
+  the beat. A spread estimate has to measure how fast the gain actually
+  decorrelates, not assume one path's spread.
+
 `:coh` switches (after `bell`): `:spread<B>` (Hz, default 0.5),
 `:spreads<x>/<y>/...` a spread class per path (with `:qsw<x>`),
 `:match<ms>` the AR(1) match lag (40), `:noafc`, `:rate<Hz>` the sample
@@ -384,7 +434,7 @@ Switches, after the name and in any order:
 | `:q<x>` | MODEL's amplitude process noise per 5 ms during a mark (default 0.0001) |
 | `:qbank` | four q classes (10⁻⁴, 3·10⁻⁴, 10⁻³, 3·10⁻³) as a hidden state per path, picked by the posterior (`BellConfig::q_bank`) |
 | `:qsw<x>` | the probability that a path changes q class at a change of element (default 0.05) |
-| `:coh` | the coherent variant ("The coherent variant"), with `:spread<B>`, `:spreads<x>/<y>/...`, `:match<ms>`, `:noafc` |
+| `:coh` | the coherent variant ("The coherent variant"), with `:spread<B>`, `:spreads<x>/<y>/...`, `:match<ms>`, `:noafc`, `:imp<ε>`, `:kappa<κ>`, `:impscore` |
 
 ## Known limits
 

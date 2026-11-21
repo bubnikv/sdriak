@@ -81,6 +81,17 @@ struct BellConfig {
     std::vector<float> coh_spreads;
     float  coh_match_ms  = 40.0f;
     float  coh_omega0    = 10.0f;     // Ω before any mark, per sample
+    // Impulses: the noise is w ~ (1 − coh_imp_eps)·CN(0, 1) +
+    // coh_imp_eps·CN(0, coh_imp_kappa). A sample far outside the Gaussian
+    // part then counts as weak evidence for either key state instead of
+    // strong evidence for a mark, and moves the filter by its posterior
+    // weight of not being an impulse. 0: Gaussian noise.
+    float  coh_imp_eps   = 0.0f;
+    float  coh_imp_kappa = 1000.0f;
+    // Weight the filter update by that posterior too. Off: the mixture
+    // only scores, and the filter always takes the Gaussian update (a fast
+    // fade then still updates the gain).
+    bool   coh_imp_update = true;
 
     // Clamp NOISE's output to [0, 1] before PROCES (morse-wip, bmorse.cxx:352;
     // not in the listing). NOISE's variance estimate is fitted to Bell's
@@ -204,6 +215,8 @@ private:
     std::vector<float> m_coha;
     float m_omega = 10.0f;
     std::vector<float> m_yikip, m_yiksv;
+    // The impulse mixture's constants: ln(1 − ε), ln ε, ln κ.
+    float m_ln_gauss = 0.0f, m_ln_imp = 0.0f, m_ln_kappa = 0.0f;
 
     // PROCES: the saved paths ip < ISAVE, and their new nodes
     // j = m_nodes·ip + n, n = 30·c + 6·i + k for q class c.

@@ -208,6 +208,11 @@ BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
             const double pi2 = 9.869604401089358;
             m_coha.push_back(static_cast<float>(std::exp(-pi2 * b * b * L * dt / 2.0)));
         }
+        if (m_cfg.coh_imp_eps > 0.0f) {
+            m_ln_gauss = std::log1p(-m_cfg.coh_imp_eps);
+            m_ln_imp = std::log(m_cfg.coh_imp_eps);
+            m_ln_kappa = std::log(m_cfg.coh_imp_kappa);
+        }
         // TRELIS's decode delay stays about 1 s.
         m_cfg.ndelay = std::max(2, static_cast<int>(std::lround(m_cfg.ndelay * kSampleMs / m_dt)));
     } else {
@@ -558,18 +563,38 @@ float BellDecoder::kalfil_coh(int ip, int ixs, int jnode, float pin, int c) {
     const float a = m_coha[c];
     const float gr = a * m_ykkip[ip], gi = a * m_yikip[ip];
     const float ppred = a * a * m_pkkip[ip] + (1.0f - a * a) * m_omega;
+    const bool imp = m_cfg.coh_imp_eps > 0.0f;
+    const float kappa = m_cfg.coh_imp_kappa;
+    // ln(e^a + e^b), for the impulse mixture.
+    auto lse = [](float a, float b) { return a > b ? a + std::log1p(std::exp(b - a)) : b + std::log1p(std::exp(a - b)); };
     if (ixs == 0) {
         m_ykksv[jnode] = gr;
         m_yiksv[jnode] = gi;
         m_pkksv[jnode] = ppred;
-        return -(m_yr * m_yr + m_yi * m_yi);
+        const float y2 = m_yr * m_yr + m_yi * m_yi;
+        if (!imp) return -y2;
+        return lse(m_ln_gauss - y2, m_ln_imp - y2 / kappa - m_ln_kappa);
     }
-    const float s = ppred + 1.0f, er = m_yr - gr, ei = m_yi - gi;
+    const float s = ppred + 1.0f, er = m_yr - gr, ei = m_yi - gi, e2 = er * er + ei * ei;
     const float k = ppred / s;
-    m_ykksv[jnode] = gr + k * er;
-    m_yiksv[jnode] = gi + k * ei;
-    m_pkksv[jnode] = (1.0f - k) * ppred;
-    return -(er * er + ei * ei) / s - std::log(s);
+    if (!imp) {
+        m_ykksv[jnode] = gr + k * er;
+        m_yiksv[jnode] = gi + k * ei;
+        m_pkksv[jnode] = (1.0f - k) * ppred;
+        return -e2 / s - std::log(s);
+    }
+    // Two updates, one per noise component, mixed by the posterior weight r
+    // of the impulse component.
+    const float si = ppred + kappa, ki = ppred / si;
+    const float lg = m_ln_gauss - e2 / s - std::log(s);
+    const float li = m_ln_imp - e2 / si - std::log(si);
+    const float l = lse(lg, li);
+    const float r = m_cfg.coh_imp_update ? std::exp(li - l) : 0.0f;
+    const float keff = (1.0f - r) * k + r * ki;
+    m_ykksv[jnode] = gr + keff * er;
+    m_yiksv[jnode] = gi + keff * ei;
+    m_pkksv[jnode] = ((1.0f - r) * (1.0f - k) + r * (1.0f - ki)) * ppred;
+    return l;
 }
 
 // MODEL (p. 177–178): during a mark the amplitude is a slow random walk;
