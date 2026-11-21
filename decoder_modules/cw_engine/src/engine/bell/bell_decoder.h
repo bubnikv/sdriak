@@ -157,6 +157,9 @@ public:
     int   saved_paths() const { return m_isave; }       // ISAVE
     // The posterior mean of the mark process noise over the q classes.
     float mark_q_est() const { return m_qhat; }
+    // Coherent, one spread class: the spread, measured on the station
+    // (BellBackendConfig::measure_spread), in place of coh_spread.
+    void  set_spread(float b);
 
 private:
     // Element types k.

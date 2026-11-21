@@ -15,6 +15,8 @@
  * Part of SDRIAK. GPL-3.0-or-later.
  */
 #include "decode_bell.h"
+#include "cw_frontend.h"
+#include "cw_spread_estimator.h"
 
 #include <algorithm>
 #include <cmath>
@@ -72,19 +74,49 @@ public:
           m_noise_scale(std::max(1.0, sample_rate / m_decim / 125.0)),
           m_dec_dt_ms(1000.0 * m_decim / sample_rate),
           m_afcn(afc_size(sample_rate / m_decim)),
-          m_ring(m_afcn), m_fft(m_afcn), m_pow(m_afcn) {}
+          m_ring(m_afcn), m_fft(m_afcn), m_pow(m_afcn), m_rate(sample_rate) {
+        if (m_cfg.gate || m_cfg.coarse_afc) {
+            CwFrontEndConfig fc;
+            fc.det_db = m_cfg.gate_db;
+            fc.det_s = m_cfg.gate_s;
+            m_detector.init(fc);
+            m_iq.init(256);
+            m_hold_frames = static_cast<uint64_t>(m_cfg.gate_hold_s * sample_rate);
+        }
+        if (m_cfg.measure_spread) { m_spread.init(1000.0 / m_dec_dt_ms); }
+    }
 
-    void set_floor(double noise_pw) override { m_floor = noise_pw; }
+    void set_floor(double noise_pw) override {
+        m_floor = noise_pw;
+        if (m_cfg.gate || m_cfg.coarse_afc) { m_detector.set_floor(noise_pw); }
+    }
     void set_repair_weights(const float *w, unsigned nframes) override { m_w.assign(w, w + nframes); }
 
     bool process(const float *iq, unsigned nframes, SkimDecode *out) override {
         m_text.clear();
+        if (m_cfg.gate || m_cfg.coarse_afc) {
+            for (unsigned k = 0; k < nframes; k++) {
+                m_iq.push(iq[2 * k], iq[2 * k + 1]);
+                if (m_detector.hop_due(m_iq.head())) { m_detector.hop(m_iq, m_rate, m_frames + k, m_trace); }
+                if (m_detector.candidate()) { m_last_carrier = m_frames + k; m_seen = true; }
+            }
+            m_frames += nframes;
+        }
         if (m_cfg.decoder.coherent) {
             for (unsigned k = 0; k < nframes; k++) {
                 if (k < m_w.size()) m_wmax = std::max(m_wmax, m_w[k]);
+                float re = iq[2 * k], im = iq[2 * k + 1];
+                if (m_cfg.coarse_afc) {
+                    // derotated at the full rate by the detector's carrier
+                    m_cphi = std::remainder(m_cphi + 2.0 * kPi * m_detector.carrier_hz() / m_rate, 2.0 * kPi);
+                    const double c = std::cos(m_cphi), s = std::sin(m_cphi);
+                    const double r2 = re * c + im * s, i2 = im * c - re * s;
+                    re = static_cast<float>(r2);
+                    im = static_cast<float>(i2);
+                }
                 if (++m_phase < m_decim) continue;
                 m_phase = 0;
-                coherent_sample(iq[2 * k], iq[2 * k + 1], m_wmax);
+                coherent_sample(re, im, m_wmax);
                 m_wmax = 0.0f;
             }
             m_w.clear();             // the weights belonged to this block
@@ -176,6 +208,21 @@ private:
         if (!(m_floor > 0.0) && m_bfill == 0) return;       // nothing to scale by yet
         const float s = static_cast<float>(1.0 / std::sqrt(n0 * m_noise_scale));
         m_dec.push_iq(re * s, im * s, m_text, w);
+        if (m_cfg.measure_spread) {
+            // K3: the decoder's key-down runs are the marks the station's
+            // spread is measured on
+            m_spread.push(m_kt, re * s, im * s, true);
+            const bool down = m_dec.key_prob() > kMarkProb;
+            if (down && !m_in_mark) { m_mark_from = m_kt; }
+            if (!down && m_in_mark && m_kt > m_mark_from + 2) {
+                m_spread.mark(m_mark_from, m_kt - 1, 1, 1.0);
+                if (m_spread.spread() > 0) {
+                    m_dec.set_spread(static_cast<float>(std::max(kSpreadFloorHz, kSpreadMargin * m_spread.spread())));
+                }
+            }
+            m_in_mark = down;
+            m_kt++;
+        }
     }
 
     // AFC: every 0.5 s, the Hann-windowed periodogram of the last m_afcn
@@ -237,6 +284,8 @@ private:
     double afc_hz() const { return m_afc_hz; }
 
     bool emit(SkimDecode *out) {
+        // the gate: no carrier within the hold, no text
+        if (m_cfg.gate && (!m_seen || m_frames > m_last_carrier + m_hold_frames)) { m_text.clear(); }
         if (m_text.empty()) return false;
         std::memset(out, 0, sizeof(*out));
         const size_t n = std::min(m_text.size(), static_cast<size_t>(SkimDecode::kTextMax - 1));
@@ -298,6 +347,21 @@ private:
     // largest since the last kept sample.
     std::vector<float> m_w;
     float m_wmax = 0.0f;
+    // The gate: the detector on the raw IQ, frames seen, the last frame
+    // with a carrier.
+    const double m_rate;
+    CwIqRing m_iq;
+    CwCarrierDetector m_detector;
+    CwTrace  m_trace;
+    uint64_t m_frames = 0, m_last_carrier = 0, m_hold_frames = 0;
+    bool     m_seen = false;
+    double   m_cphi = 0.0;                   // the coarse AFC's derotation phase
+    // The measured spread: the estimator, the decoder's sample count, the
+    // key-down run in progress.
+    CwSpreadEstimator m_spread;
+    uint64_t m_kt = 0, m_mark_from = 0;
+    bool     m_in_mark = false;
+    static constexpr double kMarkProb = 0.9, kSpreadMargin = 1.3, kSpreadFloorHz = 0.3;
 };
 
 }  // namespace

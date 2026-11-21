@@ -45,6 +45,32 @@ struct BellBackendConfig {
     // count each noise sample as rate/125 of a white one.
     double coh_rate_hz = 125.0;
 
+    // The gate (PLAN.md R1): v3's carrier detector on the channel's raw IQ
+    // (CwCarrierDetector: a carrier gate_db over the floor for gate_s), and
+    // the decoder's text passed only while a carrier was seen within the
+    // last gate_hold_s: the decoder's own delay (the AFC's look-ahead and
+    // the trellis) plus a margin, so the over's last characters still pass.
+    bool   gate = false;
+    double gate_db = 6.0;
+    double gate_s = 1.0;
+    double gate_hold_s = 4.0;
+    // The coarse AFC (PLAN.md R2): the detector's carrier (v3's AFC)
+    // derotates the channel's samples at their full rate, before the
+    // decimation to coh_rate_hz, so a tone near the channel's edge does not
+    // sit on the decimated rate's fold; the periodogram AFC follows what is
+    // left. It fixes the edge (62.5 Hz: 0.70 → 0.04 CER) but the estimate's
+    // moves from hop to hop disturb every path's gain filter: about 1 dB at
+    // 12 WPM, 0.3 dB at 25 on a centred tone. Holding it, stepping it,
+    // setting it once per over, smoothing it, or a 250 Hz decoder instead
+    // all did worse. Off by default.
+    bool   coarse_afc = false;
+    // The spread measured on the station (PLAN.md R2; CwSpreadEstimator, as
+    // v3's K3) and shared by all paths, in place of coh_spread: runs of
+    // samples the decoder holds key-down with probability over 0.9 are its
+    // marks. 1.3 × the measured spread, at least 0.3 Hz. One spread class
+    // only (coh_spreads empty).
+    bool   measure_spread = false;
+
     // The listing alone: BellConfig::listing(), no AGC clamp.
     static BellBackendConfig listing();
     // morse-wip's behaviour: BellConfig::port() and the AGC clamp.

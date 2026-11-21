@@ -167,6 +167,49 @@ carrier):
   blocks (several coherent sums per element where the gain moves,
   combined with the tracked amplitude), which is K5.
 
+**The per-path decoder (R1–R6).** Coherent gain inside v3 needs a gain
+filter per path on per-sample observations; `bell:coh` (BELL.md) already is
+one. It is developed into the candidate for a v4 backend, each step
+measured against v3 + K2 and DeepCW v2 narrow:
+
+| Step | Work | State |
+|---|---|---|
+| R1 | v3's carrier detector as Bell's gate: text passes only while a carrier was seen within 4 s (`BellBackendConfig::gate`, bench `:gate`) | built: false characters on noise 97 → 0 an hour, nothing else moves |
+| R2 | v3's AFC ahead of the decimation (`coarse_afc`, `:cafc`); the station's spread measured and shared | the edge fixed (62.5 Hz 0.70 → 0.04) at a cost on centred tones (12 WPM 1 dB, 25 WPM 0.3 dB: the estimate's moves disturb every path's filter); holding, stepping, per-over, smoothed and a 250 Hz decoder all worse; off. The spread measured (`measure_spread`, `:mspread`): built, below |
+| R3 | observations at 250 Hz with correlated noise, an edge-aware model | 250 Hz as it stands breaks (25 WPM threshold +2.2 dB) |
+| R4 | the beam: 25 / 50 / 100 paths | — |
+| R5 | impulses: repair weights, the sferic anomaly | — |
+| R6 | within 1.5 dB of `dcw2n` at 12–25 WPM, no false characters: a v4 backend | — |
+
+Bell with the gate and the coarse AFC, white noise, SNR500 for 10 % / 3 %
+at 12 / 25 / 35 WPM, and fading at 10 dB (ITU poor, flat 3 Hz, beat):
+
+| | 12 | 25 | 35 | ITU poor | flat 3 Hz | beat |
+|---|---|---|---|---|---|---|
+| one spread (0.5 Hz) | −3.79 / −2.02 | −1.28 / −0.32 | +1.14 / +2.44 | 0.237 | 0.641 | 0.596 |
+| the bank {0.3, 1, 3} Hz | −2.08 / +1.56 | −0.37 / +1.25 | +1.61 / — | 0.143 | 0.123 | 0.257 |
+| v3 + K2 + K3 | −1.11 / −0.49 | −0.82 / −0.02 | −0.18 / +1.30 | 0.152 | 0.202 | 0.435 |
+
+One spread wins on a steady signal, the bank under fast fading. The
+spread measured on the station and shared by its paths (`:mspread`: K3's
+estimator on the runs the decoder holds key-down with P > 0.9, 1.3 × the
+measured spread, at least 0.3 Hz), with the gate and without the coarse
+AFC:
+
+| | 12 | 25 | 35 | ITU poor | flat 3 Hz | beat | 10 Hz |
+|---|---|---|---|---|---|---|---|
+| one spread (0.5 Hz) | −4.28 / −3.16 | −1.45 / −0.28 | +0.47 / +1.66 | 0.226 | 0.628 | 0.606 | 0.715 |
+| measured spread | −4.56 / −3.24 | −1.48 / −0.39 | +0.38 / +1.54 | 0.138 | 0.287 | 0.366 | 0.548 |
+| DeepCW v2 narrow | −5.82 / −4.01 | −3.67 / −1.70 | −2.13 / −0.51 | 0.125 | 0.200 | 0.397 | 0.272 |
+
+- 1.3 / 2.2 / 2.5 dB from `dcw2n` at 12 / 25 / 35 WPM: R6's bar is met at
+  12 WPM; the gap grows with the speed (R3).
+- Slow and moderate fading as the bank or better; fast fading weaker (the
+  estimator reads 3 Hz as about 0.8 Hz; 10 Hz is beyond the per-sample
+  filters); no false characters on noise.
+- Strong stations: 0.099 at 60 dB (one spread 0.718): the score needs
+  K2's kind of floor.
+
 **The order from here.** It replaces §3's order for the steps it names;
 each step keeps its pass criteria and its switch, byte-identical when off.
 

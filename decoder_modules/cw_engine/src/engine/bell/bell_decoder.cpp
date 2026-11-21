@@ -195,6 +195,13 @@ BellConfig BellConfig::port() {
     return c;
 }
 
+void BellDecoder::set_spread(float b) {
+    if (!m_cfg.coherent || m_nq != 1) return;
+    const double L = m_cfg.coh_match_ms * 1e-3, dt = m_dt * 1e-3, pi2 = 9.869604401089358;
+    m_qval[0] = b;
+    m_coha[0] = static_cast<float>(std::exp(-pi2 * b * b * L * dt / 2.0));
+}
+
 BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
     m_cfg.paths = std::clamp(m_cfg.paths, 7, 256);
     m_cfg.ndelay = std::max(m_cfg.ndelay, 2);
