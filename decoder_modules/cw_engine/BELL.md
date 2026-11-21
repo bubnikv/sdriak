@@ -274,6 +274,95 @@ keep the gain without the cost; that is the next experiment.
 - **`bell:port` is within 0.1 of `bell`** in every fading cell, and
   worse in most.
 
+## The coherent variant
+
+`bell:coh` (`BellConfig::coherent`, not in the listing) keeps Bell's
+trellis (letter states, XTRANS durations, speeds, SAVEP, TRELIS, TRANSL)
+and replaces his envelope filter with a linear Kalman filter on the
+channel's complex gain g. Along any one path the key sequence is known, so
+
+    y = k·g + w,  w ~ CN(0, 1)          (k = 1 in a mark, 0 in a space)
+    g' = a·g + v,  v ~ CN(0, (1 − a²)·Ω)
+
+is linear and Gaussian, and the classic Kalman filter gives the exact
+posterior of g and the exact likelihood of each node (per-survivor
+processing). In a mark the filter updates on y, in a space it only
+predicts, so its variance grows back towards Ω by itself. a comes from the
+Doppler spread: an AR(1) whose correlation equals the bench's Gaussian
+exp(−π²B²τ²/2) at τ = 40 ms. Ω is learned from the marks. NOISE, MODEL,
+the IF emulation, the AGC and both clamps are not used.
+
+Front end (`decode_bell`): every 2nd channel sample (8 ms at 250 Hz; the
+±62 Hz passband leaves the noise close to white), divided by √floor so
+the noise has variance 1. The AR(1) model cannot follow a steady
+rotation, and the bench puts the tone 10 Hz off the channel centre, so an
+AFC derotates first: every 0.5 s the Hann-windowed periodogram of the
+last 4 s, its peak accepted when 30× the median, followed with weight
+0.3. The decoder sees each sample 2 s after the AFC, so the first marks
+are derotated with a locked estimate. Bell's trellis already delays text
+by up to 1 s; the AFC adds 2 s, so these runs use `--tail 3`.
+
+White noise, SNR500 (dB) for payload CER 10 % / 3 % / 1 %, 20 overs a
+point, tone 10 Hz off centre:
+
+| | 12 WPM | 18 WPM | 25 WPM | 35 WPM |
+|---|---|---|---|---|
+| `bell:coh` | −4.5 / −2.7 / −1.3 | −3.0 / −1.4 / −0.2 | −1.4 / 0.1 / 0.9 | 0.7 / 1.6 / 2.0 |
+| `v3` (`--tail 3`) | −1.1 / −0.5 / 0.9 | −1.0 / −0.2 / 1.4 | −0.6 / 0.0 / 1.4 | 0.2 / 1.0 / 2.1 |
+| `bell` (envelope) | 5.1 / 7.8 / — | 3.7 / 5.5 / — | 2.8 / 4.1 / 5.8 | 2.4 / 4.2 / 5.0 |
+
+- **Coherence gains 6–10 dB over Bell's envelope decoder**, and puts it
+  ahead of v3 by 3.4 dB at 12 WPM, 2 dB at 18 and 0.8 dB at 25 (10 %
+  level). The longer the element, the more the filter can integrate.
+- **At 35 WPM it is 0.5 dB behind v3.** A dit is 34 ms, four 8 ms samples.
+  Sampling at 250 Hz instead (`:rate250`, each noise sample counted as half
+  a white one) is worse, not better: 25 WPM at −1 dB 0.05 → 0.23, 35 WPM at
+  1 dB 0.06 → 0.32. The white-noise filter misreads the correlated noise.
+  More likely the keying edges cost here: the bench's 5 ms raised-cosine
+  edges and the channel filter are a large share of a 34 ms dit, and the
+  model's key is 0 or 1.
+- **Little junk around the over:** whole-over CER at 4–8 dB is 0.00–0.05,
+  about v3's 0.01–0.05, where envelope Bell has 0.05–0.30. With N0 from
+  the band floor the likelihoods are calibrated, and noise rarely
+  explains better as a mark.
+
+Fading, payload CER at 24 WPM, 6 / 10 / 20 dB, 50 overs a point:
+
+| Fading | `bell` (envelope) | `coh`, B 0.5 Hz | `coh`, true B | `coh`, bank {0.3, 1, 3} Hz | `v3` |
+|---|---|---|---|---|---|
+| none | 0.012 / 0.002 / 0.004 | 0.001 / 0.000 / 0.004 | 0.002 / 0.000 / 0.000 | 0.007 / 0.002 / 0.014 | 0.002 / 0.002 / 0.014 |
+| ITU good | 0.238 / 0.104 / 0.025 | 0.116 / 0.047 / 0.012 | 0.143 / 0.079 / 0.017 | 0.127 / 0.073 / 0.029 | 0.180 / 0.117 / 0.044 |
+| flat 0.1 Hz | 0.261 / 0.146 / 0.025 | 0.150 / 0.068 / 0.017 | 0.180 / 0.081 / 0.022 | 0.160 / 0.108 / 0.046 | 0.215 / 0.143 / 0.042 |
+| flat 0.3 Hz | 0.283 / 0.139 / 0.052 | 0.143 / 0.071 / 0.014 | 0.170 / 0.086 / 0.020 | 0.205 / 0.118 / 0.044 | 0.316 / 0.248 / 0.061 |
+| ITU moderate | 0.284 / 0.134 / 0.074 | 0.180 / 0.107 / 0.012 | same | 0.234 / 0.129 / 0.036 | 0.402 / 0.316 / 0.080 |
+| ITU poor | 0.353 / 0.239 / 0.148 | 0.341 / 0.228 / 0.032 | 0.188 / 0.093 / 0.019 | 0.255 / 0.138 / 0.033 | 0.561 / 0.470 / 0.132 |
+| flat 1 Hz | 0.344 / 0.221 / 0.145 | 0.370 / 0.233 / 0.034 | 0.220 / 0.105 / 0.019 | 0.264 / 0.155 / 0.035 | 0.563 / 0.463 / 0.143 |
+| flat 3 Hz | 0.511 / 0.410 / 0.294 | 0.656 / 0.632 / 0.194 | 0.279 / 0.119 / 0.020 | 0.299 / 0.119 / 0.020 | 0.665 / 0.569 / 0.187 |
+
+(`coh`, true B: the condition's own spread, 0.05 Hz for none. The bank
+{0.1, 0.5, 1.5, 4} Hz is 0.01–0.07 worse than {0.3, 1, 3} on slow
+fading and level on fast.)
+
+- **With the spread known, the coherent decoder is level with or better
+  than v3 and envelope Bell in every condition** at 6 dB and up: at 10 dB
+  0.00–0.12 against v3's 0.00–0.57 and envelope Bell's 0.00–0.41.
+- **A fixed 0.5 Hz is best on slow fading** (ITU good to moderate, 0.05–
+  0.11 at 10 dB), better than the true spread there: the model also has
+  to absorb the AFC's residual frequency error. At 1–3 Hz it fails (3 Hz:
+  0.63).
+- **The bank {0.3, 1, 3} Hz needs no spread and beats v3 under every
+  fading condition from 6 dB**, by 0.04–0.45 at 10 dB, except the slowest
+  at 20 dB (flat 0.1 Hz: 0.046 against 0.042); on a steady carrier it is
+  level. It pays 0.02–0.05 against the best single spread on slow fading,
+  the same cost as the envelope q bank.
+- **At 0–3 dB under fading every decoder is poor** (0.3–0.7); coherence
+  helps most at 6–15 dB.
+
+`:coh` switches (after `bell`): `:spread<B>` (Hz, default 0.5),
+`:spreads<x>/<y>/...` a spread class per path (with `:qsw<x>`),
+`:match<ms>` the AR(1) match lag (40), `:noafc`, `:rate<Hz>` the sample
+rate (125).
+
 ## Running it
 
 ```sh
@@ -295,6 +384,7 @@ Switches, after the name and in any order:
 | `:q<x>` | MODEL's amplitude process noise per 5 ms during a mark (default 0.0001) |
 | `:qbank` | four q classes (10⁻⁴, 3·10⁻⁴, 10⁻³, 3·10⁻³) as a hidden state per path, picked by the posterior (`BellConfig::q_bank`) |
 | `:qsw<x>` | the probability that a path changes q class at a change of element (default 0.05) |
+| `:coh` | the coherent variant ("The coherent variant"), with `:spread<B>`, `:spreads<x>/<y>/...`, `:match<ms>`, `:noafc` |
 
 ## Known limits
 

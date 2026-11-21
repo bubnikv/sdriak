@@ -33,6 +33,18 @@ struct BellBackendConfig {
     // amplitude.
     bool   agc_clamp  = true;
 
+    // The coherent variant (decoder.coherent) needs the tone near 0 Hz: its
+    // AR(1) fading model cannot follow a steady rotation. The AFC finds the
+    // tone in the periodogram of the last 4 s, every 0.5 s, and derotates
+    // the samples by the frequency it holds. It sees each sample
+    // coh_afc_lookahead_s before the decoder does (added latency).
+    bool   coh_afc    = true;
+    double coh_afc_lookahead_s = 2.0;
+    // The coherent decoder's sample rate: the channel's rate divided by an
+    // integer. 125 Hz (8 ms) keeps the noise close to white; faster rates
+    // count each noise sample as rate/125 of a white one.
+    double coh_rate_hz = 125.0;
+
     // The listing alone: BellConfig::listing(), no AGC clamp.
     static BellBackendConfig listing();
     // morse-wip's behaviour: BellConfig::port() and the AGC clamp.

@@ -64,6 +64,24 @@ struct BellConfig {
     std::vector<float> q_bank;
     float  q_switch = 0.05f;
 
+    // Coherent variant (not in the listing): push_iq() takes complex
+    // samples, every coh_dt_ms, scaled so the noise has variance 1. Each
+    // node runs a linear Kalman filter on the channel's complex gain g,
+    //   y = k·g + w,  g' = a·g + v,  v ~ CN(0, (1 − a²)·Ω),
+    // which is exact given the node's key sequence: in a mark it updates on
+    // y, in a space it only predicts. a comes from the Doppler spread B
+    // (the bench's B = 2σ_f): an AR(1) whose correlation equals the
+    // Gaussian exp(−π²B²τ²/2) at τ = coh_match_ms. Ω, the mean signal
+    // power, is learned from the marks. NOISE, MODEL and the clamps are not
+    // used. coh_spreads, when not empty, makes the spread a hidden class per
+    // path, like q_bank (and q_switch).
+    bool   coherent      = false;
+    float  coh_dt_ms     = 8.0f;
+    float  coh_spread    = 0.5f;
+    std::vector<float> coh_spreads;
+    float  coh_match_ms  = 40.0f;
+    float  coh_omega0    = 10.0f;     // Ω before any mark, per sample
+
     // Clamp NOISE's output to [0, 1] before PROCES (morse-wip, bmorse.cxx:352;
     // not in the listing). NOISE's variance estimate is fitted to Bell's
     // receiver; on any other front end a noise sample far below zero is
@@ -105,6 +123,9 @@ public:
     // One detected-envelope sample (the input of Bell's NOISE). Decoded
     // characters are appended to out.
     void push(float zin, std::string &out);
+    // The coherent variant: one complex sample every coh_dt_ms, noise
+    // variance 1.
+    void push_iq(float re, float im, std::string &out);
 
     // State of the last sample.
     float key_prob() const { return m_px; }             // PX: P(key down)
@@ -115,7 +136,8 @@ public:
     float speed_wpm() const { return m_spdhat; }        // SPDHAT
     float noise_power() const { return m_rn; }          // RN
     float best_prob() const { return m_p[m_imax]; }     // P(IMAX)
-    float amplitude() const { return m_ykkip[m_imax]; } // YKKIP(IMAX)
+    float amplitude() const;                            // YKKIP(IMAX); coherent: |g|
+    float signal_power() const { return m_omega; }      // coherent: Ω
     int   saved_paths() const { return m_isave; }       // ISAVE
     // The posterior mean of the mark process noise over the q classes.
     float mark_q_est() const { return m_qhat; }
@@ -150,6 +172,9 @@ private:
     void   likhd(float z, float rn, int ip, int lambda, float dur, int ilrate);
     float  kalfil(float z, int ip, float rn, int ixs, int kelem, int jnode, float dur,
                   int ilrate, float pin, float qmark);
+    // The coherent KALFIL: the log-likelihood of the sample (less a constant
+    // common to all nodes), kNoLog when the node is not scored.
+    float  kalfil_coh(int ip, int ixs, int jnode, float pin, int c);
     void   model(float dur, int ielm, int ilr, int ixs, float qmark, float &phi, float &qa) const;
     bool   probp();
     void   sprob();
@@ -169,6 +194,16 @@ private:
     // per saved path (30 per class).
     std::vector<float> m_qval;
     int m_nq = 1, m_nodes = kNodes;
+    // The sample period, ms (5; coherent: coh_dt_ms).
+    float m_dt = kSampleMs;
+
+    // Coherent: the sample, the AR(1) coefficient of each class, Ω, and the
+    // imaginary part of each filter's mean (the real part is YKKIP/YKKSV).
+    static constexpr float kNoLog = -1e30f;
+    float m_yr = 0.0f, m_yi = 0.0f;
+    std::vector<float> m_coha;
+    float m_omega = 10.0f;
+    std::vector<float> m_yikip, m_yiksv;
 
     // PROCES: the saved paths ip < ISAVE, and their new nodes
     // j = m_nodes·ip + n, n = 30·c + 6·i + k for q class c.

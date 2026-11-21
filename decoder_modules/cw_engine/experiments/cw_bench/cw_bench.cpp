@@ -462,7 +462,11 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
     // the speeds a path may move to, ":q<x>" MODEL's amplitude process
     // noise per 5 ms during a mark, ":qbank" four q classes (1e-4, 3e-4,
     // 1e-3, 3e-3) chosen by the posterior, ":qbank<x>/<y>/..." others,
-    // ":qsw<x>" their switch probability at an element change.
+    // ":qsw<x>" their switch probability at an element change; ":coh" the
+    // coherent variant, ":noafc" without its AFC, ":rate<Hz>" its sample
+    // rate (125), ":spread<B>" its Doppler
+    // spread (Hz),
+    // ":spreads<x>/<y>/..." spread classes, ":match<ms>" its AR(1) match lag.
     if (name.rfind("bell", 0) == 0) {
         BellBackendConfig c;
         for (size_t at = name.find(':'); at != std::string::npos;) {
@@ -484,6 +488,19 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
                 }
             }
             else if (suf.rfind("qsw", 0) == 0) c.decoder.q_switch = static_cast<float>(std::atof(suf.c_str() + 3));
+            else if (suf == "coh") c.decoder.coherent = true;
+            else if (suf == "noafc") c.coh_afc = false;
+            else if (suf.rfind("rate", 0) == 0) c.coh_rate_hz = std::atof(suf.c_str() + 4);
+            else if (suf.rfind("spreads", 0) == 0) {                // spreads<x>/<y>/...
+                c.decoder.coh_spreads.clear();
+                for (size_t p = 7; p < suf.size();) {
+                    const size_t e = std::min(suf.find('/', p), suf.size());
+                    c.decoder.coh_spreads.push_back(static_cast<float>(std::atof(suf.substr(p, e - p).c_str())));
+                    p = e + 1;
+                }
+            }
+            else if (suf.rfind("spread", 0) == 0) c.decoder.coh_spread = static_cast<float>(std::atof(suf.c_str() + 6));
+            else if (suf.rfind("match", 0) == 0) c.decoder.coh_match_ms = static_cast<float>(std::atof(suf.c_str() + 5));
             else if (suf.size() > 1 && suf[0] == 'q') c.decoder.mark_q = static_cast<float>(std::atof(suf.c_str() + 1));
             else if (suf.rfind("wpm", 0) == 0 && suf.find('-') != std::string::npos) {
                 c.decoder.wpm_min = std::atoi(suf.c_str() + 3);

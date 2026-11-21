@@ -198,7 +198,21 @@ BellConfig BellConfig::port() {
 BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
     m_cfg.paths = std::clamp(m_cfg.paths, 7, 256);
     m_cfg.ndelay = std::max(m_cfg.ndelay, 2);
-    m_qval = m_cfg.q_bank.empty() ? std::vector<float>{m_cfg.mark_q} : m_cfg.q_bank;
+    if (m_cfg.coherent) {
+        // The classes are spreads; each gets its AR(1) coefficient over one
+        // sample, a = ρ(L)^(dt/L) with ρ(τ) = exp(−π²B²τ²/2), L the match lag.
+        m_qval = m_cfg.coh_spreads.empty() ? std::vector<float>{m_cfg.coh_spread} : m_cfg.coh_spreads;
+        m_dt = m_cfg.coh_dt_ms;
+        const double L = m_cfg.coh_match_ms * 1e-3, dt = m_dt * 1e-3;
+        for (float b : m_qval) {
+            const double pi2 = 9.869604401089358;
+            m_coha.push_back(static_cast<float>(std::exp(-pi2 * b * b * L * dt / 2.0)));
+        }
+        // TRELIS's decode delay stays about 1 s.
+        m_cfg.ndelay = std::max(2, static_cast<int>(std::lround(m_cfg.ndelay * kSampleMs / m_dt)));
+    } else {
+        m_qval = m_cfg.q_bank.empty() ? std::vector<float>{m_cfg.mark_q} : m_cfg.q_bank;
+    }
     m_nq = static_cast<int>(m_qval.size());
     m_nodes = kNodes * m_nq;
     reset();
@@ -214,7 +228,9 @@ void BellDecoder::reset() {
     m_kkl = m_kks = 1;
     m_ymin1 = m_ymin2 = 1.0f;
     m_ymavg = 0.05f;
-    m_rn = 0.1f;
+    m_rn = m_cfg.coherent ? 1.0f : 0.1f;
+    m_omega = m_cfg.coh_omega0;
+    if (m_cfg.coherent) restart();          // the filters start at P = Ω
 }
 
 void BellDecoder::restart() {
@@ -253,11 +269,15 @@ void BellDecoder::restart() {
     m_px = m_spdhat = m_pelm = 0.0f;
     m_qhat = m_qval[0];
 
-    // KALFIL's DATA: YKKIP/25*.5/, PKKIP/25*.1/.
-    m_ykkip.assign(np, 0.5f);
-    m_pkkip.assign(np, 0.1f);
-    m_ykksv.assign(nn, 0.5f);
-    m_pkksv.assign(nn, 0.1f);
+    // KALFIL's DATA: YKKIP/25*.5/, PKKIP/25*.1/. Coherent: g = 0 with the
+    // stationary variance Ω, no phase known.
+    const float y0 = m_cfg.coherent ? 0.0f : 0.5f, p0 = m_cfg.coherent ? m_omega : 0.1f;
+    m_ykkip.assign(np, y0);
+    m_pkkip.assign(np, p0);
+    m_ykksv.assign(nn, y0);
+    m_pkksv.assign(nn, p0);
+    m_yikip.assign(m_cfg.coherent ? np : 0, 0.0f);
+    m_yiksv.assign(m_cfg.coherent ? nn : 0, 0.0f);
 
     // TRELIS's DATA: PTHTRL/5000*5/, LMDSAV/5000*5/, N/0/: path 4 and letter
     // state 4 here. (morse-wip zeroes both, and its first NDELAY samples read
@@ -278,6 +298,21 @@ void BellDecoder::push(float zin, std::string &out) {
     if (m_cfg.clamp_z)
         z = std::clamp(z, 0.0f, 1.0f);
     proces(z, m_rn, out);
+}
+
+void BellDecoder::push_iq(float re, float im, std::string &out) {
+    m_yr = re;
+    m_yi = im;
+    proces(0.0f, 1.0f, out);
+    // Ω: E|y|² = Ω + 1 in a mark; follow it slowly, weighted by P(key down).
+    const float y2 = re * re + im * im;
+    m_omega += 0.005f * m_px * (y2 - 1.0f - m_omega);
+    m_omega = std::clamp(m_omega, 0.5f, 1e5f);
+}
+
+float BellDecoder::amplitude() const {
+    if (m_cfg.coherent) return std::hypot(m_ykkip[m_imax], m_yikip[m_imax]);
+    return m_ykkip[m_imax];
 }
 
 // NOISE (p. 190, and the OCR text of the page the scan lost): the noise
@@ -313,6 +348,15 @@ void BellDecoder::proces(float z, float rn, std::string &out) {
         trprob(i, m_lambda[i], m_dur[i], m_ilrate[i]);
         path(i, m_lambda[i], m_dur[i], m_ilrate[i]);
         likhd(z, rn, i, m_lambda[i], m_dur[i], m_ilrate[i]);
+    }
+    // Coherent: LIKHD left log-likelihoods; scale by the largest before
+    // taking exp, so a strong signal cannot overflow or underflow them all.
+    if (m_cfg.coherent) {
+        const int ni = m_nodes * m_isave;
+        float lmax = kNoLog;
+        for (int j = 0; j < ni; j++) lmax = std::max(lmax, m_lkhd[j]);
+        for (int j = 0; j < ni; j++)
+            m_lkhd[j] = m_lkhd[j] <= kNoLog ? 0.0f : std::exp(m_lkhd[j] - lmax);
     }
     // Posterior of each new node, of the key state, element and speed.
     // When every node scores zero (the products underflow single precision)
@@ -355,15 +399,16 @@ void BellDecoder::trprob(int ip, int lambda, float dur, int ilrate) {
     for (int n = 0; n < m_nodes; n++) pin(ip, n) = psum != 0.0f ? pint[n] / psum : 0.0f;
 }
 
-// XTRANS (p. 170): P(the element lasts another 5 ms | it has lasted D0),
-// from a density centred on the nominal length with exponential tails.
+// XTRANS (p. 170): P(the element lasts another sample | it has lasted D0),
+// from a density centred on the nominal length with exponential tails. A
+// sample is 5 ms (coherent: coh_dt_ms).
 // Single precision, like the listing: whether D0 lands exactly on the
 // nominal length decides which branch runs.
 double BellDecoder::xtrans(int ielem, float d0, int irate) const {
     const int mscale = kKimap[ielem];
     const float rscale = 1200.0f / static_cast<float>(irate);
     const float b0 = d0 / (static_cast<float>(mscale) * rscale);
-    const float b1 = (d0 + kSampleMs) / (static_cast<float>(mscale) * rscale);
+    const float b1 = (d0 + m_dt) / (static_cast<float>(mscale) * rscale);
     float alpha;
     if (ielem == kPause) alpha = 14.0f * kAparm[2];
     else if (ielem == kWordSpace) alpha = 7.0f * kAparm[1];
@@ -433,7 +478,7 @@ void BellDecoder::path(int ip, int lambda, float dur, int ilrate) {
             const int ixl = ilamx(ilelm);
             const int ixs = isx(k);
             // The duration grows while the key state stays, restarts on a change.
-            m_dursav[j] = dur * static_cast<float>(1 - ixs - ixl + 2 * ixs * ixl) + kSampleMs;
+            m_dursav[j] = dur * static_cast<float>(1 - ixs - ixl + 2 * ixs * ixl) + m_dt;
             m_ilrsav[j] = ilrate + (i - kRateHold) * memdel(ilelm, k);
         }
     }
@@ -443,7 +488,18 @@ void BellDecoder::path(int ip, int lambda, float dur, int ilrate) {
 void BellDecoder::likhd(float z, float rn, int ip, int lambda, float dur, int ilrate) {
     if (lambda == kNone) {
         // (The listing indexes ILAMI(IELMST(0)) here; the node's PIN is 0.)
-        for (int n = 0; n < m_nodes; n++) m_lkhd[ip * m_nodes + n] = 0.0f;
+        const float none = m_cfg.coherent ? kNoLog : 0.0f;
+        for (int n = 0; n < m_nodes; n++) m_lkhd[ip * m_nodes + n] = none;
+        return;
+    }
+    if (m_cfg.coherent) {
+        for (int c = 0; c < m_nq; c++)
+            for (int k = 0; k < kElems; k++)
+                for (int i = 0; i < kRates; i++) {
+                    const int n = c * kNodes + i * kElems + k;
+                    const int j = ip * m_nodes + n;
+                    m_lkhd[j] = kalfil_coh(ip, isx(k), j, pin(ip, n), c);
+                }
         return;
     }
     const int kelem = ilami(lambda);
@@ -486,6 +542,34 @@ float BellDecoder::kalfil(float z, int ip, float rn, int ixs, int kelem, int jno
     const float a = 0.5f * pzinv * zr * zr;
     if (a > 1000.0f) return 0.0f;
     return std::exp(-a) / std::sqrt(pz);
+}
+
+// The coherent KALFIL: g' = a·g + v, v ~ CN(0, (1 − a²)·Ω); in a mark
+// y = g + w with w ~ CN(0, 1), in a space y = w and the filter only predicts.
+// Returns ln p(y) less ln π, which every node shares.
+float BellDecoder::kalfil_coh(int ip, int ixs, int jnode, float pin, int c) {
+    constexpr float kPinMin = 0.0001f;
+    if (pin <= kPinMin) {
+        m_ykksv[jnode] = m_ykkip[ip];
+        m_yiksv[jnode] = m_yikip[ip];
+        m_pkksv[jnode] = m_pkkip[ip];
+        return kNoLog;
+    }
+    const float a = m_coha[c];
+    const float gr = a * m_ykkip[ip], gi = a * m_yikip[ip];
+    const float ppred = a * a * m_pkkip[ip] + (1.0f - a * a) * m_omega;
+    if (ixs == 0) {
+        m_ykksv[jnode] = gr;
+        m_yiksv[jnode] = gi;
+        m_pkksv[jnode] = ppred;
+        return -(m_yr * m_yr + m_yi * m_yi);
+    }
+    const float s = ppred + 1.0f, er = m_yr - gr, ei = m_yi - gi;
+    const float k = ppred / s;
+    m_ykksv[jnode] = gr + k * er;
+    m_yiksv[jnode] = gi + k * ei;
+    m_pkksv[jnode] = (1.0f - k) * ppred;
+    return -(er * er + ei * ei) / s - std::log(s);
 }
 
 // MODEL (p. 177–178): during a mark the amplitude is a slow random walk;
@@ -630,6 +714,7 @@ void BellDecoder::savep() {
         m_ilrate[i] = m_ilrsav[m_sort[i]];
         m_qcls[i] = m_qcsav[m_sort[i]];
         m_ykkip[i] = m_ykksv[m_sort[i]];
+        if (m_cfg.coherent) m_yikip[i] = m_yiksv[m_sort[i]];
         m_pkkip[i] = m_pkksv[m_sort[i]];
     }
 
@@ -656,6 +741,7 @@ void BellDecoder::savep() {
         m_ilrate[n] = m_ilrate[i];
         m_qcls[n] = m_qcls[i];
         m_ykkip[n] = m_ykkip[i];
+        if (m_cfg.coherent) m_yikip[n] = m_yikip[i];
         m_pkkip[n] = m_pkkip[i];
         m_pathsv[n] = m_pathsv[i];
         m_sort[n] = m_sort[i];
