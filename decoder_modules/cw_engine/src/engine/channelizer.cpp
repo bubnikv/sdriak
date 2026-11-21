@@ -34,6 +34,7 @@
 // WDSP's fir_bandpass (SDRIAK: on the core dsp library, returning the taps
 // as a std::vector — upstream declares the vendored WDSP's here).
 #include "sdriak/fir_bandpass.h"
+#include "impulse_repair.h"
 
 // FFTW's planner is NOT thread-safe: fftwf_plan_* and fftwf_destroy_plan share
 // global planner state; only fftwf_execute on distinct plans may run
@@ -83,13 +84,29 @@ struct SkimChannelizerState {
     std::vector<unsigned> cnt; // per-channel valid frames (≤ kRingFrames)
     uint64_t  dropped = 0;
 
+    // The impulse repair before the filter bank (optional): its output and
+    // flags for one block, a running count of repaired frames over the
+    // prototype's span, and the hop's weight per ring slot (the rings are
+    // written in lockstep, so one ring serves every channel).
+    static constexpr auto kRepairBlock = 1024u;
+    std::unique_ptr<ImpulseRepair> repair;
+    std::vector<float> rep_out;
+    std::vector<unsigned char> rep_flags;
+    std::vector<unsigned char> span;      // P flags, a ring
+    unsigned  span_at = 0, span_sum = 0;
+    std::vector<float> weight;            // kRingFrames hop weights
+
     // One hop: the polyphase branches, the FFT, the M outputs into the rings.
     void hop();
+    // Frames into the history, a hop where one is due; flags (optional): the
+    // repair's, one a frame.
+    void stage(const float *iq, unsigned nframes, const unsigned char *flags);
 };
 
 std::unique_ptr<SkimChannelizer> SkimChannelizer::create_ex(double in_rate, double chan_bw_hz,
                                                             double passband_hz,
-                                                            unsigned taps_per_branch) {
+                                                            unsigned taps_per_branch,
+                                                            const ImpulseRepairConfig *repair) {
     if (in_rate <= 0 || chan_bw_hz <= 0)
         return nullptr;
     double md = in_rate / chan_bw_hz;
@@ -134,6 +151,13 @@ std::unique_ptr<SkimChannelizer> SkimChannelizer::create_ex(double in_rate, doub
     ch->ring.assign(static_cast<size_t>(M) * SkimChannelizerState::kRingFrames * 2, 0.0f);
     ch->wr.assign(M, 0);
     ch->cnt.assign(M, 0);
+    if (repair) {
+        ch->repair = std::make_unique<ImpulseRepair>(in_rate, *repair);
+        ch->rep_out.assign(2 * static_cast<size_t>(SkimChannelizerState::kRepairBlock), 0.0f);
+        ch->rep_flags.assign(SkimChannelizerState::kRepairBlock, 0);
+        ch->span.assign(ch->P, 0);
+        ch->weight.assign(SkimChannelizerState::kRingFrames, 0.0f);
+    }
     return std::unique_ptr<SkimChannelizer>(new SkimChannelizer(std::move(ch)));
 }
 
@@ -177,6 +201,7 @@ void SkimChannelizerState::hop() {
     for (unsigned c = 0; c < M; c++) {
         float yr = fft_out[c][0], yi = fft_out[c][1];
         if (odd && (c & 1)) { yr = -yr; yi = -yi; }
+        if (c == 0 && repair) { weight[wr[0]] = static_cast<float>(span_sum) / static_cast<float>(P); }
         float *slot = ring.data() + (static_cast<size_t>(c) * SkimChannelizerState::kRingFrames + wr[c]) * 2;
         slot[0] = yr;
         slot[1] = yi;
@@ -189,26 +214,53 @@ void SkimChannelizerState::hop() {
     }
 }
 
-void SkimChannelizer::push(const float *iq, unsigned nframes) {
-    SkimChannelizerState *ch = m_ch.get();
-    const unsigned H = ch->H, P = ch->P;
+void SkimChannelizerState::stage(const float *iq, unsigned nframes, const unsigned char *flags) {
     while (nframes) {
-        unsigned take = std::min(nframes, H - ch->staged);
+        unsigned take = std::min(nframes, H - staged);
         // Slide history left as the new frames stage in at the tail.
-        memmove(ch->hist.data(), ch->hist.data() + 2 * take,
-                (2 * static_cast<size_t>(P - take)) * sizeof(float));
-        memcpy(ch->hist.data() + 2 * (P - take), iq, 2 * static_cast<size_t>(take) * sizeof(float));
-        iq         += 2 * take;
-        nframes    -= take;
-        ch->staged += take;
-        if (ch->staged == H) {
-            ch->staged = 0;
-            ch->hop();
+        memmove(hist.data(), hist.data() + 2 * take, (2 * static_cast<size_t>(P - take)) * sizeof(float));
+        memcpy(hist.data() + 2 * (P - take), iq, 2 * static_cast<size_t>(take) * sizeof(float));
+        if (flags) {
+            // The repaired frames among the prototype's span: the window of
+            // the hop below (centred on its group delay, so the span lines
+            // up with the frame it produces).
+            for (unsigned i = 0; i < take; i++) {
+                span_sum += flags[i] - span[span_at];
+                span[span_at] = flags[i];
+                span_at = (span_at + 1) % P;
+            }
+            flags += take;
+        }
+        iq      += 2 * take;
+        nframes -= take;
+        staged  += take;
+        if (staged == H) {
+            staged = 0;
+            hop();
         }
     }
 }
 
+void SkimChannelizer::push(const float *iq, unsigned nframes) {
+    SkimChannelizerState *ch = m_ch.get();
+    if (!ch->repair) {
+        ch->stage(iq, nframes, nullptr);
+        return;
+    }
+    while (nframes) {
+        const unsigned n = std::min(nframes, SkimChannelizerState::kRepairBlock);
+        ch->repair->process(iq, ch->rep_out.data(), n, ch->rep_flags.data());
+        ch->stage(ch->rep_out.data(), n, ch->rep_flags.data());
+        iq      += 2 * n;
+        nframes -= n;
+    }
+}
+
 unsigned SkimChannelizer::read(unsigned chan, float *iq, unsigned max_frames) {
+    return read(chan, iq, max_frames, nullptr);
+}
+
+unsigned SkimChannelizer::read(unsigned chan, float *iq, unsigned max_frames, float *weights) {
     SkimChannelizerState *ch = m_ch.get();
     if (chan >= ch->M)
         return 0;
@@ -218,10 +270,17 @@ unsigned SkimChannelizer::read(unsigned chan, float *iq, unsigned max_frames) {
     for (unsigned i = 0; i < n; i++) {
         iq[2 * i]     = base[2 * rd];
         iq[2 * i + 1] = base[2 * rd + 1];
+        if (weights) { weights[i] = ch->repair ? ch->weight[rd] : 0.0f; }
         rd = (rd + 1) % SkimChannelizerState::kRingFrames;
     }
     ch->cnt[chan] -= n;
     return n;
+}
+
+const ImpulseRepair *SkimChannelizer::repair() const { return m_ch->repair.get(); }
+
+unsigned SkimChannelizer::latency() const {
+    return m_ch->repair ? static_cast<unsigned>(m_ch->repair->latency()) : 0u;
 }
 
 uint64_t SkimChannelizer::dropped() const {

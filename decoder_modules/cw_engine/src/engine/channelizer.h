@@ -7,6 +7,14 @@
  * because RTTY/PSK backends need phase, not just magnitude.
  * Prototype filter by WDSP's fir_bandpass; the M-point FFT is fftw3f.
  *
+ * Optionally the wideband stream is first cleaned of impulse noise
+ * (ImpulseRepair, ALGORITHM.md §5.7): an impulse is short only here, before
+ * the filter bank smears it over every channel. The channels then lag the
+ * input by the repair's latency(), and read() hands out beside each channel
+ * frame its repair weight: the share of the prototype's span behind that
+ * frame that was rebuilt rather than received (for
+ * SkimDecodeChannel::set_repair_weights).
+ *
  * Threading contract: push() and read() are single-threaded (the engine
  * pipeline thread). No internal locking.
  *
@@ -17,6 +25,8 @@
 #include "skim_common.h"
 
 struct SkimChannelizerState;
+struct ImpulseRepairConfig;
+class ImpulseRepair;
 
 // SDRIAK: a class (upstream: an opaque struct and skim_channelizer_*
 // functions — new/new_ex are the create/create_ex factories, free the
@@ -37,9 +47,12 @@ public:
     // to the output Nyquist (chan_bw_hz) so a station anywhere between two
     // channel centres still lands with BOTH tones in one channel; the longer
     // prototype buys back the alias rejection the wide cutoff spends.
+    // repair: the impulse repair before the filter bank, with this
+    // configuration; null: none.
     static std::unique_ptr<SkimChannelizer> create_ex(double in_rate, double chan_bw_hz,
                                                       double passband_hz,
-                                                      unsigned taps_per_branch);
+                                                      unsigned taps_per_branch,
+                                                      const ImpulseRepairConfig *repair = nullptr);
     ~SkimChannelizer();
     SkimChannelizer(const SkimChannelizer &) = delete;
     SkimChannelizer &operator=(const SkimChannelizer &) = delete;
@@ -62,6 +75,15 @@ public:
     // (interleaved I/Q). Returns frames copied. Each channel buffers ~8 s;
     // unread output beyond that overwrites oldest (see dropped()).
     unsigned read(unsigned chan, float *iq, unsigned max_frames);
+    // … and with the impulse repair on, each frame's repair weight into
+    // weights (0 without the repair).
+    unsigned read(unsigned chan, float *iq, unsigned max_frames, float *weights);
+
+    // The impulse repair, or null; its statistics.
+    const ImpulseRepair *repair() const;
+    // Input frames between the stream and the filter bank (the repair's
+    // latency; 0 without it).
+    unsigned latency() const;
 
     // Total frames lost to ring overwrites since creation (all channels).
     uint64_t dropped() const;
