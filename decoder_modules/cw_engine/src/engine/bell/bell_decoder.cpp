@@ -198,6 +198,9 @@ BellConfig BellConfig::port() {
 BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
     m_cfg.paths = std::clamp(m_cfg.paths, 7, 256);
     m_cfg.ndelay = std::max(m_cfg.ndelay, 2);
+    m_qval = m_cfg.q_bank.empty() ? std::vector<float>{m_cfg.mark_q} : m_cfg.q_bank;
+    m_nq = static_cast<int>(m_qval.size());
+    m_nodes = kNodes * m_nq;
     reset();
 }
 
@@ -215,7 +218,7 @@ void BellDecoder::reset() {
 }
 
 void BellDecoder::restart() {
-    const int np = m_cfg.paths, nn = kNodes * np;
+    const int np = m_cfg.paths, nn = m_nodes * np;
     // PROCES's DATA: ISAVE/25/, LAMBDA/25*5/, ILRATE/5*10,5*20,…,5*50/,
     // P/750*1./, LAMSAV/750*5/, DUR/25*1000./, ILRSAV/750*20/, PATHSV/25*5/.
     // The listing's letter state 5 (a dah, then an element space) and path 5
@@ -226,6 +229,12 @@ void BellDecoder::restart() {
     for (int i = 0; i < np; i++)
         m_ilrate[i] = (i / 5 % 5 + 1) * 10;
     m_dur.assign(np, 1000.0f);
+    // The q classes take turns over the paths (one class: all 0).
+    m_qcls.resize(np);
+    for (int i = 0; i < np; i++)
+        m_qcls[i] = i % m_nq;
+    m_qcsav.assign(nn, 0);
+    m_pint.assign(m_nodes, 0.0f);
     m_pathsv.assign(np, 4);
     m_sort.assign(np, 0);
     m_p.assign(nn, 1.0f);
@@ -242,6 +251,7 @@ void BellDecoder::restart() {
     m_xhat = 0;
     m_elmhat = kDit;
     m_px = m_spdhat = m_pelm = 0.0f;
+    m_qhat = m_qval[0];
 
     // KALFIL's DATA: YKKIP/25*.5/, PKKIP/25*.1/.
     m_ykkip.assign(np, 0.5f);
@@ -321,17 +331,28 @@ void BellDecoder::proces(float z, float rn, std::string &out) {
 // TRPROB (p. 169–170).
 void BellDecoder::trprob(int ip, int lambda, float dur, int ilrate) {
     if (lambda == kNone) {
-        for (int n = 0; n < kNodes; n++) pin(ip, n) = 0.0f;
+        for (int n = 0; n < m_nodes; n++) pin(ip, n) = 0.0f;
         return;
     }
     const int ielem = ilami(lambda);
     const float ptrx = static_cast<float>(xtrans(ielem, dur, ilrate));
-    float psum = 0.0f, pint[kNodes] = {};
-    for (int k = 0; k < kElems; k++)
-        for (int i = 0; i < kRates; i++)
-            ptrans(k, i, lambda, ilrate, ptrx, psum, pint, i * kElems + k);
+    float psum = 0.0f;
+    float *pint = m_pint.data();
+    // The q class: kept while the element lasts (qstay), moved with
+    // probability q_switch when it changes (qmove).
+    const int qc = m_qcls[ip];
+    for (int c = 0; c < m_nq; c++) {
+        const float qstay = c == qc ? 1.0f : 0.0f;
+        const float qmove = m_nq == 1 ? 1.0f
+                            : c == qc ? 1.0f - m_cfg.q_switch
+                                      : m_cfg.q_switch / static_cast<float>(m_nq - 1);
+        for (int k = 0; k < kElems; k++)
+            for (int i = 0; i < kRates; i++)
+                ptrans(k, i, lambda, ilrate, ptrx, psum, pint, c * kNodes + i * kElems + k, qstay,
+                       qmove);
+    }
     // (No guard in the listing: PSUM is never 0 for a valid λ.)
-    for (int n = 0; n < kNodes; n++) pin(ip, n) = psum != 0.0f ? pint[n] / psum : 0.0f;
+    for (int n = 0; n < m_nodes; n++) pin(ip, n) = psum != 0.0f ? pint[n] / psum : 0.0f;
 }
 
 // XTRANS (p. 170): P(the element lasts another 5 ms | it has lasted D0),
@@ -366,15 +387,16 @@ double BellDecoder::xtrans(int ielem, float d0, int irate) const {
 
 // PTRANS (p. 171).
 void BellDecoder::ptrans(int kelem, int irate, int lambda, int ilrate, float ptrx, float &psum,
-                         float *pin, int n) const {
+                         float *pin, int n, float qstay, float qmove) const {
     const int ilelm = ilami(lambda);
     if (kelem == ilelm) {
-        // The same element continues: the key-state probability, no speed change.
-        pin[n] = irate == kRateHold ? ptrx : 0.0f;
+        // The same element continues: the key-state probability, no speed
+        // or q class change.
+        pin[n] = irate == kRateHold ? ptrx * qstay : 0.0f;
     } else {
         const float pelem = elemtr(lambda, kelem);
         const float prate = static_cast<float>(spdtr(irate, ilrate, kelem, ilelm));
-        pin[n] = (1.0f - ptrx) * pelem * prate;
+        pin[n] = (1.0f - ptrx) * pelem * prate * qmove;
     }
     psum += pin[n];
 }
@@ -393,10 +415,12 @@ double BellDecoder::spdtr(int isrt, int ilrt, int iselm, int ilelm) const {
 
 // PATH (p. 173–174).
 void BellDecoder::path(int ip, int lambda, float dur, int ilrate) {
+    for (int c = 0; c < m_nq; c++)
     for (int i = 0; i < kRates; i++) {
         for (int k = 0; k < kElems; k++) {
-            const int n = i * kElems + k;
-            const int j = ip * kNodes + n;
+            const int n = c * kNodes + i * kElems + k;
+            const int j = ip * m_nodes + n;
+            m_qcsav[j] = c;
             m_dursav[j] = 0.0f;
             m_ilrsav[j] = ilrate;
             if (lambda == kNone) {
@@ -419,15 +443,17 @@ void BellDecoder::path(int ip, int lambda, float dur, int ilrate) {
 void BellDecoder::likhd(float z, float rn, int ip, int lambda, float dur, int ilrate) {
     if (lambda == kNone) {
         // (The listing indexes ILAMI(IELMST(0)) here; the node's PIN is 0.)
-        for (int n = 0; n < kNodes; n++) m_lkhd[ip * kNodes + n] = 0.0f;
+        for (int n = 0; n < m_nodes; n++) m_lkhd[ip * m_nodes + n] = 0.0f;
         return;
     }
     const int kelem = ilami(lambda);
-    for (int k = 0; k < kElems; k++) {
-        for (int i = 0; i < kRates; i++) {
-            const int n = i * kElems + k;
-            const int j = ip * kNodes + n;
-            m_lkhd[j] = kalfil(z, ip, rn, isx(k), kelem, j, dur, ilrate, pin(ip, n));
+    for (int c = 0; c < m_nq; c++) {
+        for (int k = 0; k < kElems; k++) {
+            for (int i = 0; i < kRates; i++) {
+                const int n = c * kNodes + i * kElems + k;
+                const int j = ip * m_nodes + n;
+                m_lkhd[j] = kalfil(z, ip, rn, isx(k), kelem, j, dur, ilrate, pin(ip, n), m_qval[c]);
+            }
         }
     }
 }
@@ -435,7 +461,7 @@ void BellDecoder::likhd(float z, float rn, int ip, int lambda, float dur, int il
 // KALFIL (p. 176–177): one scalar Kalman step on the amplitude for this
 // extension, and the Gaussian likelihood of the innovation.
 float BellDecoder::kalfil(float z, int ip, float rn, int ixs, int kelem, int jnode, float dur,
-                          int ilrate, float pin) {
+                          int ilrate, float pin, float qmark) {
     constexpr float kPinMin = 0.0001f;
     if (pin <= kPinMin) {
         // Not scored: the node gets no mass, and SAVEP keeps no node without
@@ -445,7 +471,7 @@ float BellDecoder::kalfil(float z, int ip, float rn, int ixs, int kelem, int jno
         return 0.0f;
     }
     float phi, qa;
-    model(dur, kelem, ilrate, ixs, phi, qa);
+    model(dur, kelem, ilrate, ixs, qmark, phi, qa);
     const float hz = static_cast<float>(ixs);
     const float ykk = m_ykkip[ip], pkk = m_pkkip[ip];
     const float ypred = phi * ykk;
@@ -465,11 +491,12 @@ float BellDecoder::kalfil(float z, int ip, float rn, int ixs, int kelem, int jno
 // MODEL (p. 177–178): during a mark the amplitude is a slow random walk;
 // during a space it decays towards 0 with no process noise; entering a mark
 // after a space adds variance that grows with the space's length.
-void BellDecoder::model(float dur, int ielm, int ilr, int ixs, float &phi, float &qa) const {
+void BellDecoder::model(float dur, int ielm, int ilr, int ixs, float qmark, float &phi,
+                        float &qa) const {
     const float r1 = 1200.0f / static_cast<float>(ilr);
     const float bauds = std::min(dur / r1, 14.0f);
     if (ielm <= kDah) {
-        qa = 0.0001f;
+        qa = qmark;
         phi = 1.0f;
         return;
     }
@@ -486,12 +513,12 @@ void BellDecoder::model(float dur, int ielm, int ilr, int ixs, float &phi, float
 
 // PROBP (p. 178–179). false when no node has any mass.
 bool BellDecoder::probp() {
-    const int ni = kNodes * m_isave;
+    const int ni = m_nodes * m_isave;
     std::vector<float> &psav = m_psav_node;
     double psum = 0.0;
     for (int i = 0; i < m_isave; i++) {
-        for (int n = 0; n < kNodes; n++) {
-            const int j = i * kNodes + n;
+        for (int n = 0; n < m_nodes; n++) {
+            const int j = i * m_nodes + n;
             psav[j] = m_p[i] * pin(i, n) * m_lkhd[j];
             psum += psav[j];
         }
@@ -506,17 +533,22 @@ void BellDecoder::sprob() {
     float pselem[kElems] = {};
     m_spdhat = 0.0f;
     m_px = 0.0f;
+    float qhat = 0.0f;
     for (int k = 0; k < kElems; k++) {
-        for (int i = 0; i < kRates; i++) {
-            const int n = i * kElems + k;
-            for (int m = 0; m < m_isave; m++) {
-                const int j = m * kNodes + n;
-                pselem[k] += m_p[j];
-                m_spdhat += static_cast<float>(m_ilrsav[j]) * m_p[j];
-                if (k <= kDah) m_px += m_p[j];
+        for (int c = 0; c < m_nq; c++) {
+            for (int i = 0; i < kRates; i++) {
+                const int n = c * kNodes + i * kElems + k;
+                for (int m = 0; m < m_isave; m++) {
+                    const int j = m * m_nodes + n;
+                    pselem[k] += m_p[j];
+                    m_spdhat += static_cast<float>(m_ilrsav[j]) * m_p[j];
+                    if (k <= kDah) m_px += m_p[j];
+                    qhat += m_qval[c] * m_p[j];
+                }
             }
         }
     }
+    m_qhat = m_nq == 1 ? m_qval[0] : qhat;
     m_pelm = 0.0f;
     for (int k = 0; k < kElems; k++) {
         if (pselem[k] >= m_pelm) {
@@ -528,13 +560,14 @@ void BellDecoder::sprob() {
 
 // SAVEP (p. 180–183): keep the best node of each element type, then the
 // best of the rest until POPT of the mass or PATHS nodes are kept; merge
-// nodes with the same (λ, duration, speed), keeping the more probable.
+// nodes with the same (λ, duration, speed, q class), keeping the more
+// probable.
 void BellDecoder::savep() {
     const int np = m_cfg.paths;
     std::vector<float> &psav = m_psav_path;
     // SORT(1..NSAV) as a flag per node: the listing searches SORT for every
     // node it looks at.
-    std::fill(m_saved.begin(), m_saved.begin() + kNodes * m_isave, 0);
+    std::fill(m_saved.begin(), m_saved.begin() + m_nodes * m_isave, 0);
     int nsav = 0;
     double psum = 0.0;
     int jsav = 0, ipsav = 0;
@@ -542,12 +575,14 @@ void BellDecoder::savep() {
     for (int k = 0; k < kElems; k++) {
         float pmax = 0.0f;
         for (int ip = 0; ip < m_isave; ip++) {
-            for (int i = 0; i < kRates; i++) {
-                const int j = ip * kNodes + i * kElems + k;
-                if (m_p[j] >= pmax) {
-                    pmax = m_p[j];
-                    jsav = j;
-                    ipsav = ip;
+            for (int c = 0; c < m_nq; c++) {
+                for (int i = 0; i < kRates; i++) {
+                    const int j = ip * m_nodes + c * kNodes + i * kElems + k;
+                    if (m_p[j] >= pmax) {
+                        pmax = m_p[j];
+                        jsav = j;
+                        ipsav = ip;
+                    }
                 }
             }
         }
@@ -565,8 +600,8 @@ void BellDecoder::savep() {
         float pmax = 0.0f;
         bool found = false;
         for (int ip = 0; ip < m_isave; ip++) {
-            for (int n = 0; n < kNodes; n++) {
-                const int j = ip * kNodes + n;
+            for (int n = 0; n < m_nodes; n++) {
+                const int j = ip * m_nodes + n;
                 if (m_saved[j]) continue;
                 if (m_p[j] > pmax) {
                     pmax = m_p[j];
@@ -593,6 +628,7 @@ void BellDecoder::savep() {
         m_lambda[i] = m_lamsav[m_sort[i]];
         m_dur[i] = m_dursav[m_sort[i]];
         m_ilrate[i] = m_ilrsav[m_sort[i]];
+        m_qcls[i] = m_qcsav[m_sort[i]];
         m_ykkip[i] = m_ykksv[m_sort[i]];
         m_pkkip[i] = m_pkksv[m_sort[i]];
     }
@@ -605,7 +641,7 @@ void BellDecoder::savep() {
         if (!iconv[n]) continue;
         for (int k = n + 1; k < m_isave; k++) {
             if (iconv[k] && m_ilrate[k] == m_ilrate[n] && m_dur[k] == m_dur[n] &&
-                m_lambda[k] == m_lambda[n])
+                m_lambda[k] == m_lambda[n] && m_qcls[k] == m_qcls[n])
                 iconv[k] = 0;
         }
     }
@@ -618,6 +654,7 @@ void BellDecoder::savep() {
         m_lambda[n] = m_lambda[i];
         m_dur[n] = m_dur[i];
         m_ilrate[n] = m_ilrate[i];
+        m_qcls[n] = m_qcls[i];
         m_ykkip[n] = m_ykkip[i];
         m_pkkip[n] = m_pkkip[i];
         m_pathsv[n] = m_pathsv[i];

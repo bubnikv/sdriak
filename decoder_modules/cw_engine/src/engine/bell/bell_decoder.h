@@ -50,6 +50,19 @@ struct BellConfig {
     int    wpm_max  = 60;
     // TRELIS: the longest decode delay, in 5 ms samples (NDELAY).
     int    ndelay   = 200;
+    // MODEL: the process noise of the amplitude's random walk while the key
+    // stays down, per 5 ms sample (listing: 0.0001, about 0.14 of a unit
+    // amplitude per second). Fixed in the listing; under fading the right
+    // value grows with the Doppler spread (BELL.md, "Fading").
+    float  mark_q   = 0.0001f;
+    // MODEL as a bank of filters (Magill): every node also carries one of
+    // these values of the mark process noise, its q class, so the posterior
+    // picks the fading rate as it picks the speed. A path keeps its class
+    // while an element lasts and moves to another, each equally likely,
+    // with total probability q_switch when the element changes. Empty: one
+    // class, mark_q, and the listing's 30 nodes per path.
+    std::vector<float> q_bank;
+    float  q_switch = 0.05f;
 
     // Clamp NOISE's output to [0, 1] before PROCES (morse-wip, bmorse.cxx:352;
     // not in the listing). NOISE's variance estimate is fitted to Bell's
@@ -104,6 +117,8 @@ public:
     float best_prob() const { return m_p[m_imax]; }     // P(IMAX)
     float amplitude() const { return m_ykkip[m_imax]; } // YKKIP(IMAX)
     int   saved_paths() const { return m_isave; }       // ISAVE
+    // The posterior mean of the mark process noise over the q classes.
+    float mark_q_est() const { return m_qhat; }
 
 private:
     // Element types k.
@@ -112,7 +127,7 @@ private:
     static constexpr int kElems    = 6;                 // element types
     static constexpr int kRates    = 5;                 // speed steps i: −2..+2 steps
     static constexpr int kRateHold = 2;                 // the speed step that keeps the speed
-    static constexpr int kNodes    = kElems * kRates;   // new nodes per saved path
+    static constexpr int kNodes    = kElems * kRates;   // new nodes per path and q class
     static constexpr int kStates   = 16;                // letter states λ
     // No letter state: a transition the model does not allow, a pruned path.
     static constexpr int kNone     = -1;
@@ -129,13 +144,13 @@ private:
     void   trprob(int ip, int lambda, float dur, int ilrate);
     double xtrans(int ielem, float d0, int irate) const;
     void   ptrans(int kelem, int irate, int lambda, int ilrate, float ptrx, float &psum,
-                  float *pin, int n) const;
+                  float *pin, int n, float qstay, float qmove) const;
     double spdtr(int isrt, int ilrt, int iselm, int ilelm) const;
     void   path(int ip, int lambda, float dur, int ilrate);
     void   likhd(float z, float rn, int ip, int lambda, float dur, int ilrate);
     float  kalfil(float z, int ip, float rn, int ixs, int kelem, int jnode, float dur,
-                  int ilrate, float pin);
-    void   model(float dur, int ielm, int ilr, int ixs, float &phi, float &qa) const;
+                  int ilrate, float pin, float qmark);
+    void   model(float dur, int ielm, int ilr, int ixs, float qmark, float &phi, float &qa) const;
     bool   probp();
     void   sprob();
     void   savep();
@@ -144,15 +159,22 @@ private:
 
     // The listing's two-dimensional arrays: PIN(IP, N) per saved path and
     // new node, PTHTRL(N, I) and LMDSAV(N, I) per trellis stage and path.
-    float &pin(int ip, int n) { return m_pin[ip * kNodes + n]; }
+    float &pin(int ip, int n) { return m_pin[ip * m_nodes + n]; }
     int   &pthtrl(int n, int i) { return m_pthtrl[n * m_cfg.paths + i]; }
     int   &lmdsav(int n, int i) { return m_lmdsav[n * m_cfg.paths + i]; }
 
     BellConfig m_cfg;
 
+    // The q classes: their mark process noise, how many, and the new nodes
+    // per saved path (30 per class).
+    std::vector<float> m_qval;
+    int m_nq = 1, m_nodes = kNodes;
+
     // PROCES: the saved paths ip < ISAVE, and their new nodes
-    // j = 30·ip + n, n = 6·i + k.
+    // j = m_nodes·ip + n, n = 30·c + 6·i + k for q class c.
     int m_isave = 0;
+    std::vector<int>   m_qcls, m_qcsav;         // q class of each path, node
+    std::vector<float> m_pint;                  // TRPROB's scratch
     std::vector<int>   m_lambda, m_ilrate, m_pathsv, m_sort;
     std::vector<float> m_dur;
     std::vector<float> m_p;                     // P: saved paths, then new nodes
@@ -166,7 +188,7 @@ private:
     int   m_imax = 0;
     int   m_xhat = 0;
     int   m_elmhat = kDit;
-    float m_px = 0.0f, m_spdhat = 0.0f, m_pelm = 0.0f;
+    float m_px = 0.0f, m_spdhat = 0.0f, m_pelm = 0.0f, m_qhat = 0.0f;
     float m_rn = 0.1f;
 
     // KALFIL: the amplitude filter of each saved path and of each new node.

@@ -192,6 +192,85 @@ noise before the keying (`bench.py fading`):
 - **At 20 dB v3 is level or better**, and much better at 3 Hz (0.18
   against 0.29), where Bell's fixed amplitude random walk (below) is too
   slow for the spread.
+
+#### The amplitude random walk against the Doppler spread
+
+MODEL's process noise while the key stays down is a fixed q = 10⁻⁴ per
+5 ms in the listing (`BellConfig::mark_q`, switch `:q<x>`). Payload CER
+at 24 WPM, 50 overs a point, 6 / 10 / 20 dB:
+
+| Fading | `bell` (q 10⁻⁴) | best q | `bell`, best q | `v3` |
+|---|---|---|---|---|
+| none | 0.012 / 0.002 / 0.004 | ≤ 3·10⁻⁴ | same | 0.002 / 0.002 / 0.014 |
+| ITU good | 0.238 / 0.104 / 0.025 | ≤ 3·10⁻⁴ | same | 0.180 / 0.117 / 0.044 |
+| flat 0.1 Hz | 0.261 / 0.146 / 0.025 | 10⁻⁵ | 0.261 / 0.133 / 0.027 | 0.215 / 0.143 / 0.042 |
+| flat 0.3 Hz | 0.283 / 0.139 / 0.052 | ≤ 10⁻⁴ | same | 0.316 / 0.248 / 0.061 |
+| ITU moderate | 0.284 / 0.134 / 0.074 | 10⁻⁴–3·10⁻⁴ | same | 0.402 / 0.316 / 0.080 |
+| ITU poor | 0.353 / 0.239 / 0.148 | 3·10⁻⁴ | 0.349 / 0.231 / 0.143 | 0.561 / 0.470 / 0.132 |
+| flat 1 Hz | 0.344 / 0.221 / 0.145 | 3·10⁻⁴ | 0.346 / 0.205 / 0.132 | 0.563 / 0.463 / 0.143 |
+| flat 3 Hz | 0.511 / 0.410 / 0.294 | 10⁻³ | 0.403 / 0.231 / 0.140 | 0.665 / 0.569 / 0.187 |
+
+(q swept over 10⁻⁵, 10⁻⁴, 3·10⁻⁴, 10⁻³, 3·10⁻³, 10⁻²; at 50 overs,
+differences under about 0.02 are noise.)
+
+- **The best q grows as B²** (B the bench's spread in Hz, B = 2σ_f). A
+  complex Gaussian gain with Doppler spread σ_f moves by
+  E|Δg|² = (2πσ_fΔt)²·Ω per sample, half of it along the amplitude, so
+  q ≈ (πBΔt)²/2 ≈ 1.2·10⁻⁴·B² for Δt = 5 ms and Ω = 1: 1.1·10⁻⁵ at
+  0.3 Hz, 1.2·10⁻⁴ at 1 Hz, 1.1·10⁻³ at 3 Hz. The best values measured,
+  10⁻⁵, 3·10⁻⁴ and 10⁻³, are within one step of the sweep's grid.
+- **Bell's fixed 10⁻⁴ is right up to about 0.5 Hz.** A q matched to the
+  spread gains only from 1 Hz up, and at 3 Hz it nearly halves the error
+  rate (10 dB: 0.41 → 0.23; 20 dB: 0.29 → 0.14), putting Bell ahead of v3
+  at every SNR from 6 dB.
+- **Too large a q costs** on slow fading and on a steady signal: without
+  fading at 0 dB, q 3·10⁻³ raises payload CER from 0.40 to 0.57. A
+  tracker has to estimate the spread, not assume a fast one.
+- **The advantage over v3 holds at 50 overs:** at 10 dB, ITU poor 0.24
+  against 0.47, flat 1 Hz 0.22 against 0.46. v3 stays ahead at 0 dB,
+  and on slow fading (ITU good, flat 0.1 Hz) up to 6 dB.
+
+#### q chosen by the posterior
+
+`:qbank` gives every node a q class as well as an element type and a
+speed (Magill's bank of filters; `BellConfig::q_bank`, `q_switch`). A
+path keeps its class while an element lasts and may move to another when
+it changes, so the posterior picks the fading rate the way it picks the
+speed. With one class the decoder is bit-exact with `mark_q` alone.
+Payload CER at 10 dB (0 dB in the first row), 50 overs:
+
+| Fading | q 10⁻⁴ | best fixed q | 4 classes, switch 0.01 | 4 classes, 0.002 | 2 classes {10⁻⁴, 10⁻³}, 0.01 | `v3` |
+|---|---|---|---|---|---|---|
+| none, 0 dB | 0.400 | 0.393 | 0.469 | 0.470 | 0.453 | 0.051 |
+| ITU good | 0.104 | 0.104 | 0.129 | 0.129 | 0.127 | 0.117 |
+| flat 0.1 Hz | 0.146 | 0.133 | 0.165 | 0.164 | 0.161 | 0.143 |
+| flat 0.3 Hz | 0.139 | 0.134 | 0.160 | 0.159 | 0.158 | 0.248 |
+| ITU moderate | 0.134 | 0.131 | 0.161 | 0.161 | 0.157 | 0.316 |
+| ITU poor | 0.239 | 0.231 | 0.244 | 0.244 | 0.243 | 0.470 |
+| flat 1 Hz | 0.221 | 0.205 | 0.219 | 0.219 | 0.215 | 0.463 |
+| flat 3 Hz | 0.410 | 0.231 | 0.235 | 0.233 | 0.234 | 0.569 |
+
+(Four classes are 10⁻⁴, 3·10⁻⁴, 10⁻³, 3·10⁻³. With switch 0.05 the bank
+is 0.01–0.02 worse on slow fading; 50 paths instead of 25 changes
+nothing.)
+
+- **At 3 Hz the bank matches the best fixed q** (0.23 against 0.41 for
+  the listing's), without knowing the spread. At 1 Hz and ITU poor it is
+  level with the listing's q.
+- **On slow fading and a steady signal it costs 0.02–0.03 at 10 dB and
+  about 0.05 at 0–3 dB.** The switch rate is not the cause (0.01 and
+  0.002 agree to 0.003), nor the number of classes or paths: with a fast
+  class available, some noise is explained as amplitude movement within a
+  mark. Two classes cost the least.
+- **Against v3 the bank keeps the fading lead** (6–10 dB, ITU moderate
+  and up) and gives up a little more on slow fading.
+- The bank multiplies the nodes per path by the number of classes (two
+  classes: 60, four: 120).
+
+So a per-path choice of q recovers the fast-fading gain but pays on slow
+fading, because each path judges the fading rate from a few elements. An
+estimate of the spread over many elements, shared by the paths, should
+keep the gain without the cost; that is the next experiment.
 - **`bell:port` is within 0.1 of `bell`** in every fading cell, and
   worse in most.
 
@@ -213,6 +292,9 @@ Switches, after the name and in any order:
 | `:paths<N>` | the most paths saved |
 | `:noif` | no emulation of Bell's IF filter |
 | `:wpm<lo>-<hi>` | the speeds a path may move to (default 5–60) |
+| `:q<x>` | MODEL's amplitude process noise per 5 ms during a mark (default 0.0001) |
+| `:qbank` | four q classes (10⁻⁴, 3·10⁻⁴, 10⁻³, 3·10⁻³) as a hidden state per path, picked by the posterior (`BellConfig::q_bank`) |
+| `:qsw<x>` | the probability that a path changes q class at a change of element (default 0.05) |
 
 ## Known limits
 
@@ -224,4 +306,5 @@ Switches, after the name and in any order:
   of a Rician envelope. FADING_TRACKER.md explains why a complex filter on
   I/Q does better.
 - **Fixed amplitude dynamics.** `MODEL`'s random walk (q = 10⁻⁴ per 5 ms)
-  is not tied to the Doppler spread, and its variance shrinks during spaces.
+  is not tied to the Doppler spread, and its variance shrinks during
+  spaces. `:q<x>` sets it by hand; nothing estimates the spread.

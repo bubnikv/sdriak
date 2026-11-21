@@ -459,7 +459,10 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
     // them; "bell:port" as morse-wip has it. Further suffixes switch one
     // part each: ":sign" morse-wip's xtrans sign, ":noclamp" neither clamp,
     // ":paths<N>", ":noif" no emulation of Bell's IF filter, ":wpm<lo>-<hi>"
-    // the speeds a path may move to.
+    // the speeds a path may move to, ":q<x>" MODEL's amplitude process
+    // noise per 5 ms during a mark, ":qbank" four q classes (1e-4, 3e-4,
+    // 1e-3, 3e-3) chosen by the posterior, ":qbank<x>/<y>/..." others,
+    // ":qsw<x>" their switch probability at an element change.
     if (name.rfind("bell", 0) == 0) {
         BellBackendConfig c;
         for (size_t at = name.find(':'); at != std::string::npos;) {
@@ -471,6 +474,17 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf == "noclamp") { c.decoder.clamp_z = false; c.agc_clamp = false; }
             else if (suf == "noif") c.if_filter = false;
             else if (suf.rfind("paths", 0) == 0) c.decoder.paths = std::atoi(suf.c_str() + 5);
+            else if (suf == "qbank") c.decoder.q_bank = {0.0001f, 0.0003f, 0.001f, 0.003f};
+            else if (suf.rfind("qbank", 0) == 0) {                  // qbank<x>/<y>/...
+                c.decoder.q_bank.clear();
+                for (size_t p = 5; p < suf.size();) {
+                    const size_t e = std::min(suf.find('/', p), suf.size());
+                    c.decoder.q_bank.push_back(static_cast<float>(std::atof(suf.substr(p, e - p).c_str())));
+                    p = e + 1;
+                }
+            }
+            else if (suf.rfind("qsw", 0) == 0) c.decoder.q_switch = static_cast<float>(std::atof(suf.c_str() + 3));
+            else if (suf.size() > 1 && suf[0] == 'q') c.decoder.mark_q = static_cast<float>(std::atof(suf.c_str() + 1));
             else if (suf.rfind("wpm", 0) == 0 && suf.find('-') != std::string::npos) {
                 c.decoder.wpm_min = std::atoi(suf.c_str() + 3);
                 c.decoder.wpm_max = std::atoi(suf.c_str() + suf.find('-') + 1);
