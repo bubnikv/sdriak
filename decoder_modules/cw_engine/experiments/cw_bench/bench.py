@@ -13,6 +13,9 @@ Cases:
     fading    payload CER by ITU-R F.1487 condition and flat Doppler spread,
               at the SNR500 points of DeepCW's CW Skimmer table
     impulse   payload CER with impulse noise, and false characters on noise
+    impulse2  the same for realistic impulses: receiver-shaped pulses, sferics,
+              ignition and power-line trains, static crashes, Class A noise,
+              clipping (with a 3 s tail, for decoders that commit late)
     noise     false characters per hour on noise (and on --bed when given)
 
 Decoder switches go through the environment, as for the gates, e.g.
@@ -181,6 +184,38 @@ def case_impulse(a):
                 print(f"  {'':6s} {i or 'none':16s} {100*cer(rows):6.1f} %  {noise_rate(nz):14.0f}")
 
 
+IMPULSE2 = [
+    ('none', []),
+    ('rx 1/s 40 dB', ['--impulse', 'poisson:1:40:rx']),
+    ('sferic 3/s 40 dB', ['--impulse', 'poisson:3:40:sferic']),
+    ('rx 10/s 40 dB', ['--impulse', 'poisson:10:40:rx']),
+    ('ignition 50/s 30 dB', ['--impulse', 'periodic:50:30:rx']),
+    ('rasp 100/s 25 dB', ['--impulse', 'periodic:100:25:rx']),
+    ('crashes 0.2/s 40 dB', ['--impulse', 'crash:0.2:40']),
+    ('Class A 0.1/0.01', ['--classa', '0.1:0.01']),
+    ('rx 3/s 70 dB, clip 60', ['--impulse', 'poisson:3:70:rx', '--clip', '60']),
+]
+
+
+def case_impulse2(a):
+    snrs = [3, 6, 10]
+    tasks = [(c, i) for c in a.cfg for i in range(len(IMPULSE2))]
+    res = fan_out(a.bin, a.jobs, [['--cfg', c] + IMPULSE2[i][1] +
+                                  ['--wpm', '25', '--snr', ','.join(map(str, snrs)), '--lead', '2', '--tail', '3',
+                                   '--seeds', str(a.seeds)] + a.extra for c, i in tasks])
+    with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        noise = list(ex.map(lambda t: run(a.bin, ['--cfg', t[0]] + IMPULSE2[t[1]][1] +
+                                          ['--noise-only', '120', '--seeds', '3'] + a.extra), tasks))
+    print(f"realistic impulse noise: payload CER at 25 WPM by SNR500 ({a.seeds} overs a point),"
+          " and false characters per hour on 6 minutes of noise with the same impulses")
+    for c in a.cfg:
+        print(f"\n  {c:24s}" + "".join(f"{s:>+7}" for s in snrs) + f"  {'false/h':>8s}")
+        for (cc, i), rows, nz in zip(tasks, res, noise):
+            if cc == c:
+                cells = "".join(f"{cer([r for r in rows if r['snr'] == s]):7.3f}" for s in snrs)
+                print(f"  {IMPULSE2[i][0]:24s}{cells}  {noise_rate(nz):8.0f}")
+
+
 def case_noise(a):
     extra = ['--bed', a.bed] if a.bed else []
     print(f"false characters per hour on 20 minutes of {'the bed' if a.bed else 'noise'}")
@@ -191,7 +226,7 @@ def case_noise(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('case', choices=['ladder', 'offset', 'startup', 'fading', 'impulse', 'noise'])
+    ap.add_argument('case', choices=['ladder', 'offset', 'startup', 'fading', 'impulse', 'impulse2', 'noise'])
     ap.add_argument('--bin', required=True, help='path to cw_engine_bench')
     ap.add_argument('--cfg', action='append', help='v3 (default), v2, v2:<fc> ...')
     ap.add_argument('--seeds', type=int, default=10)

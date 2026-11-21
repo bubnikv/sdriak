@@ -1033,7 +1033,7 @@ Others exist in part.
 | Speed-matched linear filters | measured: no gain left (§5.3.6) | `CwMatchedFilter`, `CwEnvelope` |
 | Per-element amplitude, gain tracker, Doppler spread | open | — |
 | Forward–backward, character and callsign posteriors | open | — |
-| Impulse marking | open | — |
+| Impulse repair before the channelizer, repair weights to the decoders | measured on the bench (§5.7); no pipeline uses it yet; v3 ignores the weights | `ImpulseRepair`, `SkimDecodeChannel::set_repair_weights` |
 
 The weak view uses the exponential (Rayleigh-fading) model, so a notch
 sample already costs at most ln(σ1²/σ0²)/L ≤ ln 9/L nats. That bounded
@@ -1713,6 +1713,60 @@ at the same output sample, and a CW station never does.
 - **Hook.** This needs a new optional hook on `SkimDecodeChannel` that hands
   the pipeline's per-block erasure weights to `process()`. Detection belongs
   to the skimmer module, which owns the channelizer.
+
+**Built: repair before the channelizer.** `ImpulseRepair`
+(`engine/impulse_repair.h`) runs on the wideband stream:
+
+- strong signals are split off first, as in Linrad: a short-time FFT
+  (bins of about 31 Hz, sqrt-Hann, half overlap) sets aside the bins whose
+  power, averaged over 0.5 s, stands 25 dB over the median bin, and their
+  neighbours; they bypass the repair and are added back after it. One AR
+  model cannot predict dozens of independently keyed carriers;
+- a complex AR(32) model of the rest, refitted every 32 ms on the last
+  128 ms of repaired history, predicts each sample;
+- a prediction error 12 dB over the median error (last 256 ms) opens a
+  gap; it extends while the samples stay 5 dB away from the model's
+  extrapolation, plus 4 guard samples;
+- a gap whose error spectrum is narrowband (spectral flatness, geometric
+  over arithmetic mean of the error's power spectrum, under 0.2; white
+  noise gives about 0.56) is a carrier keyed on or a strong signal fading
+  and is left alone. The test looks only at the gap, so dense impulse
+  trains, which raise every frame of a spectral average, are found as
+  well as single pulses;
+- the gap is filled by forward and backward prediction, crossfaded, so
+  carriers run through it and nothing is zeroed;
+- a gap that has not settled after 32 ms is not an impulse either, and is
+  left alone; detection then pauses for 8 ms while the model learns the
+  new signal;
+- past 10 % of recent samples repaired, the threshold rises (dense Class A
+  noise, like Linrad's dumb blanker past 20 %).
+
+Its latency is the split's frame and the look-ahead, 70 ms at 8 kHz; it
+costs 2.4 % of a core at 48 kHz, 10.6 % at 192 kHz without the split
+(the split's FFTs add a few per cent). It hands each output sample
+a repaired flag; `SkimDecodeChannel::set_repair_weights()` gives a backend
+the share of repaired wideband samples in the channelizer prototype's span
+behind each channel sample.
+
+On the bench (`bench.py impulse2`, `--repair`; BELL.md has the tables),
+25 WPM at 6 dB, v3: sferics 3/s at 40 dB 0.755 → 0.030, 10 pulses/s
+0.762 → 0.010, ignition 0.299 → 0.002, power-line rasp 0.378 → 0.000,
+static crashes 0.229 → 0.020, 70 dB pulses clipped at 60 dB 0.995 →
+0.028. Clean signals are level within noise; ITU poor fading loses about
+0.02 at 15 dB. At 48 kHz the stage works the same way (sferics 0.155 →
+0.008, clipped pulses 0.998 → 0.002; measured before the split). In a
+crowded band (`--qrm`: 10–60 other stations at 10–30 dB) it still pays,
+but less: sferics 0.75 → 0.09–0.16, ignition 0.30 → 0.005–0.16, and a
+clean band of 60 stations loses 0.02.
+
+Not done yet:
+- a skimmer pipeline to run it in (the engine has none);
+- v3 using the repair weights (coherent Bell does, `:repw`);
+- the pulse-fit subtraction of Linrad's smart blanker, which keeps the
+  noise samples a prediction throws away, and would also clean the bins
+  the split sets aside (an impulse's energy there passes untouched);
+- a crowded band at 48–192 kHz, where the split's median and the AR
+  model's capacity change again.
 
 ### 5.8 Where small networks fit
 

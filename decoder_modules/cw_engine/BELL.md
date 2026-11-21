@@ -408,6 +408,105 @@ delay; 24 WPM, 30 overs):
   the beat. A spread estimate has to measure how fast the gain actually
   decorrelates, not assume one path's spread.
 
+Realistic impulses (`bench.py impulse2`: receiver-shaped pulses, sferics,
+trains, crashes, Class A, clipping; see the bench README). Payload CER at
+25 WPM, SNR500 6 dB, 20 overs, and false characters per hour on noise
+with the same impulses (v3 / coherent with `:imp0.05:kappa30:impscore`):
+
+| Impulses | `v3` | `bell` | `coh` | `coh` + impulse model | false/h |
+|---|---|---|---|---|---|
+| none | 0.007 | 0.006 | 0.000 | 0.000 | 0 / 120 |
+| `rx` 1/s 40 dB | 0.139 | 0.277 | 0.297 | 0.098 | 0 / 130 |
+| sferic 3/s 40 dB | 0.755 | 0.610 | 0.683 | 0.160 | 0 / 760 |
+| `rx` 10/s 40 dB | 0.762 | 0.736 | 0.751 | 0.381 | 0 / 3130 |
+| ignition 50/s 30 dB | 0.299 | 0.769 | 0.764 | 0.315 | 0 / 9700 |
+| rasp 100/s 25 dB | 0.378 | 0.389 | 0.791 | 0.682 | 30 / 2270 |
+| crashes 0.2/s 40 dB | 0.229 | 0.135 | 0.162 | 0.067 | 120 / 290 |
+| Class A 0.1 / 0.01 | 0.002 | 0.033 | 0.005 | 0.000 | 10 / 80 |
+| `rx` 3/s 70 dB, clip 60 | 0.995 | 0.713 | 0.703 | 0.759 | 0 / 5550 |
+
+- **Realistic impulses defeat every decoder:** three sferics a second take
+  v3 to 0.76; strong pulses clipped at the ADC leave v3 decoding nothing
+  and the Bell variants losing about 0.7.
+- **The impulse model makes coherent Bell the most robust on sparse and
+  shaped pulses** (sferics 0.16, crashes 0.067), but it decodes hundreds
+  to thousands of false characters an hour where v3 makes almost none,
+  and it fails on dense power-line rasp.
+- No decoder working on one channel handles strong or dense impulses:
+  that needs the wideband stage of ALGORITHM.md §5.7.
+
+With that stage, `ImpulseRepair` (`engine/impulse_repair.h`, bench
+`--repair`), on the wideband stream before the channelizer (ALGORITHM.md
+§5.7 has the method): strong signals are split off by a short-time FFT,
+a complex AR(32) model of the rest predicts each sample, a prediction
+error 12 dB over the error's median opens a gap, and a gap whose error is
+broadband is filled by forward and backward prediction, crossfaded. The
+same grid, 6 dB:
+
+| Impulses | `v3` | `bell` | `coh` | `coh` + impulse model | false/h |
+|---|---|---|---|---|---|
+| none | 0.004 | 0.010 | 0.002 | 0.000 | 0 / 130 |
+| `rx` 1/s 40 dB | 0.004 | 0.007 | 0.002 | 0.000 | 0 / 130 |
+| sferic 3/s 40 dB | 0.030 | 0.151 | 0.101 | 0.013 | 0 / 120 |
+| `rx` 10/s 40 dB | 0.010 | 0.040 | 0.021 | 0.009 | 0 / 100 |
+| ignition 50/s 30 dB | 0.002 | 0.005 | 0.002 | 0.000 | 0 / 120 |
+| rasp 100/s 25 dB | 0.000 | 0.227 | 0.087 | 0.016 | 0 / 750 |
+| crashes 0.2/s 40 dB | 0.020 | 0.055 | 0.040 | 0.011 | 0 / 120 |
+| Class A 0.1 / 0.01 | 0.002 | 0.014 | 0.000 | 0.000 | 0 / 70 |
+| `rx` 3/s 70 dB, clip 60 | 0.028 | 0.018 | 0.010 | 0.012 | 0 / 110 |
+
+- **Every decoder gains**, v3 most: sferics 0.755 → 0.030, clipped strong
+  pulses 0.995 → 0.028. Coherent Bell with the impulse model stays the
+  best on nearly every impulse case, and its false characters on
+  impulsive noise fall to about its level on plain noise, about 100 an
+  hour (v3: 0).
+- **On clean signals and fading the stage costs little:** the white-noise
+  ladder is level within noise (v3 at 25 WPM, 60 overs: −2 dB 0.593 →
+  0.570, 0 dB 0.032 → 0.045, 2 dB 0.007 → 0.010); ITU poor at 15 dB loses
+  about 0.02 (v3 0.195 → 0.215), coherent Bell nothing.
+- **Why each guard is there.** A strong mark coming on is as unpredictable
+  as an impulse, and its error never settles: gaps are capped at 32 ms
+  and such a gap is left alone (a gap allowed to run to 64 ms filled the
+  start of every strong mark with silence, ITU poor at 15 dB 0.086 →
+  0.163). The cap must not be shorter: sferic trains and clipped pulses
+  ring for more than 8 ms. And a narrowband error (a carrier keyed on, a
+  fade) is never filled, which a test on the gap's own spectrum decides
+  without averages, so dense trains are found as well as single pulses.
+
+A crowded band (`--qrm 10|30|60:30:20`: other stations at 10–30 dB SNR500
+in other channels), v3 at 6 dB, 20 overs, payload CER without → with the
+repair:
+
+| Stations | none | sferic 3/s | ignition 50/s | crashes |
+|---|---|---|---|---|
+| 0 | 0.007 → 0.004 | 0.755 → 0.030 | 0.299 → 0.002 | 0.229 → 0.020 |
+| 10 | 0.004 → 0.009 | 0.752 → 0.106 | 0.306 → 0.005 | 0.229 → 0.053 |
+| 30 | 0.002 → 0.002 | 0.750 → 0.158 | 0.305 → 0.035 | 0.229 → 0.086 |
+| 60 | 0.001 → 0.024 | 0.748 → 0.093 | 0.298 → 0.161 | 0.251 → 0.068 |
+
+- **The repair still pays in a crowd, but less**: one AR model of the
+  weak part cannot follow every station the split leaves in it. With 60
+  stations the split sets almost nothing aside (they fill so much of the
+  band that the median bin is a station), and a clean crowded band loses
+  0.02. Coherent Bell with the impulse model behaves alike (60 stations:
+  sferics 0.158 → 0.088, ignition 0.326 → 0.175). A rejected gap pauses
+  detection for only 8 ms: a 64 ms pause leaves impulses unrepaired in a
+  crowd (30 stations, sferics 0.217 against 0.153 at 10 overs). A larger
+  AR model (48, 64) gives no clear gain.
+- **The decoder can be told which samples were rebuilt**
+  (`SkimDecodeChannel::set_repair_weights()`: per channel sample, the
+  share of repaired wideband samples in the channelizer prototype's span
+  behind it). With `:repw` coherent Bell scales a sample's log-likelihood
+  and Kalman gain by 1 − that share. It trims what the repair leaves, at no
+  cost on clean signals or fading. CER at 3 / 6 dB with `--repair`:
+
+  | | sferic 3/s | rasp 100/s | crashes | clipped |
+  |---|---|---|---|---|
+  | `coh` | 0.056 / 0.101 | 0.208 / 0.125 | 0.031 / 0.039 | 0.006 / 0.014 |
+  | `coh:repw` | 0.053 / 0.085 | 0.173 / 0.085 | 0.025 / 0.033 | 0.005 / 0.004 |
+  | `coh:imp0.05:kappa30:impscore` | 0.008 / 0.013 | 0.069 / 0.006 | 0.010 / 0.011 | 0.014 / 0.012 |
+  | the same with `:repw` | 0.004 / 0.009 | 0.063 / 0.008 | 0.009 / 0.003 | 0.010 / 0.007 |
+
 `:coh` switches (after `bell`): `:spread<B>` (Hz, default 0.5),
 `:spreads<x>/<y>/...` a spread class per path (with `:qsw<x>`),
 `:match<ms>` the AR(1) match lag (40), `:noafc`, `:rate<Hz>` the sample
@@ -434,7 +533,7 @@ Switches, after the name and in any order:
 | `:q<x>` | MODEL's amplitude process noise per 5 ms during a mark (default 0.0001) |
 | `:qbank` | four q classes (10⁻⁴, 3·10⁻⁴, 10⁻³, 3·10⁻³) as a hidden state per path, picked by the posterior (`BellConfig::q_bank`) |
 | `:qsw<x>` | the probability that a path changes q class at a change of element (default 0.05) |
-| `:coh` | the coherent variant ("The coherent variant"), with `:spread<B>`, `:spreads<x>/<y>/...`, `:match<ms>`, `:noafc`, `:imp<ε>`, `:kappa<κ>`, `:impscore` |
+| `:coh` | the coherent variant ("The coherent variant"), with `:spread<B>`, `:spreads<x>/<y>/...`, `:match<ms>`, `:noafc`, `:imp<ε>`, `:kappa<κ>`, `:impscore`, `:repw` |
 
 ## Known limits
 

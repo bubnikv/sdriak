@@ -25,6 +25,7 @@
 #include "engine/decode_deepcw2.h"
 #endif
 #include "engine/channelizer.h"
+#include "engine/impulse_repair.h"
 #include "engine/callsign.h"
 #include "sdriak/fir_bandpass.h"
 
@@ -34,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -81,6 +83,14 @@ struct Options {
     bool imp_crash = false;            // static crashes: imp_rate flashes per second
     int imp_shape = 0;                 // ImpShape: delta, receiver-shaped, sferic
     double clip_db = 0.0;              // > 0: ADC clipping, this far over the wideband noise rms
+    bool repair = false;               // ImpulseRepair on the wideband stream before the channelizer
+    int qrm_n = 0;                     // other keyed CW stations in other channels
+    double qrm_db = 30.0;              // their SNR500, the strongest
+    double qrm_range = 0.0;            // and how far below it they spread
+    double repair_thr_db = 12.0;       // its detection threshold
+    double repair_split_db = 25.0;     // its strong-signal split (0: none)
+    double repair_holdoff_ms = 8.0;    // its pause after a rejected gap
+    int repair_order = 32;             // its AR model order
     double classa_a = 0.0;             // > 0: Middleton Class A noise, impulsive index A
     double classa_gamma = 0.0;         //      and Gaussian-to-impulsive power ratio Γ
     std::string bed;                   // cf32 IQ recording at `rate`
@@ -195,6 +205,28 @@ bool parse_args(int argc, char **argv, Options &o) {
             else { std::fprintf(stderr, "bad --impulse shape %s\n", shape); return false; }
         }
         else if (a == "--clip") o.clip_db = std::atof(val());
+        else if (a == "--qrm") {                                  // <N>:<SNR500 dB>[:<range dB>]
+            if (std::sscanf(val(), "%d:%lf:%lf", &o.qrm_n, &o.qrm_db, &o.qrm_range) < 2 || o.qrm_n < 0) {
+                std::fprintf(stderr, "bad --qrm\n");
+                return false;
+            }
+        }
+        else if (a.rfind("--repair-order=", 0) == 0) {    // its AR model order
+            o.repair = true;
+            o.repair_order = std::atoi(a.c_str() + 15);
+        }
+        else if (a.rfind("--repair-holdoff=", 0) == 0) {  // its pause after a rejected gap, ms
+            o.repair = true;
+            o.repair_holdoff_ms = std::atof(a.c_str() + 17);
+        }
+        else if (a.rfind("--repair-split=", 0) == 0) {    // the strong-signal split, dB (0: off)
+            o.repair = true;
+            o.repair_split_db = std::atof(a.c_str() + 15);
+        }
+        else if (a.rfind("--repair", 0) == 0) {           // --repair[=<threshold dB>]
+            o.repair = true;
+            if (a.size() > 9 && a[8] == '=') o.repair_thr_db = std::atof(a.c_str() + 9);
+        }
         else if (a == "--classa") {                                 // <A>:<Gamma>
             if (std::sscanf(val(), "%lf:%lf", &o.classa_a, &o.classa_gamma) != 2 || o.classa_a <= 0) {
                 std::fprintf(stderr, "bad --classa\n");
@@ -492,6 +524,7 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
     // ":qsw<x>" their switch probability at an element change; ":coh" the
     // coherent variant, ":noafc" without its AFC, ":imp<eps>" and
     // ":kappa<k>" its impulse mixture (":impscore" for scoring only),
+    // ":repw" weighing samples --repair rebuilt by 1 − their share,
     // ":rate<Hz>" its sample
     // rate (125), ":spread<B>" its Doppler
     // spread (Hz),
@@ -520,6 +553,7 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf == "coh") c.decoder.coherent = true;
             else if (suf == "noafc") c.coh_afc = false;
             else if (suf == "impscore") c.decoder.coh_imp_update = false;
+            else if (suf == "repw") c.decoder.coh_repair_weight = true;
             else if (suf.rfind("imp", 0) == 0) c.decoder.coh_imp_eps = static_cast<float>(std::atof(suf.c_str() + 3));
             else if (suf.rfind("kappa", 0) == 0) c.decoder.coh_imp_kappa = static_cast<float>(std::atof(suf.c_str() + 5));
             else if (suf.rfind("rate", 0) == 0) c.coh_rate_hz = std::atof(suf.c_str() + 4);
@@ -570,6 +604,23 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     auto ch = SkimChannelizer::create_ex(o.rate, 125.0, o.passband, o.taps);
     if (!ch) { std::fprintf(stderr, "bad channelizer geometry\n"); std::exit(2); }
     auto dec = backend.channel_new(ch->out_rate());
+    // the wideband impulse repair before the channelizer (--repair)
+    std::unique_ptr<ImpulseRepair> repair;
+    if (o.repair) {
+        ImpulseRepair::Config rc;
+        rc.thr_db = o.repair_thr_db;
+        rc.split_db = o.repair_split_db;
+        rc.hold_off_ms = o.repair_holdoff_ms;
+        rc.order = o.repair_order;
+        repair = std::make_unique<ImpulseRepair>(o.rate, rc);
+    }
+    // Its flags per wideband sample, a running count over the channelizer
+    // prototype's span (taps × branches), and the weights handed on.
+    std::vector<unsigned char> rflags(512);
+    std::vector<unsigned char> rring(static_cast<size_t>((o.taps ? o.taps : 8) * std::lround(o.rate / 125.0)), 0);
+    std::vector<float> wpi(512), wch(4096);
+    int rsum = 0;
+    size_t rat = 0;
     const double enbw = channel_enbw(o);
     const double chan_hz = ch->offset_hz(o.channel);
 
@@ -698,6 +749,35 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     const double pre_gain = o.preamble_db > 0 ? std::pow(10.0, -o.preamble_db / 20.0) : 1.0;
     const double w0 = 2 * SKIM_PI * (chan_hz + foff) / o.rate;
 
+    // other stations (--qrm): keyed CW in other channels, at least two
+    // channels away, each with its own text, speed and level
+    struct Qrm { std::vector<float> env; double amp, w; };
+    std::vector<Qrm> qrm;
+    if (o.qrm_n > 0) {
+        std::mt19937 rq(9000 + seed);
+        std::uniform_real_distribution<double> uq(0.0, 1.0);
+        const unsigned m = ch->count();
+        for (int q = 0; q < o.qrm_n; q++) {
+            unsigned c = 0;
+            for (int tries = 0; tries < 1000; tries++) {
+                c = static_cast<unsigned>(rq() % m);
+                if (std::fabs(ch->offset_hz(c) - chan_hz) >= 2.5 * 125.0) break;
+            }
+            const double f = ch->offset_hz(c) + 60.0 * (uq(rq) - 0.5);
+            const double lvl = o.qrm_db - o.qrm_range * uq(rq);
+            const double wq = 15.0 + 20.0 * uq(rq);
+            Qrm s;
+            while (s.env.size() < env.size()) {      // over after over, to the end
+                const std::vector<float> e = envelope(payload(rq), wq, o.rate, o.jitter, 0.3 + uq(rq), o.edge_ms, rq);
+                s.env.insert(s.env.end(), e.begin(), e.end());
+            }
+            s.env.resize(env.size());
+            s.amp = amp * std::pow(10.0, (lvl - snr500) / 20.0);
+            s.w = 2 * SKIM_PI * f / o.rate;
+            qrm.push_back(std::move(s));
+        }
+    }
+
     std::string out;
     std::vector<float> iq(2 * 512), cbuf(2 * 4096);
     double ph = 0.0;
@@ -716,6 +796,8 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                          std::polar(amp * env[kd], w0 * static_cast<double>(kd));
                 }
             }
+            for (const Qrm &q : qrm)
+                if (q.env[k] > 0.0f) s += std::polar(q.amp * q.env[k], q.w * static_cast<double>(k));
             const double ns = k < pre_n ? pre_gain : 1.0;
             double re = s.real(), im = s.imag();
             if (bed.empty()) {
@@ -750,11 +832,32 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             iq[2 * i + 1] = static_cast<float>(im);
             ph += w0;
         }
+        if (repair) {
+            repair->process(iq.data(), iq.data(), static_cast<unsigned>(n), rflags.data());
+            // Each channel sample's repair weight: the share of repaired
+            // samples in the channelizer prototype's span behind it (its
+            // window is centred on its group delay, so the trailing span
+            // lines up with the sample it produces now).
+            for (size_t i = 0; i < n; i++) {
+                rsum += rflags[i] - rring[rat];
+                rring[rat] = rflags[i];
+                rat = (rat + 1) % rring.size();
+                wpi[i] = static_cast<float>(rsum) / static_cast<float>(rring.size());
+            }
+        }
         ch->push(iq.data(), static_cast<unsigned>(n));
         const unsigned got = ch->read(o.channel, cbuf.data(), 4096);
+        if (repair && got) {
+            for (unsigned j = 0; j < got; j++) wch[j] = wpi[std::min(n - 1, ((j + 1) * n) / got - 1)];
+            dec->set_repair_weights(wch.data(), got);
+        }
         SkimDecode d{};
         if (got && dec->process(cbuf.data(), got, &d)) out += d.text;
     }
+    if (repair)
+        std::fprintf(stderr, "repair: seed %d gaps %ld rejected %ld narrow %ld repaired %.2f %% impulsive %.1f %% strong %.1f\n",
+                     seed, repair->gaps(), repair->rejected(), repair->narrow(),
+                     100.0 * repair->repaired() / std::max(1.0, repair->output()), 100.0 * repair->impulsive_frames(), repair->strong_bins());
     r.hyp = normalise(out);
     if (o.noise_only_s > 0) {
         r.dist = static_cast<int>(std::count_if(r.hyp.begin(), r.hyp.end(), [](char c) { return c != ' '; }));
