@@ -687,6 +687,11 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
                 c.decoder.speed_lock = true;
                 c.decoder.speed_lock_span = static_cast<float>(std::atof(suf.c_str() + 5));
             }
+            else if (suf == "dlearn") c.decoder.dur_learn = true;
+            else if (suf.rfind("dlearn", 0) == 0) {
+                c.decoder.dur_learn = true;
+                c.decoder.dur_learn_max = static_cast<float>(std::atof(suf.c_str() + 6));
+            }
             else if (suf.rfind("dsharp", 0) == 0) c.decoder.dur_sharpness = static_cast<float>(std::atof(suf.c_str() + 6));
             else if (suf.rfind("delay", 0) == 0) c.decoder.ndelay = std::atoi(suf.c_str() + 5);
             else if (suf.rfind("floor", 0) == 0) c.decoder.coh_floor_ratio = static_cast<float>(std::atof(suf.c_str() + 5));

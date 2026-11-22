@@ -235,6 +235,8 @@ void BellDecoder::reset() {
     m_whi = m_cfg.wpm_max;
     unlock_speed();
     m_slock_idle_s = 0.0f;
+    m_run_s = m_run_pmax = m_up_s = 0.0f;
+    m_up_pmin = 1.0f;
     restart();
 
     // NOISE's DATA.
@@ -433,7 +435,7 @@ double BellDecoder::xtrans(int ielem, float d0, int irate) const {
     if (ielem == kPause) alpha = 14.0f * kAparm[2];
     else if (ielem == kWordSpace) alpha = 7.0f * kAparm[1];
     else alpha = static_cast<float>(mscale) * kAparm[0];
-    if (ielem != kPause) alpha *= m_cfg.dur_sharpness;
+    if (ielem != kPause) alpha *= m_dsharp;
 
     if (b1 <= 1.0f) {
         const float p1 = 1.0f - 0.5f * std::exp(alpha * (b1 - 1.0f));
@@ -708,6 +710,16 @@ void BellDecoder::unlock_speed() {
     m_slock = m_slock_s = m_sdev = m_odd = 0.0f;
     m_wlo = m_cfg.wpm_min;
     m_whi = m_cfg.wpm_max;
+    m_mad = kListingMad;
+    m_dsharp = m_cfg.dur_sharpness;
+}
+
+void BellDecoder::learn_duration(float run_s, bool mark) {
+    const float r = run_s * m_slock / 1.2f;                  // the run in locked dits
+    if (!mark && r > kLearnSpaceMax) return;                 // a word space or a pause
+    const float d = std::min(kLearnCap, std::min(std::fabs(r - 1.0f), std::fabs(r - 3.0f)));
+    m_mad += kLearnGain * (d - m_mad);
+    m_dsharp = m_cfg.dur_sharpness * std::clamp(kListingMad / std::max(m_mad, 1e-3f), 1.0f, m_cfg.dur_learn_max);
 }
 
 void BellDecoder::lock_speed() {
@@ -719,10 +731,21 @@ void BellDecoder::lock_speed() {
     // posterior cannot leave the range and does not press on it), but its
     // sure runs no longer sit near 1 or 3 locked dits. When their average
     // misfit passes kOddRelease, the range opens and a new average starts.
+    const bool learn = m_cfg.dur_learn && locked;
     if (m_px > 0.5f) {
+        if (m_up_s > 0.0f) {
+            if (learn && m_up_pmin < kLearnSure) learn_duration(m_up_s, false);
+            m_up_s = 0.0f;
+            m_up_pmin = 1.0f;
+        }
         m_run_s += dt;
         m_run_pmax = std::max(m_run_pmax, m_px);
-    } else if (m_run_s > 0.0f) {
+    } else {
+        m_up_s += dt;
+        m_up_pmin = std::min(m_up_pmin, m_px);
+    }
+    if (m_px <= 0.5f && m_run_s > 0.0f) {
+        if (learn && m_run_pmax > kOddSure) learn_duration(m_run_s, true);
         if (locked && m_run_pmax > kOddSure) {
             const float r = m_run_s * m_slock / 1.2f;        // the run in locked dits
             const float lr = std::log(std::max(r, 1e-3f));
