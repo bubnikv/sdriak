@@ -347,6 +347,16 @@ repair weights (`:repw`):
   0.015 at 0 / 10 / 20 dB (R7 0.493 / 0.100 / 0.017). The gap to
   DeepCW, 10 % CER: 0.7 / 1.5 / 1.7 dB on QSO text, 1.4 / 0.9 / 1.4 dB
   on random text.
+- **The gain filters with R7 + R8.** The gain known (`:ogain`) is worth
+  0.26 dB at 25 WPM and 0.54 dB at 35, nothing at 12. A smoother cannot
+  take it: the product of a linear Gaussian filter's one-step predictive
+  likelihoods is the path's exact joint likelihood. Nor does more memory:
+  on white noise the measured spread sits at the estimator's clamp
+  (0.2 Hz, 0.26 Hz to the paths), and a fixed spread lower than that is
+  worse, with the frequency known as well (SNR500 for 10 % at 25 / 35
+  WPM: 0.3 Hz −2.19 / −0.32, 0.1 Hz −2.01 / −0.05, 0.03 Hz −0.99 /
+  +1.53). The remainder is what estimating the gain costs; the front end
+  is left as it is.
 - The decimation is not what costs at speed: every channel sample
   (250 Hz) does worse, more so the faster (an error floor of 5 % at
   25 WPM and 15 % at 35, +2 dB), and neither 200 paths nor dropping the
