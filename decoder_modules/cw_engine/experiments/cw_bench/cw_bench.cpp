@@ -31,6 +31,7 @@
 #include "sdriak/fir_bandpass.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -85,6 +86,7 @@ struct Options {
     int imp_shape = 0;                 // ImpShape: delta, receiver-shaped, sferic
     double clip_db = 0.0;              // > 0: ADC clipping, this far over the wideband noise rms
     bool repair = false;               // ImpulseRepair on the wideband stream before the channelizer
+    bool time = false;                 // --time: the decoder's own CPU per over, to stderr
     double drift_hz_s = 0.0;           // the target's frequency drift, Hz/s
     double gain_db = 0.0;              // the whole input scaled by this, dB
     bool random_text = false;          // random groups in place of the payload
@@ -239,6 +241,7 @@ bool parse_args(int argc, char **argv, Options &o) {
             o.repair = true;
             if (a.size() > 9 && a[8] == '=') o.repair_thr_db = std::atof(a.c_str() + 9);
         }
+        else if (a == "--time") o.time = true;
         else if (a == "--drift") o.drift_hz_s = std::atof(val());     // Hz/s
         else if (a == "--gain") o.gain_db = std::atof(val());         // dB, the whole input
         else if (a == "--text") {                                   // payload | random
@@ -583,6 +586,7 @@ struct Result {
     size_t ref_len = 0, pay_len = 0;
     int dist = 0, pay_dist = 0;
     std::string ref, hyp;
+    double audio_s = 0.0, decode_s = 0.0;  // the over's length; the time spent in the decoder (--time)
 };
 
 std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
@@ -686,6 +690,11 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf.rfind("slock", 0) == 0) {
                 c.decoder.speed_lock = true;
                 c.decoder.speed_lock_span = static_cast<float>(std::atof(suf.c_str() + 5));
+            }
+            else if (suf == "dlearn") c.decoder.dur_learn = true;
+            else if (suf.rfind("dlearn", 0) == 0) {
+                c.decoder.dur_learn = true;
+                c.decoder.dur_learn_max = static_cast<float>(std::atof(suf.c_str() + 6));
             }
             else if (suf.rfind("dsharp", 0) == 0) c.decoder.dur_sharpness = static_cast<float>(std::atof(suf.c_str() + 6));
             else if (suf.rfind("delay", 0) == 0) c.decoder.ndelay = std::atoi(suf.c_str() + 5);
@@ -1072,13 +1081,19 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
             if (rgot == got && got) dec->set_reference(rbuf.data(), got);
         }
         SkimDecode d{};
-        if (got && dec->process(cbuf.data(), got, &d)) out += d.text;
+        if (got) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool any = dec->process(cbuf.data(), got, &d);
+            r.decode_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (any) out += d.text;
+        }
     }
     if (repair)
         std::fprintf(stderr, "repair: seed %d gaps %ld rejected %ld narrow %ld repaired %.2f %% impulsive %.1f %% strong %.1f\n",
                      seed, repair->gaps(), repair->rejected(), repair->narrow(),
                      100.0 * repair->repaired() / std::max(1.0, repair->output()), 100.0 * repair->impulsive_frames(), repair->strong_bins());
     r.hyp = normalise(out);
+    r.audio_s = static_cast<double>(env.size()) / o.rate;
     if (o.noise_only_s > 0) {
         r.dist = static_cast<int>(std::count_if(r.hyp.begin(), r.hyp.end(), [](char c) { return c != ' '; }));
         return r;
@@ -1190,6 +1205,7 @@ int main(int argc, char **argv) {
             const Result r = run_over(o, *be, o.wpm[0], o.offset[0], 0.0, s, bed);
             chars += r.dist;
             std::printf("%s noise %d %.0f s %d chars\n", o.cfg.c_str(), s, o.noise_only_s, r.dist);
+            if (o.time) std::fprintf(stderr, "time %s noise %d audio %.3f decode %.4f\n", o.cfg.c_str(), s, r.audio_s, r.decode_s);
             if (o.show) std::printf("   hyp: %s\n", r.hyp.c_str());
         }
         std::printf("%s noise total: %.0f characters per hour\n", o.cfg.c_str(),
@@ -1204,6 +1220,9 @@ int main(int argc, char **argv) {
                     std::printf("%s %.0f %.1f %.1f %d %zu %d %zu %d\n", o.cfg.c_str(), wpm, off, snr, s,
                                 r.ref_len, r.dist, r.pay_len, r.pay_dist);
                     if (o.show) std::printf("   ref: %s\n   hyp: %s\n", r.ref.c_str(), r.hyp.c_str());
+                    if (o.time)
+                        std::fprintf(stderr, "time %s %.0f %.1f %d audio %.3f decode %.4f\n", o.cfg.c_str(), wpm, snr, s,
+                                     r.audio_s, r.decode_s);
                     std::fflush(stdout);
                 }
     return 0;

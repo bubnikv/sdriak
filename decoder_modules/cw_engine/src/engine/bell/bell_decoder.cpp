@@ -235,6 +235,7 @@ void BellDecoder::reset() {
     m_whi = m_cfg.wpm_max;
     unlock_speed();
     m_slock_idle_s = 0.0f;
+    m_run_s = m_run_pmax = 0.0f;
     restart();
 
     // NOISE's DATA.
@@ -433,7 +434,7 @@ double BellDecoder::xtrans(int ielem, float d0, int irate) const {
     if (ielem == kPause) alpha = 14.0f * kAparm[2];
     else if (ielem == kWordSpace) alpha = 7.0f * kAparm[1];
     else alpha = static_cast<float>(mscale) * kAparm[0];
-    if (ielem != kPause) alpha *= m_cfg.dur_sharpness;
+    if (ielem != kPause) alpha *= m_dsharp;
 
     if (b1 <= 1.0f) {
         const float p1 = 1.0f - 0.5f * std::exp(alpha * (b1 - 1.0f));
@@ -680,6 +681,7 @@ void BellDecoder::sprob() {
     m_spdhat = 0.0f;
     m_px = 0.0f;
     float qhat = 0.0f;
+    m_end_p = m_end_pd = 0.0f;
     for (int k = 0; k < kElems; k++) {
         for (int c = 0; c < m_nq; c++) {
             for (int i = 0; i < kRates; i++) {
@@ -687,6 +689,17 @@ void BellDecoder::sprob() {
                 for (int m = 0; m < m_isave; m++) {
                     const int j = m * m_nodes + n;
                     pselem[k] += m_p[j];
+                    if (m_cfg.dur_learn && m_lambda[m] != kNone) {
+                        // the parent's element ends here: its duration
+                        // against its nominal length, in the path's dits
+                        const int e = ilami(m_lambda[m]);
+                        if (e != k && e <= kCharSpace) {
+                            const float dit = 1200.0f / static_cast<float>(m_ilrate[m]);
+                            const float d = std::fabs(m_dur[m] - kKimap[e] * dit) / dit;
+                            m_end_p += m_p[j];
+                            m_end_pd += m_p[j] * std::min(d, kLearnCap);
+                        }
+                    }
                     m_spdhat += static_cast<float>(m_ilrsav[j]) * m_p[j];
                     if (k <= kDah) m_px += m_p[j];
                     qhat += m_qval[c] * m_p[j];
@@ -708,6 +721,8 @@ void BellDecoder::unlock_speed() {
     m_slock = m_slock_s = m_sdev = m_odd = 0.0f;
     m_wlo = m_cfg.wpm_min;
     m_whi = m_cfg.wpm_max;
+    m_mad = kListingMad;
+    m_dsharp = m_cfg.dur_sharpness;
 }
 
 void BellDecoder::lock_speed() {
@@ -719,6 +734,13 @@ void BellDecoder::lock_speed() {
     // posterior cannot leave the range and does not press on it), but its
     // sure runs no longer sit near 1 or 3 locked dits. When their average
     // misfit passes kOddRelease, the range opens and a new average starts.
+    // dur_learn: the ended elements' distance from their nominal length
+    // (SPROB), weighted by their mass, averaged into XTRANS's scale
+    if (m_cfg.dur_learn && locked && m_end_p > 0.0f) {
+        const float w = kLearnGain * std::min(m_end_p, 1.0f);
+        m_mad += w * (m_end_pd / m_end_p - m_mad);
+        m_dsharp = m_cfg.dur_sharpness * std::clamp(kListingMad / std::max(m_mad, 1e-3f), 1.0f, m_cfg.dur_learn_max);
+    }
     if (m_px > 0.5f) {
         m_run_s += dt;
         m_run_pmax = std::max(m_run_pmax, m_px);
