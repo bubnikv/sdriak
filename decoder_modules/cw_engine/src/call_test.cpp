@@ -331,6 +331,50 @@ int main() {
                                     !addr[i].calling);
             delete x;
         }
+
+        // The CQ window belongs to the call it names; name-and-number
+        // exchanges (ok1hra/skimmer-for-linux fefec9a: CWT 2026-11-18,
+        // callers answering on a runner's frequency were spotted there as
+        // calling). Upstream's vectors.
+        static const struct { const char *text, *call; bool calling, addressed; const char *what; }
+        named[] = {
+            { "CQ CWT SP3FSM PA3AAV PA3AAV ", "PA3AAV", false, false,
+                "a caller right after the runner's CQ does not inherit it (PA3AAV)" },
+            { "CQ CWT SP3FSM SP3FSM ", "SP3FSM", true, false,
+                "the runner its window names stays calling (SP3FSM)" },
+            { "CQ TEST DL1AB DL1ABC DL1ABC ", "DL1ABC", true, false,
+                "the named call's longer reading keeps the window (DL1AB → DL1ABC)" },
+            { "CQ CWT KY4GS · K5QR K5QR AMANDA 32T8 ", "K5QR", false, false,
+                "a caller after the over break, garbled number: not calling (K5QR)" },
+            // the runner's call lost: the window names nobody, the caller first
+            { "CQ CWT · PA3AAV PA3AAV GE GERT 2624 ", "PA3AAV", false, true,
+                "<call> GE <name> <number> past the over break: worked (PA3AAV)" },
+            { "CQ CWT · W0RLD W0RLD BRUCE NC ", "W0RLD", false, true,
+                "<call> <name> <state> past the over break: worked (W0RLD)" },
+            { "CQ CWT · W0RLD W0RLD ", "W0RLD", true, false,
+                "… without the exchange it still counts as calling (W0RLD)" },
+            { "CQ DE DL1ABC DL1ABC NAME HANS ", "DL1ABC", true, false,
+                "a QSO's NAME HANS is no exchange — still calling (DL1ABC)" },
+        };
+        for (unsigned i = 0; i < std::size(named); i++) {
+            x = new SkimCallsignExtractor(scp, ccfg);
+            x->feed(named[i].text);
+            cq = !named[i].calling;
+            s = best_into(x, got, sizeof(got), &cq);
+            check(named[i].what, strcmp(got, named[i].call) == 0 && cq == named[i].calling &&
+                                     x->addressed(named[i].call) == named[i].addressed);
+            delete x;
+        }
+
+        // an over keyed as one token (OK1BR fa0a20a, IQ fixture 2026-09-11,
+        // 14040.00): the fused run takes it apart
+        x = new SkimCallsignExtractor(scp, ccfg);
+        x->feed("CQCQCQDEEA5JQFEA5JQFK ");
+        cq = false;
+        s = best_into(x, got, sizeof(got), &cq);
+        check("an over as one token: CQCQCQDEEA5JQFEA5JQFK → EA5JQF",
+              strcmp(got, "EA5JQF") == 0);
+        delete x;
     }
 
     // -- degenerate fist: gaps around the markers collapse (2026-07-16) ----------

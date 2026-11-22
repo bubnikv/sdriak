@@ -180,6 +180,25 @@ struct CwCallReaderConfig {
     double min_margin = 3.0;           // SKIM_V3_KWS_SEP: … and beat the runner-up
                                        // by this much
     bool   debug = false;              // SKIM_V3_KWS_DEBUG
+    // The precision rules (upstream v3.1, ok1hra/skimmer-for-linux c4048b3 +
+    // c61ffe6): live 2026-11-15..17, 40 of 64 bust pairs and most of the
+    // calls nobody else confirmed came from the reader, every one a
+    // MASTER.SCP call — a cut head of an unknown true call (SM5D for
+    // SM5DAJ) or a short call fitted into noise (E2E, G4G). "0" turns
+    // RIVAL or TWO off, which is upstream's v0.8.0 v3.
+    bool   rival = true;               // SKIM_V3_KR_RIVAL: the window's own call-
+                                       // shaped text (tokens and 2-3 torn joins,
+                                       // known to MASTER.SCP or not) competes with
+                                       // the winner and must lose by the margin
+    bool   two = true;                 // SKIM_V3_KR_TWO: a call the text does not
+                                       // support (near a fragment only, or the hit
+                                       // memory only) and a short one (≤ 4) the
+                                       // text did not read exactly need two reads
+                                       // in separate windows; a memory-only fit is
+                                       // no read
+    bool   cqx = false;                // SKIM_V3_KR_CQX=1: a CQ found in the audio
+                                       // alone goes only with a call the text read
+                                       // exactly (upstream: built, not measured)
 };
 
 // --- v3 only (docs/CW-V3.md) -----------------------------------------------------

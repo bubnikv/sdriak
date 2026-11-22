@@ -459,6 +459,8 @@ SkimCallsignConfig SkimCallsignConfig::from_env(SkimCallsignConfig c) {
     if ((e = std::getenv("SKIM_CALL_EXCH"))) { c.exch = on(e); }
     if ((e = std::getenv("SKIM_CALL_DESPACE"))) { c.despace = on_unless_0(e); }
     if (std::getenv("SKIM_DESPACE_DEBUG")) { c.despace_debug = true; }
+    if ((e = std::getenv("SKIM_CALL_CQNAMED"))) { c.cqnamed = on_unless_0(e); }
+    if ((e = std::getenv("SKIM_CALL_NAMEEXCH"))) { c.nameexch = on_unless_0(e); }
     return c;
 }
 
@@ -535,6 +537,13 @@ struct SkimCallsignExtractorState {
     bool cq_half;                            // last token was a lone "C"
     bool tu_win;                             // the open window is a TU's
     SkimCall tu_call;                               // the call that TU blessed
+    SkimCall cq_named;                              // cqnamed: the call the open
+                                                    // window named first
+    SkimCall ex_call;                               // nameexch: the call a name and
+                                                    // a number may follow
+    int      ex_state;                              // 0 idle, 1 after the call, 2
+                                                    // after the name
+    bool     ex_greet;                              // a GE/GM/GA/GN already taken
     unsigned    tok_n;                              // tokens processed (age clock)
     int64_t   now_us;                             // caller's clock (set_now)
     SkimCall prev_tok;                              // previous token (join hyp.)
@@ -569,6 +578,7 @@ struct SkimCallsignExtractorState {
     bool run_ambiguous(const char *call, char trail) const;
     bool run_close(char trail);
     bool fused_split(const char *tok);
+    bool fused_over(const char *tok);
     bool cand_has(const char *call) const;
     bool glue_split(const char *tok);
     void take_token(const char *tok);
@@ -609,6 +619,10 @@ void SkimCallsignExtractor::reset() {
     x->held_d     = x->d_flush = false;
     x->tu_win     = false;
     x->tu_call.clear();
+    x->cq_named.clear();
+    x->ex_call.clear();
+    x->ex_state   = 0;
+    x->ex_greet   = false;
     x->over.clear();
     x->over_toks = " ";
     x->tok_n      = 0;
@@ -988,6 +1002,57 @@ static size_t fused_repeat(const SkimCallsignDict *d, const char *r, size_t rn, 
     return len;
 }
 
+// A whole over keyed as ONE token, every gap closed (OK1BR/skimmer-for-linux
+// fa0a20a: EA5JQF, IQ fixture of 2026-09-11, 14040.00, "CQCQCQDEEA5JQFEA5JQFK"
+// twice in 180 s, the station never in the table). fused_split() wants three
+// copies of a call MASTER.SCP does not know; this shape takes two, because
+// it must cover the whole token: an optional CQ chain, DE, one valid call
+// keyed at least twice back to back, then nothing or a closing word. The
+// repeat makes it safe — "DEEA5JQFK" reads as EA5JQF and a K just as well
+// as EA5JQFK, a doubled call one way only — and the shortest call that fits
+// is the call ("DEK1AK1A" is K1A twice). The words then go through
+// take_token() one by one, scored as if the gaps had been keyed.
+bool SkimCallsignExtractorState::fused_over(const char *tok) {
+    static const char *const kClose[] = { "K", "KN", "AR", "ARK", "+", "+K", "PSEK" };
+    char buf[kMaxFusedLength + 1];
+    const size_t n = skim_strlcpy(buf, tok, sizeof(buf));
+    if (n >= sizeof(buf))
+        return false;
+    // the over-break mark glued to the last character, as in take_token()
+    const bool marked = n > 2 && strcmp(buf + n - 2, "\xC2\xB7") == 0;
+    if (marked) { buf[n - 2] = '\0'; }
+    if (SkimCallsign::is_valid(buf))
+        return false;                              // a real call stays whole
+    const char *p = buf;
+    bool cq = false;
+    for (; p[0] == 'C' && p[1] == 'Q'; p += 2) { cq = true; }
+    if (p[0] != 'D' || p[1] != 'E')
+        return false;
+    p += 2;
+    const size_t len = strlen(p);
+    for (size_t l = 3; l < CALL_BUF_LEN && 2 * l <= len; l++) {
+        char call[CALL_BUF_LEN];
+        memcpy(call, p, l);
+        call[l] = '\0';
+        unsigned r = 1;
+        while (strncmp(p + r * l, call, l) == 0) { r++; }
+        if (r < 2 || !SkimCallsign::is_valid(call))
+            continue;
+        const char *close = p + r * l;
+        bool closed = close[0] == '\0';
+        for (const char *w : kClose) { closed = closed || strcmp(close, w) == 0; }
+        if (!closed)
+            continue;
+        if (cq) { take_token("CQ"); }
+        take_token("DE");
+        for (unsigned i = 0; i < r; i++) { take_token(call); }
+        if (close[0]) { prev_tok.clear(); }       // nothing joins across it
+        if (marked) { take_token("\xC2\xB7"); }
+        return true;
+    }
+    return false;
+}
+
 bool SkimCallsignExtractorState::fused_split(const char *tok) {
     const size_t n = strlen(tok);
     if (n < 8 || n > kMaxFusedLength)
@@ -1081,7 +1146,40 @@ void SkimCallsignExtractorState::take_token(const char *tok) {
         prev_gap = !prev_tok.empty();
         // a CQ window that runs past an over break may be someone else's
         if (cq_recent <= kCqWindowTokens) { cq_broken = true; }
+        ex_state = 0;
         return;
+    }
+    // nameexch: "<call> [GE] <name> <number | state>" with no over break
+    // between — a name-and-number exchange carries no RST for the report
+    // rule below; the call is being worked (addressed), which withdraws a CQ
+    // window that reached it across an over break ("CQ CWT · PA3AAV GE GERT
+    // 2624", the runner's own call not read).
+    if (cfg.nameexch && ex_state > 0) {
+        const size_t n = strlen(tok);
+        size_t alpha = 0, digit = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (std::isalpha(static_cast<unsigned char>(tok[i]))) { alpha++; }
+            else if (std::isdigit(static_cast<unsigned char>(tok[i]))) { digit++; }
+        }
+        const bool word = alpha == n && !join_stop_word(tok) && strcmp(tok, "CQ") != 0 &&
+                          strcmp(tok, "DE") != 0 && strcmp(tok, "CWT") != 0 && strcmp(tok, "DX") != 0;
+        const bool greet = strcmp(tok, "GE") == 0 || strcmp(tok, "GM") == 0 || strcmp(tok, "GA") == 0 ||
+                           strcmp(tok, "GN") == 0;
+        if (ex_state == 1 && greet && !ex_greet) {
+            ex_greet = true;                       // "PA3AAV GE GERT 2624"
+        } else if (ex_state == 1 && word && n >= 2 && n <= 10 && !call_ok(dict.get(), tok)) {
+            ex_state = 2;                          // the name
+        } else if (ex_state == 2 && ((digit == n && n >= 1 && n <= 5) || (word && n >= 2 && n <= 3))) {
+            for (unsigned i = 0; i < ncand; i++) { // the number or state: worked
+                if (cand[i].call == ex_call) {
+                    cand[i].addressed = true;
+                    break;
+                }
+            }
+            ex_state = 0;
+        } else {
+            ex_state = 0;
+        }
     }
     // A report right after a call, no over break between: that call is being
     // ADDRESSED — the runner answering a caller (Cand::calling).
@@ -1100,7 +1198,7 @@ void SkimCallsignExtractorState::take_token(const char *tok) {
             if (tok[head]) { take_token(tok + head); }
             return;
         }
-        if (cfg.fused && fused_split(tok))
+        if (cfg.fused && (fused_split(tok) || fused_over(tok)))
             return;
     }
     if (cfg.glue && glue_split(tok))
@@ -1119,7 +1217,10 @@ void SkimCallsignExtractorState::take_token(const char *tok) {
         cq_half = true;
     } else if (cq_half && tok[0] == 'Q' && tok[1] == '\0') {
         cq_half = false;
-        if (++cq_pairs >= 2) { cq_recent = 0; }
+        if (++cq_pairs >= 2) {
+            cq_recent = 0;
+            cq_named.clear();
+        }
     } else {
         cq_half  = false;
         cq_pairs = 0;
@@ -1166,6 +1267,7 @@ void SkimCallsignExtractorState::take_token(const char *tok) {
         // the window ages before the next token reads it: kCqWindowTokens - 1
         // leaves exactly that one token inside
         cq_recent = is_tu && tu_mode == 2 ? kCqWindowTokens - 1 : 0;
+        cq_named.clear();
         tu_win = is_tu && tu_mode == 2;
         cq_broken = false;
         if (strcmp(tok, "TU") != 0 && !prev_tok.empty()) {
@@ -1204,7 +1306,21 @@ void SkimCallsignExtractorState::take_token(const char *tok) {
 
     const bool valid = call_ok(dict.get(), tok) && strlen(tok) < CALL_BUF_LEN;
     const bool de_now = de_pending > 0;
-    const bool cq_now = cq_recent <= kCqWindowTokens;
+    bool cq_now = cq_recent <= kCqWindowTokens;
+    // cqnamed: the window belongs to the call it names first; the named call
+    // itself, its torn head or its longer reading inherits it, a different
+    // call (the caller answering the runner on its frequency) does not
+    // (live 2026-11-18, CWT: 87 % of the spots still off RBN's frequency sat
+    // on a runner's frequency)
+    if (cq_now && valid && cfg.cqnamed) {
+        const std::string_view a(tok), b = cq_named.view();
+        const bool same = a == b || (!b.empty() && (a.compare(0, b.size(), b) == 0 || b.compare(0, a.size(), a) == 0));
+        if (cq_named.empty()) {
+            cq_named.assign(tok);
+        } else if (!same) {
+            cq_now = false;                        // an answer, not the caller
+        }
+    }
     if (tu_win) {
         if (cq_now && valid) { tu_call.assign(tok); }
         if (!cq_now) { tu_win = false; }
@@ -1291,6 +1407,11 @@ void SkimCallsignExtractorState::take_token(const char *tok) {
 
     cand_add(tok, 1, de_now, cq_now);
     de_pending = 0;
+    if (cfg.nameexch) {
+        ex_call.assign(tok);
+        ex_state = 1;
+        ex_greet = false;
+    }
 }
 
 // SKIM_CALL_DESPACE=1 — the torn run, the fused run's mirror. A fist whose

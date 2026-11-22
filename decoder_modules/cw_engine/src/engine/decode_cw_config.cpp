@@ -112,6 +112,9 @@ CwDecoderConfig cw_config_from_env(CwDecoderConfig c, int version) {
         if (set_nonempty(e = env("SKIM_V3_KWS_DC"))) { c.v3.reader.min_score = std::strtod(e, nullptr); }
         if (set_nonempty(e = env("SKIM_V3_KWS_SEP"))) { c.v3.reader.min_margin = std::strtod(e, nullptr); }
         if (env("SKIM_V3_KWS_DEBUG")) { c.v3.reader.debug = true; }
+        if (set_nonempty(e = env("SKIM_V3_KR_RIVAL"))) { c.v3.reader.rival = std::strtod(e, nullptr) != 0.0; }
+        if (set_nonempty(e = env("SKIM_V3_KR_TWO"))) { c.v3.reader.two = std::strtod(e, nullptr) != 0.0; }
+        if (set_nonempty(e = env("SKIM_V3_KR_CQX"))) { c.v3.reader.cqx = std::strtod(e, nullptr) != 0.0; }
     }
     return c;
 }

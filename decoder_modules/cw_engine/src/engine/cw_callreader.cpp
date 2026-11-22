@@ -19,20 +19,76 @@ static bool looks_like_call(const char *w) {
     return dig && let && n >= 3 && n <= SkimCall::kMaxLength;
 }
 
-static void add_candidate(SkimCall *cand, unsigned *nc, const char *w) {
-    if (*nc >= CwCallReader::kMaxCandidates || !looks_like_call(w))
+// Where a candidate came from (bits; upstream v3.1's KO_*): read exactly as
+// a token, as a join of torn tokens, as a glued token's inner call; a
+// dictionary call near a call-shaped token; near a fragment or a join only;
+// the hit memory.
+enum : uint8_t {
+    kFromToken = 1, kFromJoin = 2, kFromInner = 4, kFromNear = 8, kFromFragment = 16, kFromMemory = 32,
+    kFromRead = kFromToken | kFromJoin | kFromInner,
+    kFromText = kFromRead | kFromNear,
+};
+
+static void add_candidate(SkimCall *cand, uint8_t *from, unsigned *nc, const char *w, uint8_t bit) {
+    if (!looks_like_call(w))
         return;
-    if (std::any_of(cand, cand + *nc, [&](const SkimCall &c) { return c == w; }))
-      return;
+    for (unsigned i = 0; i < *nc; i++) {
+        if (cand[i] == w) {
+            from[i] |= bit;
+            return;
+        }
+    }
+    if (*nc >= CwCallReader::kMaxCandidates)
+        return;
+    from[*nc] = bit;
     cand[(*nc)++].assign(w);
 }
 
-static void add_near_calls(const SkimCallsignDict *d, SkimCall *cand, unsigned *nc, const char *w) {
+// The dictionary's calls near w: w itself (when known) as `self`, the others
+// as `bit`.
+static void add_near_calls(const SkimCallsignDict *d, SkimCall *cand, uint8_t *from, unsigned *nc, const char *w,
+                           uint8_t self, uint8_t bit) {
     if (strlen(w) < 3 || !SkimCall::fits(w))
         return;
     SkimCall near[MAX_NEAR_CALLS];
     const unsigned nn = d ? d->near(w, near, MAX_NEAR_CALLS) : 0;
-    for (unsigned i = 0; i < nn; i++) { add_candidate(cand, nc, near[i].c_str()); }
+    for (unsigned i = 0; i < nn; i++) { add_candidate(cand, from, nc, near[i].c_str(), near[i] == w ? self : bit); }
+}
+
+// Levenshtein distance of a and b, or limit + 1 once it exceeds limit
+// (upstream feed_gate.c).
+static int edit_distance(const char *a, const char *b, int limit) {
+    const int la = static_cast<int>(strlen(a)), lb = static_cast<int>(strlen(b));
+    if (std::abs(la - lb) > limit || lb >= 31)
+        return limit + 1;
+    int prev[32], cur[32];
+    for (int j = 0; j <= lb; j++) { prev[j] = j; }
+    for (int i = 1; i <= la; i++) {
+        cur[0] = i;
+        int lo = cur[0];
+        for (int j = 1; j <= lb; j++) {
+            cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1] ? 1 : 0) });
+            lo = std::min(lo, cur[j]);
+        }
+        if (lo > limit)
+            return limit + 1;
+        std::copy(cur, cur + lb + 1, prev);
+    }
+    return prev[lb];
+}
+
+// How a and b differ (upstream skim_feed_gate_similar): one the head or the
+// tail of the other — the length difference; else the edit distance up to k;
+// −1 when they are equal, shorter than 3, or further apart.
+static int call_similarity(const char *a, const char *b, int k) {
+    const std::string_view x(a), y(b);
+    if (x == y || std::min(x.size(), y.size()) < 3)
+        return -1;
+    const std::string_view &lo = x.size() < y.size() ? x : y, &hi = x.size() < y.size() ? y : x;
+    if (hi.compare(0, lo.size(), lo) == 0 || hi.compare(hi.size() - lo.size(), lo.size(), lo) == 0)
+        return static_cast<int>(hi.size() - lo.size());
+    const int d = edit_distance(a, b, k);
+    return d <= k ? d : -1;
 }
 
 // The forced-alignment score of `call` over the window, minus the free
@@ -86,33 +142,38 @@ void CwCallReader::read(const CwReadView &v, const CwCallReaderConfig &cfg) {
     for (unsigned i = 0; i + 1 < nt; i++) {             // torn "C Q"
         if (tok[i] == "C" && tok[i + 1] == "Q") { calling = true; }
     }
+    uint8_t from[kMaxCandidates] = {};
     for (unsigned i = 0; i < nt; i++) {
-        if (v.dict && v.dict->has(tok[i].c_str())) { add_candidate(cand, &nc, tok[i].c_str()); }
+        if (v.dict && v.dict->has(tok[i].c_str())) { add_candidate(cand, from, &nc, tok[i].c_str(), kFromToken); }
     }
     for (unsigned i = 0; i < nt; i++) {
-        add_near_calls(v.dict, cand, &nc, tok[i].c_str());
+        add_near_calls(v.dict, cand, from, &nc, tok[i].c_str(), kFromToken,
+                       looks_like_call(tok[i].c_str()) ? kFromNear : kFromFragment);
         char j[48];
         skim_strlcpy(j, tok[i].c_str(), sizeof(j));
         for (unsigned k = i + 1; k < std::min(nt, i + 3); k++) {   // torn: 2-3 joined
             skim_strlcat(j, tok[k].c_str(), sizeof(j));
-            if (strlen(j) >= 3 && strlen(j) <= 10) { add_near_calls(v.dict, cand, &nc, j); }
+            if (strlen(j) >= 3 && strlen(j) <= 10) { add_near_calls(v.dict, cand, from, &nc, j, kFromJoin, kFromFragment); }
         }
         const unsigned L = static_cast<unsigned>(tok[i].size());
         if (L >= 7) {                                     // glued: inner calls
             for (unsigned a = 0; a < L; a++) {
                 for (unsigned n = 4; n <= 8 && a + n <= L; n++) {
                     const SkimCall sub(tok[i].view().substr(a, n));
-                    if (v.dict && v.dict->has(sub.c_str())) { add_candidate(cand, &nc, sub.c_str()); }
+                    if (v.dict && v.dict->has(sub.c_str())) { add_candidate(cand, from, &nc, sub.c_str(), kFromInner); }
                 }
             }
         }
     }
     for (unsigned i = 0; i < kHitSlots; i++) {
         if (!m_confirmed[i].call.empty() && t - m_confirmed[i].last_read < static_cast<uint64_t>(kHoldSeconds * v.rate)) {
-            add_candidate(cand, &nc, m_confirmed[i].call.c_str());
+            add_candidate(cand, from, &nc, m_confirmed[i].call.c_str(), kFromMemory);
         }
     }
-    if (calling) { m_calling_seen = t + 1; }          // text CQ, even with no call
+    if (calling) {                                    // text CQ, even with no call
+        m_calling_seen = t + 1;
+        m_calling_text_seen = t + 1;
+    }
     if (!nc)
         return;
 
@@ -161,6 +222,7 @@ void CwCallReader::read(const CwReadView &v, const CwCallReaderConfig &cfg) {
     double nb = -1e9;
     const char *nbc = "-";
     SkimCall near[MAX_NEAR_CALLS];
+    SkimCall rival;
     if (bi >= 0 && best >= cfg.min_score) {
         // the control: every dictionary call two edits from the winner, and
         // every other candidate — a busted twin must lose by SKIM_V3_KWS_SEP
@@ -184,6 +246,37 @@ void CwCallReader::read(const CwReadView &v, const CwCallReaderConfig &cfg) {
                 nbc = near[i].c_str();
             }
         }
+        if (cfg.rival) {
+            // The text's own reading competes too, known or not: a valid call
+            // the free text read (or tore into 2-3 tokens) that the winner is
+            // a cut, a glue or a near misread of. SM5DAJ read as "SM5D AJ"
+            // must not lose its tail to the dictionary's SM5D, nor a clean
+            // EA3CE turn into TA3CE. A rival only blocks; an unknown call is
+            // never said.
+            unsigned nr = 0;
+            for (unsigned i = 0; i < nt && nr < kMaxRivals; i++) {
+                char j[48] = "";
+                for (unsigned q = i; q < std::min(nt, i + 3) && nr < kMaxRivals; q++) {
+                    skim_strlcat(j, tok[q].c_str(), sizeof(j));
+                    if (!SkimCall::fits(j))
+                        break;
+                    if (!looks_like_call(j) || cand[bi] == j || !SkimCallsign::is_valid(j))
+                        continue;
+                    const int d = call_similarity(j, cand[bi].c_str(), 2);
+                    if (d < 0 || d > 3)
+                        continue;
+                    if (std::any_of(cand, cand + nc, [&](const SkimCall &c) { return c == j; }))
+                        continue;
+                    const double v = score_call(llr_sum, k, prefix, suffix, scratch1, scratch2, j) - F;
+                    nr++;
+                    if (v > nb) {
+                        nb = v;
+                        rival.assign(j);
+                        nbc = rival.c_str();
+                    }
+                }
+            }
+        }
     }
     double cq = -1e9;
     const bool found = bi >= 0 && best >= cfg.min_score && best - nb >= cfg.min_margin;
@@ -197,7 +290,12 @@ void CwCallReader::read(const CwReadView &v, const CwCallReaderConfig &cfg) {
         calling = cq >= -3.0;
     }
     if (calling) { m_calling_seen = t + 1; }
-    calling = m_calling_seen && t + 1 - m_calling_seen <= static_cast<uint64_t>(kCqSeconds * v.rate);
+    const uint64_t cq_window = static_cast<uint64_t>(kCqSeconds * v.rate);
+    calling = m_calling_seen && t + 1 - m_calling_seen <= cq_window;
+    // cqx: the audio's CQ vouches only for a call the text read
+    if (calling && cfg.cqx && bi >= 0 && !(from[bi] & kFromRead)) {
+        calling = m_calling_text_seen && t + 1 - m_calling_text_seen <= cq_window;
+    }
     if (cfg.debug && bi >= 0) {
         std::fprintf(stderr, "kws: %.2f %.1f %s dC %.1f next %s %.1f cq %d(%.1f) cands %u%s\n",
                    static_cast<double>(t) / v.rate, v.freq_hz, cand[bi].c_str(), best, nbc, nb, calling, cq,
@@ -217,12 +315,18 @@ void CwCallReader::read(const CwReadView &v, const CwCallReaderConfig &cfg) {
         m_confirmed[hi] = {};
         m_confirmed[hi].call = cand[bi];
     }
-    if (m_confirmed[hi].reads == 0 || t - m_confirmed[hi].last_read >= static_cast<uint64_t>(ns)) {
+    // two: a fit only the hit memory proposed is no new read — the memory
+    // must not confirm (nor keep alive) what it remembers
+    const bool memory_only = cfg.two && from[bi] == kFromMemory;
+    if (!memory_only && (m_confirmed[hi].reads == 0 || t - m_confirmed[hi].last_read >= static_cast<uint64_t>(ns))) {
         m_confirmed[hi].reads++;
         m_confirmed[hi].last_read = t;
     }
     m_confirmed[hi].best_score = std::max(m_confirmed[hi].best_score, best);
-    const bool sure = m_confirmed[hi].reads >= 2 || (best >= -2.0 && best - nb >= 5.0);
+    // … and a call the text does not support, or a short one it did not read
+    // exactly, has no once-by-far path: two separate reads
+    const bool need_two = cfg.two && (!(from[bi] & kFromText) || (cand[bi].size() <= 4 && !(from[bi] & kFromRead)));
+    const bool sure = m_confirmed[hi].reads >= 2 || (!need_two && best >= -2.0 && best - nb >= 5.0);
     const bool due = m_confirmed[hi].last_sent == 0 ||
                          t - m_confirmed[hi].last_sent >= static_cast<uint64_t>(kRepeatSeconds * v.rate);
     if (sure && due && !m_fix_phrase[0]) {

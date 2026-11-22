@@ -71,6 +71,16 @@ struct SkimCallsignConfig {
     bool despace = true;        // SKIM_CALL_DESPACE: an over read with its
                                 // spaces dropped (since v0.6.0)
     bool despace_debug = false; // SKIM_DESPACE_DEBUG: print each despace hit
+    // ok1hra/skimmer-for-linux fefec9a (upstream v0.8.8), both on by default
+    // (live taps, CWT evening: 1011 → 923 spots, 68 → 56 over 150 Hz off RBN;
+    // of CW Skimmer Server's stations 263 → 260 found):
+    bool cqnamed = true;        // SKIM_CALL_CQNAMED: a CQ window belongs to the
+                                // call it names first; another call later in it
+                                // ("CQ CWT SP3FSM PA3AAV": the caller answering)
+                                // does not inherit it
+    bool nameexch = true;       // SKIM_CALL_NAMEEXCH: "<call> [GE] <name>
+                                // <number>" (CWT, SST, FOC) marks the call worked
+                                // (addressed), as a report does
 
     // (Two overloads, not a `base = {}` default argument: a default argument
     // of the class's own type inside the class needs its default member

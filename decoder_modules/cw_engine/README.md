@@ -17,6 +17,7 @@ classical v1 decoder (`decode_cw.c`) and its neural over re-reader
 |---|---|
 | Upstream | [ok1hra/skimmer-for-linux](https://github.com/ok1hra/skimmer-for-linux), the headless fork by Dan Pech, OK1HRA, of [OK1BR/skimmer-for-linux](https://github.com/OK1BR/skimmer-for-linux) by Richard Fakenberg, OK1BR |
 | Pinned commit | `03beb5b330bd4f6e57667ada51cf6012817eab50` (release v0.8.0) |
+| Followed since | the decoder subset to `c9370cd` (v0.8.8): `c4048b3` + `c61ffe6` (v3.1, the call reader's precision rules `SKIM_V3_KR_RIVAL`, `_TWO`, `_CQX`), `fefec9a` (the extractor's `SKIM_CALL_CQNAMED`, `SKIM_CALL_NAMEEXCH`); from OK1BR `fa0a20a` (an over keyed as one token, `fused_over()`) |
 | Licence | GPL-3.0-or-later, as upstream |
 
 The decoders were tuned and measured by OK1HRA against CW Skimmer Server
@@ -267,8 +268,8 @@ The files map one to one, but upstream's diffs speak GLib, so they are
 ported by hand rather than applied:
 
 ```sh
-# in the upstream clone: what changed since the pinned commit
-git diff 03beb5b <new> -- src/engine/decode.h src/engine/decode_cw.h \
+# in the upstream clone: what changed since the last commit followed
+git diff c9370cd <new> -- src/engine/decode.h src/engine/decode_cw.h \
     src/engine/decode_cw_v2.c src/engine/decode_cw_v3.c \
     src/engine/callsign.[ch] src/engine/oracle.[ch] \
     src/engine/channelizer.[ch] src/engine/fftw_lock.[ch] \

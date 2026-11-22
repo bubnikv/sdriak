@@ -10,6 +10,9 @@
  * within SKIM_V3_KWS_DC of the free reading and beats its dictionary neighbours by
  * SKIM_V3_KWS_SEP, twice in separate windows (or once by far), goes to the extractor
  * as a correction token — with a CQ before it when the over calls.
+ * The precision rules (CwCallReaderConfig::rival, two, cqx; upstream v3.1)
+ * make the text's own readings rivals of the winner and ask for two reads
+ * where the text does not back a call.
  *
  * Also the oracle's kws probe (SKIM_ORACLE_MODE=kws, measurement only).
  *
@@ -38,6 +41,8 @@ public:
     static constexpr auto kMaxCandidates = 16;    // calls scored per read
     static constexpr auto kMaxNearControls = 8;   // dictionary neighbours scored
                                                   // against the winner
+    static constexpr auto kMaxRivals = 8;         // the text's own readings scored
+                                                  // against it (rival rule)
     static constexpr auto kHoldSeconds = 300.0;   // a confirmed call is looked for
                                                   // this long
     static constexpr auto kRepeatSeconds = 20.0;  // a call goes out at most this
@@ -90,6 +95,7 @@ private:
     Confirmed m_confirmed[kHitSlots] = {};
     char     m_fix_phrase[48] = {};         // FIX phrase due at the next word space
     uint64_t m_calling_seen = 0;            // last CQ evidence (text or audio) + 1
+    uint64_t m_calling_text_seen = 0;       // … from the text alone + 1
 
 };
 
