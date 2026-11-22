@@ -254,8 +254,10 @@ void BellDecoder::restart() {
     m_isave = np;
     m_lambda.assign(np, 4);
     m_ilrate.resize(np);
+    // The listing's 10 … 50 WPM, inside [wpm_min, wpm_max]: a path started
+    // outside it could never move (SPDTR gives a step past a limit 0).
     for (int i = 0; i < np; i++)
-        m_ilrate[i] = (i / 5 % 5 + 1) * 10;
+        m_ilrate[i] = std::clamp((i / 5 % 5 + 1) * 10, m_cfg.wpm_min, m_cfg.wpm_max);
     m_dur.assign(np, 1000.0f);
     // The q classes take turns over the paths (one class: all 0).
     m_qcls.resize(np);
@@ -268,7 +270,7 @@ void BellDecoder::restart() {
     m_p.assign(nn, 1.0f);
     m_lamsav.assign(nn, 4);
     m_dursav.assign(nn, 0.0f);
-    m_ilrsav.assign(nn, 20);
+    m_ilrsav.assign(nn, std::clamp(20, m_cfg.wpm_min, m_cfg.wpm_max));
     m_lkhd.assign(nn, 0.0f);
     m_pin.assign(nn, 0.0f);
     m_psav_node.assign(nn, 0.0f);
@@ -426,6 +428,7 @@ double BellDecoder::xtrans(int ielem, float d0, int irate) const {
     if (ielem == kPause) alpha = 14.0f * kAparm[2];
     else if (ielem == kWordSpace) alpha = 7.0f * kAparm[1];
     else alpha = static_cast<float>(mscale) * kAparm[0];
+    if (ielem != kPause) alpha *= m_cfg.dur_sharpness;
 
     if (b1 <= 1.0f) {
         const float p1 = 1.0f - 0.5f * std::exp(alpha * (b1 - 1.0f));

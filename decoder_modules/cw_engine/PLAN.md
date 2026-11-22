@@ -238,6 +238,32 @@ repair weights (`:repw`):
 | 0.05 / 30 | 0.005 / 0.022 | 0.006 / 0.009 | −1.73 / −0.29 | 0.117 / 0.024 |
 | 0.01 / 100 | 0.010 / 0.014 | 0.008 / 0.014 | −2.05 / −0.34 | 0.106 / 0.016 |
 
+**Bounds on the R-series' structure** (white noise, SNR500 for 10 % / 3 %,
+20 overs a step; the bench keys with ±3 % jitter):
+
+| | 12 WPM | 25 WPM | 35 WPM |
+|---|---|---|---|
+| R-series | −4.35 / −2.68 | −2.05 / −0.34 | −0.38 / +1.26 |
+| speed known to ±10 % (`:wpm<lo>-<hi>`) | −4.84 / −2.69 | −1.92 / −0.07 | −0.39 / — |
+| duration model 2x sharper (`:dsharp2`) | −4.61 / −3.23 | −2.07 / −1.05 | −0.61 / +1.08 |
+| … 3x sharper | −4.90 / −3.34 | −1.81 / −0.47 | −0.17 / +1.68 |
+| decision delay 2 s (`:delay400`) | −4.51 / −3.36 | −2.03 / −0.21 | −0.38 / +1.03 |
+| … 3 s | −4.65 / −3.41 | −2.03 / −0.23 | −0.38 / +0.99 |
+| 200 paths | −4.26 / −3.10 | −2.03 / −0.28 | −0.51 / +1.18 |
+| DeepCW v2 narrow | −5.82 / −4.01 | −3.67 / −1.70 | −2.13 / −0.51 |
+
+- None of them holds the 1.5 dB. The speed, known to ±10 %, gains 0.5 dB
+  at 12 WPM and nothing above; a 2x sharper duration model 0.0–0.3 dB at
+  10 % and up to 0.7 dB at 3 % on keying this regular (a real fist needs
+  it learned per station, as v3's); a longer decision 0.2–0.3 dB at
+  12 WPM; the beam is saturated at 100 paths.
+- Bell's paths started at the listing's 10–50 WPM even with a narrower
+  speed range, and with a range that excluded them decoded nothing; they
+  start inside the range now.
+- What is left: the evidence (the decimation's fold, below) and what
+  DeepCW reads beyond the elements (its context, about 0.5 dB of text
+  prior at 25 WPM by S1).
+
 CPU per 27 s over (one thread, bench and channelizer subtracted): v3
 0.05 s, the R-series 0.73 s with 100 paths and 0.12 s with 25, DeepCW v2
 narrow 0.39 s, v2 wide 3.0 s, v1 9.4 s (BELL.md, "The R-series

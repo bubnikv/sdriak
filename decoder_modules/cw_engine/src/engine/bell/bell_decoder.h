@@ -50,6 +50,9 @@ struct BellConfig {
     int    wpm_max  = 60;
     // TRELIS: the longest decode delay, in 5 ms samples (NDELAY).
     int    ndelay   = 200;
+    // XTRANS: the duration model's sharpness (α) for elements and spaces,
+    // times this; the pause keeps the listing's. 1: the listing.
+    float  dur_sharpness = 1.0f;
     // MODEL: the process noise of the amplitude's random walk while the key
     // stays down, per 5 ms sample (listing: 0.0001, about 0.14 of a unit
     // amplitude per second). Fixed in the listing; under fading the right
