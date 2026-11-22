@@ -12,8 +12,9 @@ Both run on `engine/deepcw_runtime.{h,cpp}` (the session, the sha256 pin, the
 inference workers) over `engine/ort_shim.{h,cpp}` (ONNX Runtime loaded at run
 time). This file records what upstream publishes, how the two backends
 differ from it and from each other, how the v2 narrow decoder works from the
-channel to the text ("The v2 narrow decoder, end to end"), and what is not
-measured yet.
+channel to the text ("The v2 narrow decoder, end to end"), where its
+uncertainty goes and how to carry it further ("The output and its
+uncertainty: a plan"), and what is not measured yet.
 
 ## Upstreams
 
@@ -802,6 +803,140 @@ Speed is not measured. Estimate:
 The Android build does not set `OPT_BUILD_CW_DEEPCW`, and no SDRIAK module
 constructs a DeepCW backend yet (cw_bench and the gates do). The fused path
 needs neither ONNX Runtime nor the `.onnx` file, only the weights blob.
+
+## The output and its uncertainty: a plan
+
+### What the v2 narrow model emits
+
+Per window, [T1][42] log-probabilities, one row per 32 ms output frame (30 ms
+in training): the 40 characters `, . / 0–9 ? A–Z` (0–39), the word space
+(40) and the CTC blank (41). They are CTC frame posteriors (Graves et al.
+2006), trained without alignments, and so peaky: nearly every frame is blank
+with probability near 1, even inside a character's elements, and a character
+appears as a spike of one or two frames, usually near its end. A row says
+"a C is emitted here", not "this frame is a dah"; the elements never appear
+in the output.
+
+The head is a linear map 64 → 42 and a log-softmax. Each of the 42 columns
+of its weight matrix is a template that the frame's 64-number encoder state
+is matched against (the dot product plus the class's bias); the encoder state,
+through the attention, summarises the whole window (the last element
+pattern, a character space after it, the speed). The blank's bias is large,
+which is what makes the output peaky; the characters' biases follow roughly
+their frequencies in training. The Morse knowledge is in the encoder, not
+in the head.
+
+The values are posteriors relative to one window: the same frame reads
+differently in each window that holds it, and CTC models give the winning
+class 0.9 and more even on ambiguous frames. They are not calibrated
+probabilities of the character.
+
+### Where the uncertainty goes
+
+```
+log-probs [T1][42] per window
+  │  every class's score, per frame
+  ├─ ±1-frame dilation, weighted average over the ~3 windows of each frame
+  │  still 42 scores per frame: an ensemble over windows
+  ├─ greedy CTC: argmax per frame, repeats merged, blanks dropped
+  │  LOST: the runner-up, its margin, any other reading
+  ├─ word space: a blank run ≥ 2.01 s
+  │  a hard threshold
+  ├─ confidence: the mean averaged posterior of the committed characters
+  │  one number per output, a running mean per channel (SkimDecode::confidence)
+  └─ text → callsign extractor
+     characters only; the confidence is not read
+```
+
+| Kept | Lost |
+|---|---|
+| Each frame's 42 scores, averaged over the about three windows that read it | The runner-up class and its margin at every frame (an S at 0.40 beside an H at 0.45) |
+| One confidence per output, the channel's running mean | Every reading but the best: no beam, no n-best list, no lattice |
+| | The word space's uncertainty: a blank run's length against 2.01 s, no probability |
+| | Any way for the callsign stage to revisit the evidence: a call one character off cannot be recovered from the text |
+
+v3 is the opposite: its lattice keeps per-sample log-likelihood ratios, and
+its call reader (`cw_callreader.cpp`) scores candidate calls against them by
+forced alignment, the free reading as the reference. That is where v3's
+callsign precision comes from, and DeepCW has nothing like it.
+
+### The plan
+
+In order of expected value; each is measured on cw_bench's payload CER and,
+for the callsign steps, on replays against CW Skimmer Server.
+
+| # | Step | What it does | Measure |
+|---|---|---|---|
+| U1 | A call reader on CTC posteriors | For each candidate call (the text's tokens, torn joins and glued inner calls; MASTER.SCP's calls two edits away; the calls this channel confirmed), log P(call \| frames) by the CTC forward algorithm over the averaged log-probs of the last ~6 s, against the best free reading (CTC keyword spotting). The winner must beat its runner-up, the rivals from the text included, by a margin, and two reads where the text does not support it, as v3's reader (RIVAL, TWO). Its correction goes to the extractor as v3's FIX phrase does | busts, confirmed and SCP-only stations against CW Skimmer Server; the false-correction rate on noise and on random calls |
+| U2 | Prefix beam search | Replaces the greedy read-out with a CTC prefix beam (width 8–16) over the stitcher's averaged log-probs, one continuous beam across the windows (not one per window, merged after); the beam's state, or the averaged rows, kept past the commit point, and the n best readings of each committed span kept | payload CER at 10 % / 3 %; how often the right reading is in the n-best but not first |
+| U3 | A character prior in the beam | A character n-gram over ham traffic (calls, RST, CQ, TU, 5NN, contest exchanges) and a callsign shape prior, shallow-fused into U2's scores | payload CER on QSO text against random text (the prior should help the first, not hurt the second) |
+| U4 | Per-character confidence | Each committed character carries its averaged posterior and its margin over the runner-up; the extractor weighs a token by its weakest character | busts and the share of correct calls that reach the spot threshold |
+| U5 | A soft word space | P(word space) from the blank run's length (a logistic in seconds, fitted to the bench's word and character spaces) in place of the 2.01 s threshold, entering U2's scores | glued and torn calls ("DE" + call glue at 0.64–1.0 s pauses) on the 80 m fixtures |
+| U6 | Calibration | Temperature scaling of the averaged log-probs, fitted on the bench (one parameter), so that U1–U4's thresholds mean what they say; and the class priors divided out (P(c \| x) / P(c)), so that log-probs summed over copies (U7) do not count the training priors once per copy | reliability: the share of characters correct against their posterior, in bins |
+| U7 | Joint reading of repeats | Copies of one string in separate audio ("CQ CQ DE OK1BR OK1BR K", the call in the next over, the station a minute later) read together: a candidate H scores Σ log P_CTC(H \| segment i) over its copies, so OK1BK in one copy and OKIBR in another can give OK1BR, which neither reads. Details below | the oracle-style measurement first; then busts and confirmed stations against CW Skimmer Server, and wrong merges on two-station channels |
+
+U1 is the first step: it reuses v3's candidate generation, rival rules and
+FIX path unchanged, and only the scoring function differs (the CTC forward
+algorithm in place of the lattice alignment). Its cost is small beside the
+model: about 30 candidates × 190 frames × (2 L + 1) states per read, every
+3 s.
+
+**U7, repeats against overlaps.** Two kinds of "several outputs" must be
+kept apart:
+
+- **Overlapping windows, one audio.** Each frame is read by about three
+  successive model calls, and the stitcher already averages them. Those
+  readings share the noise: they are one observation, not three. They are
+  combined by averaging (as now, then U2's continuous beam), never summed
+  as independent evidence.
+- **Repeats in time, separate audio.** The noise of two copies is mostly
+  independent, so their evidence adds: about 3 dB at the call level for
+  two copies, 4.8 dB for three (at most; threshold effects and correlated
+  fading take some of it). This is the gain U7 is after, more than U2–U5
+  together for the callsigns.
+
+How U7 searches:
+
+1. **Segments.** Word-bounded spans of the read-out that may hold the same
+   string: the shapes "X X", "DE X X K", or spans within two edits of each
+   other on the same channel within the last 60–120 s (later also the
+   station table's frequency).
+2. **Candidates scored jointly.** The union of each segment's n-best (U2),
+   MASTER.SCP's calls near them and the calls this channel confirmed;
+   each scored per segment by the CTC forward algorithm (U1's scorer) and
+   summed. Cheap: calls are ≤ 10 characters, segments 1–2 s.
+3. **A joint beam, only if needed.** For a call in no copy's n-best: one
+   prefix beam over the K segments at once, K independent CTC
+   prefix-probability tables, pruned on the summed score.
+
+Its risks and guards:
+
+- **Two stations merged.** A runner's CQ and the caller's answer share the
+  channel, and a wrong merge is a confident bust. Guards: consistency (no
+  copy may score H much below its own best reading); the text's own
+  readings as rivals, as v3's RIVAL; no merge across an over break unless
+  the copies are near identical.
+- **Posteriors are not likelihoods.** Summed over K copies the training
+  priors count K times: U6 first.
+- **Correlated errors.** A fist that always mis-keys one character, or one
+  fade over two copies, breaks the independence and the sum reinforces the
+  error: the joint margin's credit is capped.
+
+The measurement comes first: the oracle's `combine` mode
+(`SKIM_ORACLE_MODE=combine`, `oracle.h`) already lays each word v3 closes
+against the reference call and its dictionary neighbours to size what
+soft-combining repeats could carry. The same design on DeepCW's averaged
+posteriors sizes U7 before it is built. Order: U1, U2, U6, then U7 (the
+measurement, then summed candidate scores, the joint beam only if the
+measurement finds calls missing from every copy's n-best).
+
+References: Graves et al. 2006 (CTC, the forward algorithm); A. Hannun,
+A. Maas, D. Jurafsky, A. Ng, "First-Pass Large Vocabulary Continuous Speech
+Recognition using Bi-Directional Recurrent DNNs", 2014 (CTC prefix beam
+search with a language model); C. Guo, G. Pleiss, Y. Sun, K. Weinberger,
+"On Calibration of Modern Neural Networks", ICML 2017 (temperature scaling);
+K. Hwang, M. Lee, W. Sung, "Online Keyword Spotting with a Character-Level
+Recurrent Neural Network", 2015 (keywords scored on character posteriors).
 
 ## Not measured yet
 
