@@ -88,6 +88,7 @@ struct Options {
     double drift_hz_s = 0.0;           // the target's frequency drift, Hz/s
     double gain_db = 0.0;              // the whole input scaled by this, dB
     bool random_text = false;          // random groups in place of the payload
+    double wpm_step = 0.0;             // > 0: the text's second half at this speed, 2 s after the first
     double step_s = -1.0, step_db = 0.0;   // a level step at step_s (< 0: none)
     bool step_noise = false;           // … of the noise, not the target
     double agc_db = 0.0, agc_ms = 0.0; // receiver AGC: its threshold over the noise rms, its decay
@@ -195,6 +196,7 @@ bool parse_args(int argc, char **argv, Options &o) {
         else if (a == "--lead") o.lead_s = std::atof(val());
         else if (a == "--tail") o.tail_s = std::atof(val());
         else if (a == "--jitter") o.jitter = std::atof(val());
+        else if (a == "--wpm-step") o.wpm_step = std::atof(val());
         else if (a == "--edge") o.edge_ms = std::atof(val());
         else if (a == "--preamble-db") o.preamble_db = std::atof(val());
         else if (a == "--fade") { if (!parse_fade(val(), o.paths)) { std::fprintf(stderr, "bad --fade\n"); return false; } }
@@ -679,6 +681,12 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf == "mspread") c.measure_spread = true;
             else if (suf == "ofreq") c.oracle_freq = true;
             else if (suf == "ogain") c.oracle_gain = true;
+            else if (suf == "slock") c.decoder.speed_lock = true;
+            else if (suf.rfind("srel", 0) == 0) c.decoder.speed_lock_release_s = static_cast<float>(std::atof(suf.c_str() + 4));
+            else if (suf.rfind("slock", 0) == 0) {
+                c.decoder.speed_lock = true;
+                c.decoder.speed_lock_span = static_cast<float>(std::atof(suf.c_str() + 5));
+            }
             else if (suf.rfind("dsharp", 0) == 0) c.decoder.dur_sharpness = static_cast<float>(std::atof(suf.c_str() + 6));
             else if (suf.rfind("delay", 0) == 0) c.decoder.ndelay = std::atoi(suf.c_str() + 5);
             else if (suf.rfind("floor", 0) == 0) c.decoder.coh_floor_ratio = static_cast<float>(std::atof(suf.c_str() + 5));
@@ -728,7 +736,19 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
         env.assign(static_cast<size_t>(o.noise_only_s * o.rate), 0.0f);
     } else {
         r.ref = "VVV " + (o.random_text ? random_payload(rng) : payload(rng));
-        env = envelope(r.ref, wpm, o.rate, o.jitter, o.lead_s, o.edge_ms, rng);
+        if (o.wpm_step > 0) {
+            // --wpm-step: the words after the middle at the other speed,
+            // after the first half's 2 s of silence
+            size_t cut = r.ref.find(' ', r.ref.size() / 2);
+            if (cut == std::string::npos) cut = r.ref.size();
+            env = envelope(r.ref.substr(0, cut), wpm, o.rate, o.jitter, o.lead_s, o.edge_ms, rng);
+            if (cut < r.ref.size()) {
+                const auto e2 = envelope(r.ref.substr(cut + 1), o.wpm_step, o.rate, o.jitter, 0.0, o.edge_ms, rng);
+                env.insert(env.end(), e2.begin(), e2.end());
+            }
+        } else {
+            env = envelope(r.ref, wpm, o.rate, o.jitter, o.lead_s, o.edge_ms, rng);
+        }
         env.resize(env.size() + static_cast<size_t>(o.tail_s * o.rate), 0.0f);
     }
 

@@ -181,6 +181,8 @@ measured against v3 + K2 and DeepCW v2 narrow:
 | R4b | a noise floor in the score at the path's predicted mark power over 1000 (`coh_floor_ratio`, `:floor1000`), as K2's | built: 60 dB 0.099 → 0.004, 20–40 dB ≤ 0.012, fading and weak signals unchanged |
 | R5 | impulses: repair weights, the sferic anomaly | done, below: the impulse term (ε 0.01, κ 100, scoring only) and the repair weights |
 | R6 | within 1.5 dB of `dcw2n` at 12–25 WPM, no false characters: a v4 backend | — |
+| R7 | the station's speed: the paths kept within ±15 % of an average of the posterior speed (`BellConfig::speed_lock`, `:slock`) | built, below: 12 WPM +0.65 dB (3 %: +1.0), 25–35 WPM unchanged |
+| R8 | the duration model's sharpness learned per station | — |
 
 Bell with the gate and the coarse AFC, white noise, SNR500 for 10 % / 3 %
 at 12 / 25 / 35 WPM, and fading at 10 dB (ITU poor, flat 3 Hz, beat):
@@ -293,6 +295,32 @@ repair weights (`:repw`):
   DeepCW reads a fist's timing from its 8 s of context, so the fair
   equivalent is the speed and the durations' spread learned per station,
   not fixed.
+- **R7, the station's speed** (`:slock`). A slow average (4 s) of the
+  posterior speed over the samples held key-down with P > 0.9, after
+  0.5 s of them; after 2 s more the paths' speeds stay within ±15 % of
+  it, and a step past the lock's limit lands on it (dropped, as SPDTR
+  drops a step past the listing's limits, it leaves an error floor of 3 %
+  at 35 WPM on any narrow range, static or locked). Acquired only while
+  the posterior's relative spread about the average is under 0.08: on a
+  weak station it wanders (0.1–0.6) and reads a 35 WPM station at
+  8–22 WPM. Released after 1.5 s without a sure key-down sample (the gap
+  between overs), or when the sure runs' average log distance from 1 or
+  3 locked dits passes 0.38 (a speed change within an over: held in the
+  range, the posterior reads it as a consistent text at the locked speed
+  and never presses on a limit).
+
+  | SNR500, 10 % / 3 % | 12 WPM | 25 WPM | 35 WPM | 12 WPM, ±10 % jitter | 12 WPM, random text |
+  |---|---|---|---|---|---|
+  | R-series | −4.35 / −2.68 | −2.05 / −0.34 | −0.38 / +1.26 | −4.41 / −1.65 | −4.26 / −3.14 |
+  | + the speed lock | −4.99 / −3.69 | −2.04 / −0.37 | −0.37 / +1.21 | −4.82 / −3.38 | −4.72 / −3.48 |
+
+  Payload CER at 0 / 6 / 15 dB, the text's second half at another speed
+  after 2 s (bench `--wpm-step`): 25 → 15 0.017 / 0.004 / 0.005, 15 → 25
+  0.022 / 0.002 / 0.004, 12 → 30 0.024 / 0.005 / 0.002, 35 → 18 0.068 /
+  0.004 / 0.010, 20 → 28 0.032 / 0.004 / 0.000 (without the lock 0.002–
+  0.046). ITU poor at 24 WPM 0.493 / 0.100 / 0.017 at 0 / 10 / 20 dB
+  (without 0.498 / 0.100 / 0.017), ITU good 0.297 / 0.035 / 0.007 (0.307
+  / 0.042 / 0.009); no false characters on noise.
 - The decimation is not what costs at speed: every channel sample
   (250 Hz) does worse, more so the faster (an error floor of 5 % at
   25 WPM and 15 % at 35, +2 dB), and neither 200 paths nor dropping the

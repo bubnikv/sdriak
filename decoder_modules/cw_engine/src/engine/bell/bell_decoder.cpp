@@ -231,6 +231,10 @@ BellDecoder::BellDecoder(const BellConfig &cfg) : m_cfg(cfg) {
 }
 
 void BellDecoder::reset() {
+    m_wlo = m_cfg.wpm_min;
+    m_whi = m_cfg.wpm_max;
+    unlock_speed();
+    m_slock_idle_s = 0.0f;
     restart();
 
     // NOISE's DATA.
@@ -254,10 +258,10 @@ void BellDecoder::restart() {
     m_isave = np;
     m_lambda.assign(np, 4);
     m_ilrate.resize(np);
-    // The listing's 10 … 50 WPM, inside [wpm_min, wpm_max]: a path started
+    // The listing's 10 … 50 WPM, inside the range in use: a path started
     // outside it could never move (SPDTR gives a step past a limit 0).
     for (int i = 0; i < np; i++)
-        m_ilrate[i] = std::clamp((i / 5 % 5 + 1) * 10, m_cfg.wpm_min, m_cfg.wpm_max);
+        m_ilrate[i] = std::clamp((i / 5 % 5 + 1) * 10, m_wlo, m_whi);
     m_dur.assign(np, 1000.0f);
     // The q classes take turns over the paths (one class: all 0).
     m_qcls.resize(np);
@@ -270,7 +274,7 @@ void BellDecoder::restart() {
     m_p.assign(nn, 1.0f);
     m_lamsav.assign(nn, 4);
     m_dursav.assign(nn, 0.0f);
-    m_ilrsav.assign(nn, std::clamp(20, m_cfg.wpm_min, m_cfg.wpm_max));
+    m_ilrsav.assign(nn, std::clamp(20, m_wlo, m_whi));
     m_lkhd.assign(nn, 0.0f);
     m_pin.assign(nn, 0.0f);
     m_psav_node.assign(nn, 0.0f);
@@ -384,6 +388,7 @@ void BellDecoder::proces(float z, float rn, std::string &out) {
     sprob();
     m_xhat = m_px > 0.5f ? 1 : 0;
     savep();
+    lock_speed();
     trelis(out);
 }
 
@@ -470,7 +475,11 @@ double BellDecoder::spdtr(int isrt, int ilrt, int iselm, int ilelm) const {
     if (ind1 == kNone) return 0.0;
     const int israte = ilrt + (isrt - kRateHold) * idel;
     // Listing: 10 and 60 WPM; morse-wip: 5 and 80.
+    // speed_lock: a step past the lock's limit lands on it (PATH clamps the
+    // speed), so the steps keep their weights; past the listing's limits,
+    // or without the lock, it is 0, as the listing has it.
     if (israte > m_cfg.wpm_max || israte < m_cfg.wpm_min) return 0.0;
+    if (!m_cfg.speed_lock && (israte > m_whi || israte < m_wlo)) return 0.0;
     return rtrans(isrt, ind1);
 }
 
@@ -496,6 +505,7 @@ void BellDecoder::path(int ip, int lambda, float dur, int ilrate) {
             // The duration grows while the key state stays, restarts on a change.
             m_dursav[j] = dur * static_cast<float>(1 - ixs - ixl + 2 * ixs * ixl) + m_dt;
             m_ilrsav[j] = ilrate + (i - kRateHold) * memdel(ilelm, k);
+            if (m_cfg.speed_lock) m_ilrsav[j] = std::clamp(m_ilrsav[j], m_wlo, m_whi);
         }
     }
 }
@@ -692,6 +702,68 @@ void BellDecoder::sprob() {
             m_elmhat = k;
         }
     }
+}
+
+void BellDecoder::unlock_speed() {
+    m_slock = m_slock_s = m_sdev = m_odd = 0.0f;
+    m_wlo = m_cfg.wpm_min;
+    m_whi = m_cfg.wpm_max;
+}
+
+void BellDecoder::lock_speed() {
+    if (!m_cfg.speed_lock) return;
+    const float dt = m_dt * 1e-3f;
+    const bool locked = m_wlo != m_cfg.wpm_min || m_whi != m_cfg.wpm_max;
+    // The key-down runs against the locked dit: a station faster or slower
+    // than the lock reads as a consistent text at the locked speed (the
+    // posterior cannot leave the range and does not press on it), but its
+    // sure runs no longer sit near 1 or 3 locked dits. When their average
+    // misfit passes kOddRelease, the range opens and a new average starts.
+    if (m_px > 0.5f) {
+        m_run_s += dt;
+        m_run_pmax = std::max(m_run_pmax, m_px);
+    } else if (m_run_s > 0.0f) {
+        if (locked && m_run_pmax > kOddSure) {
+            const float r = m_run_s * m_slock / 1.2f;        // the run in locked dits
+            const float lr = std::log(std::max(r, 1e-3f));
+            const float odd = std::min(kOddCap, std::min(std::fabs(lr), std::fabs(lr - kLn3)));
+            m_odd += kOddGain * (odd - m_odd);
+            if (m_odd > kOddRelease) {
+                unlock_speed();
+                m_run_s = 0.0f;
+                return;
+            }
+        }
+        m_run_s = m_run_pmax = 0.0f;
+    }
+    if (m_px > kSureMark) {
+        // the first kLockSettleS the paths still spread over the listing's
+        // speeds; then a running mean, a slow average once it holds tau
+        m_slock_s += dt;
+        m_slock_idle_s = 0.0f;
+        const float held = m_slock_s - kLockSettleS;
+        if (held > 0.0f) {
+            const float w = dt / std::min(held, m_cfg.speed_lock_tau_s);
+            m_slock += w * (m_spdhat - m_slock);
+            const float d = (m_spdhat - m_slock) / std::max(m_slock, 1.0f);
+            m_sdev += w * (d * d - m_sdev);
+        }
+    } else if ((m_slock_idle_s += dt) > m_cfg.speed_lock_release_s && m_slock_s > 0.0f) {
+        // the over is over: the listing's range, and a new average
+        unlock_speed();
+        return;
+    }
+    if (m_slock_s < kLockSettleS + m_cfg.speed_lock_after_s) return;
+    // acquired only while the posterior holds steady about the average (on
+    // a weak station it wanders, and slow readings of noise pull it low)
+    if (!locked && m_sdev > m_cfg.speed_lock_dev * m_cfg.speed_lock_dev) return;
+    const int lo = std::max(m_cfg.wpm_min, static_cast<int>(std::floor(m_slock * (1.0f - m_cfg.speed_lock_span))));
+    const int hi = std::min(m_cfg.wpm_max, static_cast<int>(std::ceil(m_slock * (1.0f + m_cfg.speed_lock_span))));
+    if (lo == m_wlo && hi == m_whi) return;
+    m_wlo = lo;
+    m_whi = std::max(lo, hi);
+    // the kept paths into the range: one outside could never move
+    for (int i = 0; i < m_isave; i++) m_ilrate[i] = std::clamp(m_ilrate[i], m_wlo, m_whi);
 }
 
 // SAVEP (p. 180–183): keep the best node of each element type, then the

@@ -53,6 +53,26 @@ struct BellConfig {
     // XTRANS: the duration model's sharpness (α) for elements and spaces,
     // times this; the pause keeps the listing's. 1: the listing.
     float  dur_sharpness = 1.0f;
+    // The station's speed (PLAN.md R7): a slow average (speed_lock_tau_s)
+    // of the posterior speed over the samples the decoder holds key-down
+    // with P > 0.9; after speed_lock_after_s of them the paths' speeds are
+    // kept within ±speed_lock_span of it (inside [wpm_min, wpm_max]). A
+    // path pressing on a limit pulls the average, so the range follows the
+    // station; a step past the lock's limit lands on it. It is acquired only
+    // while the posterior's relative spread about the average is under
+    // speed_lock_dev (a weak station's wanders, 0.1–0.6, and reads slow);
+    // speed_lock_release_s without a sure key-down sample (the gap between
+    // overs, the next station's at its own speed: longer than a word space
+    // down to 6 WPM), or most recent key-down runs not fitting the locked
+    // dit (a speed change within an over: held in the range, the posterior
+    // reads it as a consistent text at the locked speed), opens it again.
+    // Off: the listing's range throughout.
+    bool   speed_lock = false;
+    float  speed_lock_span = 0.15f;
+    float  speed_lock_tau_s = 4.0f;
+    float  speed_lock_after_s = 2.0f;
+    float  speed_lock_release_s = 1.5f;
+    float  speed_lock_dev = 0.08f;
     // MODEL: the process noise of the amplitude's random walk while the key
     // stays down, per 5 ms sample (listing: 0.0001, about 0.14 of a unit
     // amplitude per second). Fixed in the listing; under fading the right
@@ -134,6 +154,15 @@ struct BellConfig {
 class BellDecoder {
 public:
     static constexpr float kSampleMs = 5.0f;     // one sample per 5 ms (200 Hz)
+    static constexpr float kSureMark = 0.9f;     // speed_lock: P(key down) of a sure mark
+    static constexpr float kLockSettleS = 0.5f;  // speed_lock: the first sure key-down seconds, not averaged
+    // speed_lock's release: a sure key-down run's (P peaking over kOddSure)
+    // misfit is its log distance from 1 or 3 locked dits, the nearer, at
+    // most kOddCap; their average (gain kOddGain, about 10 runs) over
+    // kOddRelease opens the range. A steady lock stays under 0.35 down to
+    // −5 dB and ±10 % jitter; a 1.7x or 2.5x step passes 0.45 within a
+    // second; 1.4x reaches 0.34 and slower steps 0.24 (the range follows).
+    static constexpr float kOddCap = 1.0f, kLn3 = 1.0986123f, kOddGain = 0.1f, kOddRelease = 0.38f, kOddSure = 0.99f;
     static constexpr double kRateHz  = 200.0;
 
     explicit BellDecoder(const BellConfig &cfg = BellConfig());
@@ -167,6 +196,9 @@ public:
     // Coherent, one spread class: the spread, measured on the station
     // (BellBackendConfig::measure_spread), in place of coh_spread.
     void  set_spread(float b);
+    // The paths' speed range in use (speed_lock), WPM.
+    int   speed_lo() const { return m_wlo; }
+    int   speed_hi() const { return m_whi; }
     // Coherent, measurement only: the next sample's gain, known (every path
     // takes it, zero variance) in place of the paths' own filters.
     void  set_known_gain(float re, float im) {
@@ -201,6 +233,9 @@ private:
     void   ptrans(int kelem, int irate, int lambda, int ilrate, float ptrx, float &psum,
                   float *pin, int n, float qstay, float qmove) const;
     double spdtr(int isrt, int ilrt, int iselm, int ilelm) const;
+    // speed_lock: the average, the range, and the paths kept inside it.
+    void   lock_speed();
+    void   unlock_speed();
     void   path(int ip, int lambda, float dur, int ilrate);
     void   likhd(float z, float rn, int ip, int lambda, float dur, int ilrate);
     float  kalfil(float z, int ip, float rn, int ixs, int kelem, int jnode, float dur,
@@ -236,6 +271,14 @@ private:
     float m_yr = 0.0f, m_yi = 0.0f;
     float m_wt = 0.0f;                      // the sample's repair weight
     bool  m_known = false;                  // set_known_gain(): the gain known
+    // speed_lock: the paths' range (WPM), the station's speed, seconds of
+    // sure key-down averaged into it, seconds since the last.
+    int   m_wlo = 5, m_whi = 60;
+    float m_slock = 0.0f, m_slock_s = 0.0f, m_slock_idle_s = 0.0f;
+    float m_sdev = 0.0f;                    // … the posterior's relative spread about it, squared
+    float m_run_s = 0.0f;                   // … the key-down run in progress, s
+    float m_run_pmax = 0.0f;                // … and its largest P(key down)
+    float m_odd = 0.0f;                     // … the share of recent runs that do not fit the lock
     float m_kgr = 0.0f, m_kgi = 0.0f;
     std::vector<float> m_coha;
     float m_omega = 10.0f;
