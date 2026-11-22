@@ -22,7 +22,7 @@
  * track but decode nothing. This backend reads ONLY the v1 model; the v2
  * models are decode_deepcw2.h's.
  *
- * Inference runs on DeepcwConfig::workers (2) threads by default — the
+ * Inference runs on DeepcwConfig::workers threads (auto by default) — the
  * engine thread only snapshots a window and later commits the result — or
  * INLINE with sync (SKIM_DEEPCW_SYNC=1), which a replay sets so that it is
  * deterministic (results land in stream order, never a wall-clock race).
@@ -71,11 +71,11 @@ struct DeepcwConfig {
     double tail_s    = 1.0;      // tail guard: no commit closer to the end
     double minconf_s = 2.0;      // no commit inside the first seconds
     double gate_db   = 6.0;      // line over floor to run inference
-    int    threads   = 4;        // ONNX Runtime intra-op threads
+    int    threads   = 1;        // ONNX Runtime intra-op threads
     double space_p   = 0.8;      // min posterior for a word gap to count (0 = off)
     bool   sync      = false;    // SKIM_DEEPCW_SYNC=1: inference inline (replays)
-    int    workers   = 2;        // async inference threads (1..8)
-    int    batch     = 32;       // windows per model run on a worker (1..256)
+    int    workers   = 0;        // async inference threads (1 .. hardware threads; 0 = auto, deepcw_runtime.h)
+    int    batch     = 0;        // windows per model run on a worker (1..256; 0 = auto: 1, 32 on CUDA)
     int    debug     = 0;        // SKIM_DEEPCW_DEBUG: 1 = ticks, 2 = + frames
     bool   draft     = true;     // SKIM_DEEPCW_DRAFT (1): gray draft tail in the pane
     double draft_min_s = 0.384;  // SKIM_DEEPCW_DRAFT_MIN: no draft closer to the

@@ -132,6 +132,9 @@ The README now also points to e04/DeepRTTY, an RTTY decoder of the same kind.
   `decode_deepcw2.cpp` carries the notice for the ported stitcher and
   normalisation. Shipping the models needs the same notice beside them.
 - ONNX Runtime C API header (`vendor/onnxruntime`): MIT, Microsoft.
+- The narrow model's fused-kernel weights (`tools/deepcw_narrow_extract.py`'s
+  output): e04's weights in another layout, MIT, Copyright (c) 2026 e04; the
+  file carries the notice as its `notice` tensor. Not bundled.
 
 ## SDRIAK's changes against OK1HRA's backend
 
@@ -207,6 +210,207 @@ at 25 WPM, the bench and the channelizer subtracted): v3 0.05 s, v2 narrow
 0.39 s, v2 wide 3.0 s, v1 9.4 s; the Bell R-series decoder 0.73 s with
 100 paths, 0.12 s with 25 (BELL.md, "The R-series configuration").
 
+## Runtime defaults
+
+`DeepcwRuntimeConfig` (and `DeepcwConfig`, `DeepcwV2Config`): 1 intra-op
+thread, batch auto (1, or 32 on CUDA), workers auto, set when the workers start:
+- the hardware threads − 2, leaving room for the channelizer;
+- at most 8 for the narrow model on ONNX Runtime's CPU;
+- 2 on CUDA.
+
+An explicit worker count is clamped to 1 .. the hardware threads (it was
+1..8). The workers flush denormals (FTZ/DAZ). The queue holds at least 256
+windows, and more while their tiles fit 64 MB: about 12,000 narrow windows,
+570 wide (it was 256 jobs).
+
+Measured with `experiments/deepcw_throughput` on an i5-13400 (6 P-cores with
+HT and 4 E-cores, 16 threads), ONNX Runtime 1.32, 7 s windows, windows/s:
+
+| | 1 worker | 8 workers | 14 workers | 16 workers |
+|---|---|---|---|---|
+| narrow, ONNX Runtime, batch 1 | 503 | 2570 | 1975 | 1909 |
+| narrow, ONNX Runtime, batch 128 | 409 | 834 | — | 848 |
+| narrow, fused kernel | 702 | 4240 | 5110 | 5333 |
+| wide, ONNX Runtime, batch 1 | 44.5 | 202 | 235 | — |
+| wide, ONNX Runtime, batch 32 | 39.0 | 117 | 121 | — |
+
+- Batching costs on the CPU for both v2 models; one run of N windows is no
+  cheaper per window than N runs.
+- With 4 intra-op threads ONNX Runtime spins: 4 × 8 used 11 cores for the
+  windows 1 × 8 reads on 8.
+- The narrow model on ONNX Runtime loses beyond 8 workers; the fused kernel
+  and the wide model gain to the last thread.
+- FTZ/DAZ changed nothing on these tiles; it guards the workers.
+- In runtime mode (300–1000 channels in flight) the fused kernel reads 5,020
+  windows/s at 14 workers, against 4,240 with the old cap of 8.
+
+## The narrow model's fused kernel
+
+`engine/deepcw_narrow_fused.{h,cpp}` runs `model_narrow.onnx` as one
+hand-written forward pass, without ONNX Runtime. `tools/deepcw_narrow_extract.py`
+turns the pinned model into a weight blob. It finds each weight's role from
+the graph, checks every constant the kernel hard-codes, writes the matrices
+[in][out], and with `--check` runs a NumPy forward pass against ONNX Runtime.
+The blob is pinned too (`DeepcwNarrowFused::kSha256`, `253ffb73…`) and records
+the model's sha256. `SKIM_DEEPCW2_FUSED=<blob>` runs `deepcw2n` on it
+(`DeepcwRuntimeConfig::fused_path`), one window per call on the runtime's
+workers. `SKIM_DEEPCW2_FUSED_CHECK=1` also runs ONNX Runtime on every window and
+prints the difference when the backend goes.
+
+- **Front end**: bit-exact with ONNX Runtime on an FMA CPU, for every window
+  of 3 or more input frames. The first GroupNorm feeds a uint8 quantiser (step
+  0.0405), so a last-bit difference moves a feature a whole step: one such
+  flip moved a log-prob by 0.15. So it reproduces ONNX Runtime's arithmetic:
+  - each conv is an im2col product, taps in (channel, time, frequency) order,
+    as one FMA chain from zero (MLAS's SGEMM);
+  - each GroupNorm is ONNX Runtime's InstanceNormalization, i.e. Eigen's SSE
+    reduction: 4-lane packets, two accumulators, (p0 + p2) + (p1 + p3), the
+    unaligned head of the mean's sum from a 16-byte aligned buffer, none for
+    the squared deviations; then x · cs + (b − mean · cs);
+  - the file is built with `-ffp-contract=off`.
+
+  Probed against ONNX Runtime's intermediate tensors (`relu_1`, 30 tiles of 1
+  to 875 frames): all but 44 of 81,360 values match, and those 44 are all in
+  windows of 1–2 frames, where Eigen sums 3 values another way.
+- **Encoder** (`deepcw_narrow_kernel.inc`): written once against an 8-lane
+  API. It is built four ways, and the best the CPU runs is taken:
+  - for AVX2 + FMA (that file alone gets `-mavx2 -mfma`; the CPU is checked
+    at run time);
+  - for SSE2 (x86 without AVX2; baseline on x86-64: no flags, no check);
+  - for NEON: AArch64 (baseline on arm64: no flags, no check) and 32-bit ARM
+    built with NEON (the NDK's armeabi-v7a);
+  - for plain arrays (32-bit ARM without NEON, other CPUs).
+
+  `SKIM_DEEPCW2_FUSED_ISA` (`DeepcwRuntimeConfig::fused_isa`;
+  `deepcw_throughput --fused-isa`) forces one: `avx2`, `sse`, `neon` or
+  `generic`. Activations are [time][channel],
+  the channels the SIMD lanes. GEMMs are 6 rows × 16 columns per block.
+  Attention takes 6 queries × 16 keys per block, keys transposed and values
+  copied per head, the max out of the score loop, 1 / sum on the outputs. exp
+  is Cephes; 1 / x is rcpps plus one Newton step.
+- **Exactness**: the encoder has no quantiser, so its float rounding stays
+  smooth. Against a float64 forward pass from the same features, on keyed
+  tiles: ONNX Runtime 2.3e-5, fused (AVX2) 2.6e-5, NumPy float32 2.4e-5. Fused
+  against ONNX Runtime is 4–8e-5 (the two errors added). On the hardest
+  cw_bench tiles (−6 dB) float32 itself is ill-conditioned: ONNX Runtime up to
+  3.4e-4 from float64, fused up to 4.4e-4, NumPy 5.4e-4. "About 1e-5" against
+  ONNX Runtime would need its encoder's arithmetic too.
+- **Gate**: `cw_engine_deepcw2_test` (D), with `SKIM_DEEPCW2_FUSED`. It checks
+  the backend's text on the kernel, and with `SKIM_DEEPCW2_NARROW_MODEL` 108
+  keyed tiles against ONNX Runtime, every encoder the CPU runs: |Δ log-prob| ≤ 1e-4 and the
+  same greedy text. Measured: AVX2 7.9e-5, generic 5.7e-5, 0 texts differ.
+- **cw_bench**: the fading table (dcw2n, 24 WPM; AWGN, ITU poor, flat 3 Hz;
+  −6 to +20 dB, 10 overs a point) is identical to ONNX Runtime cell for cell.
+  `cw_bench`'s output is byte-identical for those and for AWGN at 12, 18 and
+  30 WPM. Over 6,763 windows, 0 had another greedy path.
+- **Cost** (i5-13400, one 7 s window = 438 frames, 61 MMAC, batch 1):
+
+  | workers | ONNX Runtime 1.32, 1 thread | fused (AVX2) |
+  |---|---|---|
+  | 1 | 503 windows/s, 2.0 ms | 702 windows/s, 1.42 ms |
+  | 4 | 1840 | 2715 |
+  | 8 | 2570, 3.1 ms | 4240, 1.89 ms |
+  | 12 | 2144, 5.6 ms | 4882, 2.45 ms |
+
+  One window: GEMMs ≈ 0.58 ms at ≈ 70 GMAC/s (the core's FMA peak), attention
+  ≈ 0.48 ms, the front end 35 µs. The rest of the speed-up is int8 GEMMs (PLAN
+  step 5).
+
+### On x86 without AVX2 (SSE2)
+
+`deepcw_narrow_kernel_sse.cpp` covers x86 CPUs without AVX2:
+- Intel before Haswell (Core 2 to Ivy Bridge);
+- the Atom-class Celeron and Pentium J/N up to Jasper Lake (N4500, N5105,
+  N6000: no AVX at all; common in cheap mini PCs);
+- AMD before Excavator.
+
+How it differs from the AVX2 file:
+- Each 8-lane vector is two `__m128`. x86-64 has 16 vector registers, so the
+  GEMM and attention blocks are 2 rows (`DCWN_ROWS`) and the depthwise conv
+  takes 32 channels a pass. 3 and 4 rows measured the same (3.52, 3.66 ms).
+- No FMA: a · b + c rounds twice, as MLAS's SSE SGEMM does on these CPUs, so
+  the front end is designed to match ONNX Runtime there. That is not verified:
+  this machine's ONNX Runtime uses FMA. Here the SSE front end differs in the
+  last bit, and the uint8 quantiser turns that into log-prob jumps of up to
+  0.085 on cw_bench windows. Still, 0 windows took another greedy path, and
+  the cw_bench fading table (dcw2n, AWGN / ITU poor / flat 3 Hz, −6 to +20
+  dB) is identical cell for cell.
+- The gate (`deepcw2_test` D) passes on it: 108 keyed tiles, 5.1e-5, the same
+  greedy text.
+
+Cost on the i5-13400, SSE forced, ms per 7 s window: SSE 3.55, AVX2 1.43,
+the plain-array path 8.75 (2.5× slower than SSE). ONNX Runtime on AVX2 takes
+2.0 here. ONNX Runtime on SSE could not be measured here (MLAS picks its
+kernels by CPUID). On a CPU without AVX2, run `deepcw_throughput --fused`,
+which prints both.
+
+### On arm64 phones (NEON)
+
+`deepcw_narrow_kernel_neon.cpp` is the encoder for arm64-v8a phones. It
+targets the Samsung Galaxy A24: MediaTek Helio G99, 2 × Cortex-A76 at 2.2 GHz
+plus 6 × Cortex-A55 at 2.0 GHz, ARMv8.2-A.
+- Each 8-lane vector is two `float32x4_t`. The 6 × 16 GEMM block keeps its 24
+  accumulators in AArch64's 32 vector registers.
+- 1 / x is vrecpe plus two Newton steps; exp is the Cephes polynomial of the
+  AVX2 file.
+- `run()` sets FPCR.FZ for the call, as it sets FTZ/DAZ on x86.
+
+Checked without a phone: cross-built with `aarch64-linux-gnu-g++` and
+`clang --target=aarch64-linux-gnu` (Debian bookworm), run under
+`qemu-aarch64`:
+- the front end is bit-exact with x86 ONNX Runtime (FMA rounds exactly once,
+  and Eigen's NEON reduction has SSE's order): 0 of 81,216 values differ;
+- log-probs are within 1.6e-5 of ONNX Runtime on keyed tiles and 4.2e-4 on
+  the hardest cw_bench tiles (float32 conditioning, as on x86), with the same
+  greedy text.
+
+Speed on the phone is not measured. Estimate, from the FMA width:
+- A76: 2 × 128-bit FMA pipes, ≈ 17.6 GMAC/s peak, ≈ 6 ms per 7 s window;
+- A55: in-order, ≈ 15–20 ms per window;
+- all 8 cores: some hundreds of windows a second before thermal limits.
+
+Run `cw_engine_deepcw_throughput --fused` on the phone (adb shell) to measure.
+
+### On 32-bit Android (armeabi-v7a)
+
+The same file has a 32-bit branch for armeabi-v7a, which the NDK builds with
+NEON. It covers old and low-end phones, Android Go devices and TV boxes, often
+a 64-bit chip under a 32-bit OS. The branch differs from AArch64 in five ways:
+- No FMA guaranteed on ARMv7 (VFPv4 is optional), so it uses vmlaq: a · b + c
+  rounded twice.
+- Rounding to nearest by adding and taking away 1.5 · 2^23 (32-bit NEON
+  always rounds to nearest).
+- Pairwise vpadd / vpmax for the across-vector sum and max.
+- A scalar square root (once per LayerNorm row).
+- 16 vector registers, so 2-row blocks, as on SSE. 32-bit NEON flushes
+  denormals itself.
+
+32-bit ARM built without NEON gets the plain-array encoder. armhf's default
+is `-mfpu=vfpv3-d16`, so 32-bit Raspberry Pi OS does too; use the 64-bit OS
+on a Pi 3/4/5/Zero 2.
+
+Checked without a device: built with `arm-linux-gnueabihf-g++ -march=armv7-a
+-mfpu=neon -mfloat-abi=hard` and `clang --target=armv7a-linux-gnueabihf`, the
+stub built without NEON too, run under `qemu-arm`:
+- log-probs are within 3.7e-5 of ONNX Runtime on keyed tiles and 2.5e-4 on
+  the hardest cw_bench tiles, with the same greedy text;
+- the front end is not bit-exact with x86 ONNX Runtime, which uses FMA: 27,715
+  of 81,216 values differ in the last bit, as on the SSE path, and a window
+  can then jump by a quantiser step.
+
+Whether ONNX Runtime's 32-bit ARM kernels multiply-add with one rounding or
+two is not known here.
+
+Speed is not measured. Estimate:
+- a Cortex-A53 or A7 in 32-bit mode issues a 128-bit vmla every 2 cycles, so
+  roughly 30–40 ms per window per core: tens of channels on a phone;
+- the plain-array path is probably scalar there (compilers do not vectorise
+  floats onto 32-bit NEON without `-ffast-math`), a few times slower.
+
+The Android build does not set `OPT_BUILD_CW_DEEPCW`, and no SDRIAK module
+constructs a DeepCW backend yet (cw_bench and the gates do). The fused path
+needs neither ONNX Runtime nor the `.onnx` file, only the weights blob.
+
 ## Not measured yet
 
 Nothing of v2 has run on channelized IQ. To measure before trusting it:
@@ -227,11 +431,13 @@ Nothing of v2 has run on channelized IQ. To measure before trusting it:
 rule, draft, word gaps, the DSP half; with `SKIM_ORT_LIB` and
 `SKIM_DEEPCW_MODEL` also the model) and `cw_engine_deepcw2_test` (v2: the
 normalisation, the stitcher on synthetic CTC streams, the DSP half; with
-`SKIM_DEEPCW2_MODEL` and/or `SKIM_DEEPCW2_NARROW_MODEL` also the models).
-Both exit 77 (skipped) without a model.
+`SKIM_DEEPCW2_MODEL` and/or `SKIM_DEEPCW2_NARROW_MODEL` also the models, and
+with `SKIM_DEEPCW2_FUSED` the narrow model's fused kernel). Both exit 77
+(skipped) without a model.
 
 | File | sha256 | From |
 |---|---|---|
 | v1 `model.onnx` | `ef120799457bca042d4690944f0faf93268eb4654e7f50f28784ad63bdc1fe02` | deepcw-engine at `8e264d243bbd4467bd19f3f28292219405b47e0e` |
 | v2 `model.onnx` | `cd5ee38106348ad86a8f2d40ef1ce7dccea0d7f7fbfd0f2dee0fd1a8a28773ae` | deepcw-engine at `79104fbe1ea0abd09eb27c6ebf9c6bab364d0d7f` |
 | v2 `model_narrow.onnx` | `fc80c4baec72d756af1dbce9b70357a731b0b1a6b8306815bcfc61b6403c46e5` | deepcw-engine at `79104fb` |
+| v2 narrow, fused-kernel weights | `253ffb73161a09f3ee7d2c23d03106e4d64ecd8b846ac6a7ec7f48fe81820dc3` | `tools/deepcw_narrow_extract.py model_narrow.onnx <out>` |

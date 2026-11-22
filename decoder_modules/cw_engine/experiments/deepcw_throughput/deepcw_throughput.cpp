@@ -9,8 +9,11 @@
  *             own rate, the runtime's queue not involved;
  *  - runtime: N channels keep one window each in flight through
  *             DeepcwRuntime (its job queue, its workers, its equal-length
- *             batching) — the engine's path, with its clamps (workers 1..8,
- *             batch 1..256).
+ *             batching) — the engine's path, with its clamps (workers 1 ..
+ *             the hardware threads, batch 1..256), its worker FTZ/DAZ.
+ * With --fused (the narrow model's weights for deepcw_narrow_fused.h) the
+ * fused kernel is measured too: its log-probs against ONNX Runtime's on the
+ * tile pool, raw W threads on it, and the runtime on it.
  * Each configuration reports windows/s and the process CPU time it used, so
  * the core cost of one window is measured, spinning threads included. At
  * one tick per second, one window per second is one keyed channel.
@@ -25,6 +28,7 @@
 #include <thread>
 
 #include "engine/decode_deepcw2.h"
+#include "engine/deepcw_narrow_fused.h"
 #include "engine/deepcw_runtime.h"
 #include "engine/ort_shim.h"
 
@@ -170,6 +174,8 @@ struct Options {
     std::string model_key = "narrow";
     std::string model_path;
     std::string ort_lib;
+    std::string fused_path;     // --fused: the narrow model's fused-kernel weights
+    std::string fused_isa = "auto";   // --fused-isa
     bool verify = true;
     bool ftz = false;
     bool raw = true, runtime = true;
@@ -192,6 +198,9 @@ void usage() {
         "  --ort LIB                ONNX Runtime library (default: SKIM_ORT_LIB, else\n"
         "                           the platform's names)\n"
         "  --noverify               skip the sha256 pin (a transformed model)\n"
+        "  --fused FILE             narrow: also the fused kernel on these weights\n"
+        "                           (tools/deepcw_narrow_extract.py; SKIM_DEEPCW2_FUSED)\n"
+        "  --fused-isa NAME         its encoder: auto (default), avx2, sse, neon, generic\n"
         "  --mode raw|runtime|both  (default both)\n"
         "  --window S               window length in seconds (default 7: deepcw2's\n"
         "                           steady state; v1 reads its 10 s ring)\n"
@@ -213,6 +222,8 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--path") { const char *v = next(); if (!v) return false; o.model_path = v; }
         else if (a == "--ort") { const char *v = next(); if (!v) return false; o.ort_lib = v; }
         else if (a == "--noverify") o.verify = false;
+        else if (a == "--fused") { const char *v = next(); if (!v) return false; o.fused_path = v; }
+        else if (a == "--fused-isa") { const char *v = next(); if (!v) return false; o.fused_isa = v; }
         else if (a == "--ftz") o.ftz = true;
         else if (a == "--mode") {
             const char *v = next(); if (!v) return false;
@@ -343,12 +354,96 @@ Result run_raw(const SkimOrtSession &s, const ModelShape &m, const std::vector<s
     return r;
 }
 
+// ---- the fused kernel
+
+// Its log-probs against ONNX Runtime's on every tile of the pool, every
+// encoder this CPU runs: the max |Δ| and the tiles whose greedy (arg-max)
+// path differs.
+void fused_exactness(const DeepcwNarrowFused &f, const SkimOrtSession &s, const ModelShape &m,
+                     const std::vector<std::vector<float>> &pool, unsigned T) {
+    const int64_t d1[4] = { 1, 1, static_cast<int64_t>(T), m.spec->bins };
+    const unsigned To = DeepcwNarrowFused::output_frames(T);
+    const int C = m.spec->classes;
+    for (const DeepcwNarrowFused::Isa isa : DeepcwNarrowFused::available_isas()) {
+        double worst = 0.0, worst_live = 0.0;   // live: ONNX Runtime's logp > -10
+        int greedy = 0;
+        for (const auto &tile : pool) {
+            std::vector<float> ref, got(static_cast<size_t>(To) * C);
+            int64_t od[8];
+            int ond = 0;
+            std::string err;
+            if (!s.run(tile.data(), d1, 4, ref, od, ond, &err) || ref.size() != got.size()) {
+                std::printf("fused check: ONNX Runtime failed: %s\n", err.c_str());
+                return;
+            }
+            f.run(tile.data(), T, got.data(), isa);
+            bool same = true;
+            for (unsigned t = 0; t < To; t++) {
+                const float *a = got.data() + static_cast<size_t>(t) * C, *b = ref.data() + static_cast<size_t>(t) * C;
+                for (int k = 0; k < C; k++) {
+                    const double d = std::fabs(a[k] - b[k]);
+                    worst = std::max(worst, d);
+                    if (b[k] > -10.0f)
+                        worst_live = std::max(worst_live, d);
+                }
+                same = same && std::max_element(a, a + C) - a == std::max_element(b, b + C) - b;
+            }
+            greedy += same ? 0 : 1;
+        }
+        std::printf("fused check (%s): %zu tiles, max |logp - ONNX Runtime| = %.2e (%.2e where logp > -10), "
+                    "%d with another greedy path\n",
+                    DeepcwNarrowFused::isa_name(isa), pool.size(), worst, worst_live, greedy);
+    }
+}
+
+Result run_fused_raw(const DeepcwNarrowFused &f, const std::vector<std::vector<float>> &pool, unsigned T, int workers,
+                     double duration) {
+    std::atomic<bool> go{ false }, stop{ false };
+    std::atomic<long long> done{ 0 };
+    std::atomic<int> ready{ 0 };
+    std::vector<std::thread> th;
+    for (int w = 0; w < workers; w++) {
+        th.emplace_back([&, w] {
+            std::vector<float> out(static_cast<size_t>(DeepcwNarrowFused::output_frames(T)) * DeepcwModel::kClasses);
+            const float *tile = pool[static_cast<size_t>(w) % pool.size()].data();
+            f.run(tile, T, out.data());   // warm-up: the thread's scratch
+            ready++;
+            while (!go.load())
+                std::this_thread::yield();
+            long long n = 0;
+            while (!stop.load()) {
+                f.run(tile, T, out.data());
+                n++;
+            }
+            done += n;
+        });
+    }
+    while (ready.load() < workers)
+        std::this_thread::yield();
+    const double c0 = cpu_seconds();
+    const auto t0 = Clock::now();
+    go = true;
+    std::this_thread::sleep_for(std::chrono::duration<double>(duration));
+    stop = true;
+    for (auto &t : th)
+        t.join();
+    Result r;
+    r.wall = std::chrono::duration<double>(Clock::now() - t0).count();
+    r.cpu = cpu_seconds() - c0;
+    r.windows = static_cast<double>(done.load());
+    return r;
+}
+
 // ---- runtime mode
 
 Result run_runtime(const Options &o, const ModelShape &m, const std::vector<std::vector<float>> &pool, unsigned T,
-                   int threads, int workers, int batch, bool &ok) {
+                   int threads, int workers, int batch, bool fused, bool &ok) {
     DeepcwRuntimeConfig cfg;
     cfg.model_path  = o.model_path;
+    if (fused) {
+        cfg.fused_path = o.fused_path;
+        cfg.fused_isa = o.fused_isa;
+    }
     cfg.ort_library = o.ort_lib;
     cfg.threads     = threads;
     cfg.workers     = workers;
@@ -458,6 +553,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "no model file: --path or the model's SKIM_* variable\n");
         return 2;
     }
+    if (!o.fused_path.empty() && m->spec != &kDeepcwModelV2Narrow) {
+        std::fprintf(stderr, "--fused: the fused kernel is the narrow model's only\n");
+        return 2;
+    }
     if (o.verify) {
         const std::string why = deepcw_model_mismatch(*m->spec, o.model_path);
         if (!why.empty()) {
@@ -501,6 +600,21 @@ int main(int argc, char **argv) {
     };
     int rc = 0;
 
+    std::unique_ptr<DeepcwNarrowFused> fused;
+    if (!o.fused_path.empty()) {
+        DeepcwNarrowFused::Isa isa = DeepcwNarrowFused::Isa::kAuto;
+        if (!DeepcwNarrowFused::isa_from_name(o.fused_isa, &isa)) {
+            std::fprintf(stderr, "--fused-isa: auto, avx2, sse, neon or generic\n");
+            return 2;
+        }
+        fused = DeepcwNarrowFused::load(o.fused_path, o.verify, &err, isa);
+        if (!fused) {
+            std::fprintf(stderr, "--fused: %s\n", err.c_str());
+            return 2;
+        }
+        std::printf("fused kernel (%s): %s\n", fused->isa(), o.fused_path.c_str());
+    }
+
     if (o.raw) {
         // Its own environment, gone before the runtime mode opens the
         // process-wide one (deepcw_runtime.cpp shared_ort: one per process).
@@ -520,6 +634,8 @@ int main(int argc, char **argv) {
             if (t == o.threads.front()) {
                 const double diff = batch_consistency(*s, *m, pool, T);
                 std::printf("batch consistency: max |logit(alone) - logit(in a batch of 8)| = %.3g\n", diff);
+                if (fused)
+                    fused_exactness(*fused, *s, *m, pool, T);
             }
             for (int w : o.workers) {
                 if (static_cast<unsigned>(w * t) > 2 * hw)
@@ -537,19 +653,28 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        if (fused) {
+            // one window per call on the calling thread: no batch, no intra-op threads
+            for (int w : o.workers) {
+                const Result r = run_fused_raw(*fused, pool, T, w, o.duration_s);
+                print_result("fused", 1, w, 1, r, macs);
+                keep("fused", 1, w, 1, r);
+                std::fflush(stdout);
+            }
+        }
     }
 
     if (o.runtime) {
         std::printf("\nruntime: %d channels, one window each in flight (DeepcwRuntime clamps workers "
-                    "to 1..8, batch to 1..256)\n", o.channels);
+                    "to 1..%u, batch to 1..256)\n", o.channels, hw);
         print_header("runtime");
         for (int t : o.threads) {
             for (int w : o.workers) {
-                if (w > 8 || static_cast<unsigned>(w * t) > 2 * hw)
+                if (static_cast<unsigned>(w) > hw || static_cast<unsigned>(w * t) > 2 * hw)
                     continue;
                 for (int b : o.batches) {
                     bool ok = true;
-                    const Result r = run_runtime(o, *m, pool, T, t, w, b, ok);
+                    const Result r = run_runtime(o, *m, pool, T, t, w, b, false, ok);
                     if (!ok)
                         rc = 1;
                     if (r.wall <= 0.0)
@@ -558,6 +683,21 @@ int main(int argc, char **argv) {
                     keep("runtime", t, w, b, r);
                     std::fflush(stdout);
                 }
+            }
+        }
+        if (fused) {
+            for (int w : o.workers) {
+                if (static_cast<unsigned>(w) > hw)
+                    continue;
+                bool ok = true;
+                const Result r = run_runtime(o, *m, pool, T, 1, w, 1, true, ok);
+                if (!ok)
+                    rc = 1;
+                if (r.wall <= 0.0)
+                    continue;
+                print_result("rt-fused", 1, w, 1, r, macs);
+                keep("rt-fused", 1, w, 1, r);
+                std::fflush(stdout);
             }
         }
     }

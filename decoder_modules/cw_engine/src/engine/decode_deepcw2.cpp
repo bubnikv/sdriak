@@ -76,9 +76,14 @@ DeepcwV2Config DeepcwV2Config::from_env(const DeepcwV2Config &base) {
         c.device = v;
     c.narrow  = env_d("SKIM_DEEPCW2_NARROW", c.narrow ? 1 : 0) != 0;
     c.verify  = env_d("SKIM_DEEPCW2_VERIFY", c.verify ? 1 : 0) != 0;
+    if (const char *v = std::getenv("SKIM_DEEPCW2_FUSED"); v && v[0])
+        c.fused_path = v;
+    c.fused_check = env_d("SKIM_DEEPCW2_FUSED_CHECK", c.fused_check ? 1 : 0) != 0;
+    if (const char *v = std::getenv("SKIM_DEEPCW2_FUSED_ISA"); v && v[0])
+        c.fused_isa = v;
     c.threads = static_cast<int>(env_d("SKIM_DEEPCW2_THREADS", c.threads));
-    c.workers = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW2_WORKERS", c.workers)), 1, 8);
-    c.batch   = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW2_BATCH", c.batch)), 1, 256);
+    c.workers = std::max(0, static_cast<int>(env_d("SKIM_DEEPCW2_WORKERS", c.workers)));   // runtime clamps
+    c.batch   = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW2_BATCH", c.batch)), 0, 256);
     c.sync    = env_d("SKIM_DEEPCW2_SYNC", c.sync ? 1 : 0) != 0;
     c.debug   = static_cast<int>(env_d("SKIM_DEEPCW2_DEBUG", c.debug));
     c.gate    = env_d("SKIM_DEEPCW2_GATE", c.gate ? 1 : 0) != 0;
@@ -432,6 +437,11 @@ DeepcwRuntimeConfig runtime_config(const DeepcwV2Config &c) {
     r.workers     = c.workers;
     r.batch       = c.batch;
     r.verify      = c.verify;
+    if (c.narrow && !c.model_v1) {
+        r.fused_path  = c.fused_path;
+        r.fused_check = c.fused_check;
+        r.fused_isa   = c.fused_isa;
+    }
     return r;
 }
 

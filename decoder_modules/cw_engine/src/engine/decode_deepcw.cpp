@@ -53,8 +53,8 @@ DeepcwConfig DeepcwConfig::from_env(const DeepcwConfig &base) {
     c.threads     = static_cast<int>(env_d("SKIM_DEEPCW_THREADS", c.threads));
     c.space_p     = env_d("SKIM_DEEPCW_SPACE_P", c.space_p);
     c.sync        = env_d("SKIM_DEEPCW_SYNC", c.sync ? 1 : 0) != 0;
-    c.workers     = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW_WORKERS", c.workers)), 1, 8);
-    c.batch       = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW_BATCH", c.batch)), 1, 256);
+    c.workers     = std::max(0, static_cast<int>(env_d("SKIM_DEEPCW_WORKERS", c.workers)));   // runtime clamps
+    c.batch       = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW_BATCH", c.batch)), 0, 256);
     c.debug       = static_cast<int>(env_d("SKIM_DEEPCW_DEBUG", c.debug));
     c.draft       = env_d("SKIM_DEEPCW_DRAFT", c.draft ? 1 : 0) != 0;
     c.draft_min_s = env_d("SKIM_DEEPCW_DRAFT_MIN", c.draft_min_s);

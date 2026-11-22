@@ -7,7 +7,12 @@
  * restart; (B) the DSP half on synthetic baseband (rate rejection, gate,
  * the narrow tile's line bin); (C) the v2 models — only when
  * SKIM_DEEPCW2_MODEL (and, for the narrow model, SKIM_DEEPCW2_NARROW_MODEL)
- * resolve with SKIM_ORT_LIB; exit 77 = SKIP otherwise.
+ * resolve with SKIM_ORT_LIB; (D) the narrow model's fused kernel
+ * (SKIM_DEEPCW2_FUSED: its weights): the backend's text on it, and, with
+ * the narrow model and ONNX Runtime, its log-probs against ONNX Runtime's on
+ * keyed tiles (|Δ| ≤ 1e-4, the same greedy text; each is ~2.5e-5 from a
+ * float64 forward pass), every encoder this build and CPU can run. Exit 77 = SKIP when no model
+ * section can run.
  *
  * Part of SDRIAK. GPL-3.0-or-later.
  */
@@ -19,6 +24,8 @@
 
 #include "engine/decode.h"
 #include "engine/decode_deepcw2.h"
+#include "engine/deepcw_narrow_fused.h"
+#include "engine/deepcw_runtime.h"
 
 namespace {
 
@@ -237,6 +244,110 @@ void model_section(const char *label, DeepcwV2Config cfg, const char *path) {
     }
 }
 
+// ---- (D) the fused kernel ---------------------------------------------------
+
+// Greedy CTC: the arg-max path, repeats merged, blanks dropped.
+std::string greedy_text(const float *logp, unsigned To) {
+    std::string o;
+    int prev = -1;
+    for (unsigned t = 0; t < To; t++) {
+        const float *r = logp + static_cast<size_t>(t) * NC;
+        const int k = static_cast<int>(std::max_element(r, r + NC) - r);
+        if (k != prev && k != BLANK)
+            o += k == SPACE ? ' ' : DeepcwModel::kChars[k];
+        prev = k;
+    }
+    return o;
+}
+
+// A narrow tile [T][3] as deepcw2n reads one: a keyed line on the centre bin
+// (amplitude a over unit complex noise), Rayleigh noise on its neighbours,
+// noise_q90_log1p.
+std::vector<float> keyed_tile(const std::vector<float> &env, size_t from, unsigned T, double a, std::mt19937 &r) {
+    std::vector<float> tile(static_cast<size_t>(T) * 3);
+    std::normal_distribution<double> n(0.0, std::sqrt(0.5));
+    for (unsigned t = 0; t < T; t++) {
+        const double k = from + t < env.size() ? env[from + t] : 0.0;
+        for (unsigned b = 0; b < 3; b++) {
+            const double re = n(r) + (b == 1 ? a * k : 0.0), im = n(r);
+            tile[static_cast<size_t>(t) * 3 + b] = static_cast<float>(std::hypot(re, im));
+        }
+    }
+    deepcw2_normalize(tile.data(), tile.size(), tile.data(), tile.size());
+    return tile;
+}
+
+void fused_section(const DeepcwV2Config &cfg, const char *fused, const char *model) {
+    std::printf("[D] narrow model, fused kernel: %s\n", fused);
+    std::string err;
+    std::unique_ptr<DeepcwNarrowFused> f = DeepcwNarrowFused::load(fused, true, &err);
+    check("the fused weights load (pin)", f != nullptr);
+    if (!f) {
+        std::printf("      %s\n", err.c_str());
+        return;
+    }
+    std::printf("      encoder %s\n", f->isa());
+    {
+        DeepcwV2Config c = cfg;
+        c.narrow = true;
+        c.fused_path = fused;
+        model_section("narrow on the fused kernel", c, model ? model : "");
+    }
+    if (!(model && model[0])) {
+        std::printf("      against ONNX Runtime: SKIP — set SKIM_DEEPCW2_NARROW_MODEL\n");
+        return;
+    }
+    DeepcwRuntimeConfig rc;
+    rc.model_path = model;
+    rc.ort_library = cfg.ort_library;
+    rc.threads = 1;
+    DeepcwRuntime ort(kDeepcwModelV2Narrow, rc);
+    if (!ort.ensure_session(&err)) {
+        std::printf("      against ONNX Runtime: %s\n", err.c_str());
+        check("ONNX Runtime loads the narrow model", false);
+        return;
+    }
+    const double fps = 250.0 / 4.0;
+    std::mt19937 r(2026);
+    const std::vector<DeepcwNarrowFused::Isa> isas = DeepcwNarrowFused::available_isas();
+    std::vector<double> worst(isas.size(), 0.0);
+    std::vector<int> text_diff(isas.size(), 0);
+    int tiles = 0, texts = 0;
+    const char *msgs[] = { "CQ CQ DE OK1BR OK1BR K", "TEST DE OK1HRA 599 001 TU", "QRZ? DE DL1ABC" };
+    for (const char *msg : msgs)
+        for (double wpm : { 18.0, 25.0, 32.0 }) {
+            const std::vector<float> env = keyer(msg, wpm, fps, 8, 8);
+            for (double snr_db : { 20.0, 6.0, 0.0 })
+                for (unsigned T : { 438u, 437u, 300u, 125u }) {
+                    const std::vector<float> tile = keyed_tile(env, 0, T, std::pow(10.0, snr_db / 20.0), r);
+                    std::vector<float> ref;
+                    unsigned To = 0;
+                    ort.infer(tile.data(), T, ref, To);
+                    if (To != DeepcwNarrowFused::output_frames(T)) {
+                        check("ONNX Runtime reads the tile", false);
+                        return;
+                    }
+                    const std::string want = greedy_text(ref.data(), To);
+                    texts += want.empty() ? 0 : 1;
+                    tiles++;
+                    for (size_t g = 0; g < isas.size(); g++) {
+                        std::vector<float> got(ref.size());
+                        f->run(tile.data(), T, got.data(), isas[g]);
+                        for (size_t i = 0; i < got.size(); i++)
+                            worst[g] = std::max(worst[g], static_cast<double>(std::fabs(got[i] - ref[i])));
+                        text_diff[g] += greedy_text(got.data(), To) == want ? 0 : 1;
+                    }
+                }
+        }
+    for (size_t g = 0; g < isas.size(); g++) {
+        const char *isa = DeepcwNarrowFused::isa_name(isas[g]);
+        std::printf("      %s: %d tiles (%d with text), max |logp - ONNX Runtime| %.2e, %d with other greedy text\n",
+                    isa, tiles, texts, worst[g], text_diff[g]);
+        check((std::string(isa) + ": log-probs within 1e-4 of ONNX Runtime").c_str(), worst[g] <= 1e-4);
+        check((std::string(isa) + ": the same greedy text on every tile").c_str(), text_diff[g] == 0);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -335,6 +446,7 @@ int main() {
     {
         DeepcwV2Config nc = cfg;
         nc.model_path.clear();
+        nc.fused_path.clear();
         nc.narrow = true;
         SkimDeepcw2Backend be(nc);
         {
@@ -364,9 +476,11 @@ int main() {
     // ---- (C) the models -----------------------------------------------------
     const char *wide = std::getenv("SKIM_DEEPCW2_MODEL");
     const char *narrow = std::getenv("SKIM_DEEPCW2_NARROW_MODEL");
-    if (!(wide && wide[0]) && !(narrow && narrow[0])) {
+    const char *fused = std::getenv("SKIM_DEEPCW2_FUSED");
+    if (!(wide && wide[0]) && !(narrow && narrow[0]) && !(fused && fused[0])) {
         std::printf("[C] SKIP — set SKIM_ORT_LIB and SKIM_DEEPCW2_MODEL (model.onnx v2) and/or "
-                    "SKIM_DEEPCW2_NARROW_MODEL (model_narrow.onnx)\n");
+                    "SKIM_DEEPCW2_NARROW_MODEL (model_narrow.onnx), and/or SKIM_DEEPCW2_FUSED "
+                    "(tools/deepcw_narrow_extract.py's output)\n");
         std::printf("=== %d checks, %d failed (model section skipped) ===\n", checks, fails);
         return fails ? 1 : 77;
     }
@@ -380,8 +494,11 @@ int main() {
     if (narrow && narrow[0]) {
         DeepcwV2Config c = cfg;
         c.narrow = true;
+        c.fused_path.clear();   // this section is ONNX Runtime's; (D) is the fused kernel's
         model_section("narrow (model_narrow.onnx)", c, narrow);
     }
+    if (fused && fused[0])
+        fused_section(cfg, fused, narrow);
     std::printf("=== %d checks, %d failed ===\n", checks, fails);
     return fails ? 1 : 0;
 }

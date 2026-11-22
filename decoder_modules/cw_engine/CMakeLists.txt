@@ -57,8 +57,31 @@ if (OPT_BUILD_CW_DEEPCW)
         src/engine/decode_deepcw.cpp
         src/engine/decode_deepcw2.cpp
         src/engine/deepcw_runtime.cpp
+        src/engine/deepcw_narrow_fused.cpp
+        src/engine/deepcw_narrow_kernel_generic.cpp
+        src/engine/deepcw_narrow_kernel_avx2.cpp
+        src/engine/deepcw_narrow_kernel_neon.cpp
+        src/engine/deepcw_narrow_kernel_sse.cpp
         src/engine/ort_shim.cpp
         src/engine/skim_sha256.cpp)
+    # The narrow model's fused kernel (deepcw_narrow_fused.h): its AVX2
+    # encoder is the one file built for AVX2 + FMA; the CPU is checked at
+    # run time, so the rest of the library keeps the baseline ISA. Its NEON
+    # and SSE2 encoders need no flags: NEON is AArch64's baseline (arm64-v8a
+    # phones) and on in the NDK's armeabi-v7a, SSE2 x86-64's (CPUs without
+    # AVX2); 32-bit ARM built without NEON and other CPUs get the portable one.
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x86|i[3-6]86)$")
+        if (MSVC)
+            set_source_files_properties(src/engine/deepcw_narrow_kernel_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        else ()
+            set_source_files_properties(src/engine/deepcw_narrow_kernel_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+        endif ()
+    endif ()
+    # The front end reproduces ONNX Runtime's GroupNorm to the bit (its
+    # output is quantised): no a · b + c contracted into an FMA.
+    if (NOT MSVC)
+        set_source_files_properties(src/engine/deepcw_narrow_fused.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif ()
     target_include_directories(cw_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vendor/onnxruntime")
     target_compile_definitions(cw_engine PUBLIC CW_ENGINE_DEEPCW=1)
     target_link_libraries(cw_engine PUBLIC ${CMAKE_DL_LIBS})

@@ -17,7 +17,10 @@
  *    batch to its longest window, but the model's front end normalises over
  *    the whole window (GroupNorm as InstanceNormalization, time included)
  *    and its self-attention has no mask, so padding changes how the real
- *    frames are read.
+ *    frames are read;
+ *  - the narrow model can run without ONNX Runtime on its fused kernel
+ *    (fused_path: deepcw_narrow_fused.h), one window per call. With
+ *    fused_check both run and every window's difference is counted.
  * Compiled only with OPT_BUILD_CW_DEEPCW.
  *
  * Part of SDRIAK. GPL-3.0-or-later.
@@ -31,6 +34,7 @@
 #include <deque>
 #include <thread>
 
+class DeepcwNarrowFused;
 class SkimOrt;
 class SkimOrtSession;
 
@@ -64,10 +68,28 @@ struct DeepcwRuntimeConfig {
     std::string model_path;      // "" = none set
     std::string ort_library;     // "" = the platform's names (ort_shim.h)
     std::string device = "cpu";  // "cpu" or "cuda"
-    int  threads = 4;            // ONNX Runtime intra-op threads
-    int  workers = 2;            // async inference threads (1..8)
-    int  batch   = 32;           // equal-length windows per run (1..256)
+    // The defaults are measured (deepcw_throughput, DeepCW.md "Runtime
+    // defaults"): on the CPU one window per run on one thread is the
+    // cheapest per window for every model, and the workers scale to about
+    // the hardware threads.
+    int  threads = 1;            // ONNX Runtime intra-op threads
+    // async inference threads, 1 .. the hardware threads; 0 = auto: the
+    // hardware threads − 2 (room for the channelizer), at most 8 for the
+    // narrow model on ONNX Runtime's CPU (it loses beyond), 2 on CUDA
+    int  workers = 0;
+    int  batch   = 0;            // equal-length windows per run (1..256); 0 = auto: 1, 32 on CUDA
     bool verify  = true;         // check the file against the spec's sha256
+    // The narrow model's fused-kernel weights (tools/deepcw_narrow_extract.py).
+    // Set: the narrow model runs on the fused kernel; model_path and ONNX
+    // Runtime are needed only for fused_check.
+    std::string fused_path;
+    // The fused kernel's encoder: "auto" (the best here), "avx2", "sse",
+    // "neon" or "generic" (deepcw_narrow_fused.h).
+    std::string fused_isa = "auto";
+    // Run every window on ONNX Runtime too and count how far the fused
+    // kernel's logits are from its (printed when the runtime is destroyed);
+    // the fused logits are the ones returned.
+    bool fused_check = false;
 };
 
 // Where a job delivers its result. The channel reads it on the engine
@@ -98,6 +120,10 @@ public:
 
     const DeepcwModelSpec &spec() const { return m_spec; }
     const DeepcwRuntimeConfig &cfg() const { return m_cfg; }
+    // The worker threads and the batch the workers use (the config's, or
+    // what auto resolves to); 0 until the first submit() starts them.
+    int workers() const { return m_workers_n.load(); }
+    int batch() const { return m_batch_n.load(); }
 
     // Runtime + model resolvable, pinned and loaded (cached; the first call
     // loads). false + *error names what is missing or wrong.
@@ -117,8 +143,23 @@ public:
     // window was not queued (never for force).
     bool submit(std::unique_ptr<DeepcwJob> job, bool force);
 
+    // fused_check: windows compared, the largest |Δ log-prob| (overall, and
+    // over the entries ONNX Runtime puts above −10: those a decoder can
+    // pick), windows whose greedy (arg-max) path differs.
+    struct FusedCheck {
+        uint64_t windows = 0;
+        double   max_abs = 0.0;
+        double   max_abs_live = 0.0;
+        uint64_t greedy_diff = 0;
+    };
+    FusedCheck fused_check() const;
+
 private:
     std::shared_ptr<const SkimOrtSession> session() const;
+    std::shared_ptr<const DeepcwNarrowFused> fused() const;
+    bool load_ort(const std::string &model);
+    // One window on whichever engine is loaded; false = nothing came back.
+    bool run_one(const float *tile, unsigned T, std::vector<float> &logp);
     bool check_output(unsigned T, const int64_t *od, int ond, int64_t batch);
     void workers_ensure();
     void worker_main();
@@ -130,6 +171,7 @@ private:
     mutable std::mutex m_lock;
     std::shared_ptr<SkimOrt> m_ort;                     // under m_lock
     std::shared_ptr<const SkimOrtSession> m_cur;        // under m_lock
+    std::shared_ptr<const DeepcwNarrowFused> m_fused;   // under m_lock
     std::string m_load_err;
     bool        m_tried = false;
     std::string m_rt_info;
@@ -139,11 +181,18 @@ private:
     std::mutex     m_jobs_lock;
     std::condition_variable m_jobs_cv;
     std::deque<std::unique_ptr<DeepcwJob>> m_jobs;      // under m_jobs_lock
+    size_t         m_jobs_bytes = 0;                    // their tiles, under m_jobs_lock
+    static constexpr size_t kQueueJobs  = 256;          // the queue holds at least these
+    static constexpr size_t kQueueBytes = 64u << 20;    // and more while their tiles fit
     bool           m_stop = false;                      // under m_jobs_lock
     std::vector<std::thread> m_workers;
+    std::atomic<int> m_workers_n{ 0 };                  // resolved at workers_ensure()
+    std::atomic<int> m_batch_n{ 0 };
     std::atomic<bool> m_behind_warned{ false };
     std::atomic<bool> m_infer_warned{ false };
     std::atomic<bool> m_shape_warned{ false };
+    mutable std::mutex m_check_lock;
+    FusedCheck         m_check;                         // under m_check_lock
 };
 
 // The pin check alone: "" when path is the spec's file, else why not (a

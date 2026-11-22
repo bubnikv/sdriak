@@ -77,9 +77,16 @@ struct DeepcwV2Config {
     std::string device = "cpu";  // SKIM_DEEPCW2_DEVICE
     bool   narrow  = false;      // SKIM_DEEPCW2_NARROW=1: model_narrow.onnx (3 bins)
     bool   verify  = true;       // SKIM_DEEPCW2_VERIFY (1): the sha256 pin
-    int    threads = 4;          // SKIM_DEEPCW2_THREADS
-    int    workers = 2;          // SKIM_DEEPCW2_WORKERS (1..8)
-    int    batch   = 32;         // SKIM_DEEPCW2_BATCH (1..256)
+    // SKIM_DEEPCW2_FUSED: the narrow model's fused-kernel weights
+    // (tools/deepcw_narrow_extract.py); set, the narrow model runs on its
+    // fused kernel without ONNX Runtime (deepcw_narrow_fused.h). The wide
+    // model ignores it.
+    std::string fused_path;
+    bool   fused_check = false;  // SKIM_DEEPCW2_FUSED_CHECK=1: ONNX Runtime too, every window compared
+    std::string fused_isa = "auto";  // SKIM_DEEPCW2_FUSED_ISA: auto, avx2, sse, neon, generic
+    int    threads = 1;          // SKIM_DEEPCW2_THREADS
+    int    workers = 0;          // SKIM_DEEPCW2_WORKERS (1 .. hardware threads; 0 = auto, deepcw_runtime.h)
+    int    batch   = 0;          // SKIM_DEEPCW2_BATCH (1..256; 0 = auto: 1, 32 on CUDA)
     bool   sync    = false;      // SKIM_DEEPCW2_SYNC=1: inference inline (replays)
     int    debug   = 0;          // SKIM_DEEPCW2_DEBUG
     bool   gate    = true;       // SKIM_DEEPCW2_GATE (1): infer only on a keyed line

@@ -19,7 +19,7 @@ v1 peak-normalised to 30. A pool of 64 such tiles is cycled.
 | Mode | What | Shows |
 |---|---|---|
 | `raw` | W threads share one session with I intra-op threads; each runs batches of B windows back to back | the model's rate through ONNX Runtime, without the queue |
-| `runtime` | N channels each keep one window in flight through `DeepcwRuntime` | the engine's path: its job queue, its workers, equal-length batching and clamps (workers 1..8, batch 1..256, queue 256) |
+| `runtime` | N channels each keep one window in flight through `DeepcwRuntime` | the engine's path: its job queue, its workers, equal-length batching and clamps (workers 1 .. the hardware threads, batch 1..256, queue ≥ 256 windows within 64 MB), FTZ/DAZ on its workers |
 
 For each configuration it reports:
 
@@ -32,6 +32,14 @@ For each configuration it reports:
 Raw mode also checks that one window reads the same alone and inside a
 batch of 8. That is the runtime's equal-length batching rule, and the
 difference should be at float rounding level.
+
+With `--fused FILE` (the narrow model's fused-kernel weights,
+`tools/deepcw_narrow_extract.py`) the fused kernel (`deepcw_narrow_fused.h`)
+is measured too:
+- its log-probs against ONNX Runtime's on the tile pool, every encoder the
+  CPU runs;
+- `fused` rows: W threads, one window per call;
+- `rt-fused` rows: the runtime on the kernel (no batch, no intra-op threads).
 
 ## Run
 
@@ -55,13 +63,17 @@ or `SKIM_DEEPCW_MODEL`, depending on the contract. The library defaults to
 | `--threads L` | 1,2,4 | ONNX Runtime intra-op threads |
 | `--workers L` | 1,2,4,… to the hardware threads | |
 | `--channels N` | 300 | runtime: channels with a window in flight |
+| `--fused FILE` | none | narrow only: also the fused kernel on these weights |
+| `--fused-isa NAME` | auto | its encoder: `auto`, `avx2`, `sse`, `neon`, `generic` |
 | `--ftz` | off | flush denormals to zero on the calling threads. With 1 intra-op thread ONNX Runtime computes on the calling thread, so this covers the model. |
 
 Some configurations are skipped: workers × threads above twice the hardware
-threads, and runtime mode with more than 8 workers (the runtime's clamp).
-In runtime mode, more than 256 channels in flight overflow the queue. The
-runtime then refuses the extra windows and warns once that it is behind;
-those windows are simply submitted again later.
+threads, and runtime mode with more workers than hardware threads (the
+runtime's clamp).
+In runtime mode the queue holds at least 256 windows, and more while their
+tiles fit 64 MB (about 12,000 narrow 7 s windows, 570 wide). Beyond that the
+runtime refuses the extra windows and warns once that it is behind; those
+windows are simply submitted again later.
 
 ## Reading it
 
