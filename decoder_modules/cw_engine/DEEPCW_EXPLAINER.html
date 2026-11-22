@@ -77,6 +77,7 @@ li::marker { color: var(--muted); }
 @media (max-width: 640px) { .answers dl { grid-template-columns: minmax(0, 1fr); gap: 2px 0; } .answers dd { margin-bottom: 10px; } }
 figure { margin: 18px 0 22px; }
 figure .svgwrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+figure img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
 figcaption { font-size: 0.88rem; color: var(--muted); margin-top: 6px; }
 svg text { font-family: var(--f-body); fill: var(--fg); }
 svg .m { fill: var(--muted); }
@@ -152,7 +153,7 @@ canvas { display: block; width: 100%; background: var(--bg); border-radius: 6px;
 <header class="top col">
   <p class="eyebrow">cw_engine · DeepCW · explainer</p>
   <h1>The DeepCW decoders: what is inside, and how to run hundreds</h1>
-  <p class="lede">The three neural CW models the engine runs — DeepCW v1, v2 wide and v2 narrow — layer by layer, how they differ, why their windows can neither be padded nor cached, what one channel costs, and how to spread hundreds of parallel signals over a CPU or a GPU.</p>
+  <p class="lede">The three neural CW models the engine runs — DeepCW v1, v2 wide and v2 narrow — layer by layer, how they differ, why their windows can neither be padded nor cached, what one channel costs, how to spread hundreds of parallel signals over a CPU or a GPU, and when the narrow model reads better than the classic v3 decoder (§7).</p>
   <p class="sub">The architecture is read from the pinned ONNX files themselves (sha256 as in <code>deepcw_runtime.h</code>: v1 <code>ef120799…</code>, v2 <code>cd5ee381…</code>, v2 narrow <code>fc80c4ba…</code>): operator counts, initialiser shapes, convolution attributes, quantisation nodes. The streaming side is from <code>decode_deepcw.cpp</code>, <code>decode_deepcw2.cpp</code> and <code>deepcw_runtime.cpp</code>; measurements from <code>DeepCW.md</code>. Compute figures are multiply-accumulates (MAC) counted from the layer shapes; a FLOP is two of them.</p>
 </header>
 
@@ -168,6 +169,10 @@ canvas { display: block; width: 100%; background: var(--bg); border-radius: 6px;
     <dd>A different scale: 3 input bins instead of 65, 2 convs (12, 24 channels), 3 Conformer blocks at d 64, 0.2 M parameters — 1/17 of v2 wide's compute, 1/59 of v1's at their window lengths.</dd>
     <dt>Quality</dt>
     <dd>Equal in white noise. Under fast fading and multipath v1 reads 2–4× better than both v2 models at 0–10 dB; the stitcher is not the cause (<code>DeepCW.md</code>).</dd>
+    <dt>Against v3</dt>
+    <dd>dcw2n reads 2.5–5 dB deeper into white noise, 7–14 dB deeper under ordinary HF fading, and far better under impulse noise. It costs 3.4× v3's CPU on a keyed channel and half its RAM. v3 is better above 40 WPM, under 10–30 Hz flutter, under strong drift and, before digits, at 12 WPM and slower. Against impulses, the impulse repair in front of the channelizer helps either decoder more than switching decoders does. <a href="#vs-v3">§7</a>.</dd>
+    <dt>Stitcher setting</dt>
+    <dd>Recommended for a skimmer: 1 s left context, 2 s freeze guard, 3 s step (L 1, G 2, S 3). It is 3.4× cheaper than the code's default (4, 2, 1), with no measured loss, at 2–5 s of latency instead of 2–3 s. The default is unchanged. <a href="#vs-v3">§7</a>.</dd>
     <dt>Hundreds on a CPU</dt>
     <dd>Only the narrow model: ≈ 0.06 GMAC per channel-second, a few cores for 300 keyed channels. The wide models cost 0.1 (v2) to 0.36 (v1) of a core per channel.</dd>
     <dt>Hundreds on a GPU</dt>
@@ -373,8 +378,158 @@ canvas { display: block; width: 100%; background: var(--bg); border-radius: 6px;
 </div>
 </section>
 
+<section class="col" id="vs-v3">
+  <span class="sec-no">§7 · against v3</span>
+  <h2>DeepCW v2 narrow against v3: when it reads better, and what it costs</h2>
+  <p>v3 is OK1HRA's Bayesian decoder, the engine's classic path. It follows the tone's envelope in the channel, keeps an explicit model of the station's timing (dit length, element and character spaces, learned as it listens) and finds the most likely mark/space sequence with a Viterbi search. dcw2n is the narrow DeepCW v2 model (§1). It reads three 12.5 Hz DFT bins around the tone over a 6 s window, emits characters directly and has no timing model at all. Here it runs on the engine's fused kernel with the stitcher at 1 s of left context, a 2 s freeze guard and a 3 s step: "L 1, G 2, S 3", DeepCW.md's cheapest setting without a measured loss.</p>
+  <div class="callout">
+    <p><b>Recommended setting for a skimmer: L 1, G 2, S 3.</b> Set <code>left_context_s = 1</code>, <code>freeze_guard_s = 2</code> and <code>step_s = 3</code> in <code>DeepcwStitchConfig</code> (or <code>SKIM_DEEPCW2_LEFT=1 SKIM_DEEPCW2_GUARD=2 SKIM_DEEPCW2_STEP=3</code>). It reads 6 s of spectrogram every 3 s instead of 7 s every second, so a keyed channel costs 3.4× less CPU than with the default. No quality loss has been measured, and every number in this section was taken with it. The price is latency: text arrives 2–5 s behind the air instead of 2–3 s.</p>
+    <p>The code's default stays (4, 2, 1), the upstream stitcher's setting. Keep it where the text must follow the air closely and CPU is no concern, such as a single-channel decoder in a live pane. Do not shorten the 2 s guard: at 12 WPM a character can take 1.9 s, and a 1 s guard breaks there.</p>
+  </div>
+  <p class="note">Every number below comes from one cw_bench campaign. Both decoders see the same overs: same text, keying and noise, from the same seeds. A point has 300 overs (about 15,600 characters; 100 overs for the channel-position sweep). In all there are 36 M scored characters per decoder, and twenty hours of noise per decoder for false characters (ten with the impulse repair, ten without). The "10 % point" is the SNR in 500 Hz where payload CER falls to 10 %; lower is better. Full tables and the figures for every condition are in <code>DeepCW.md</code>, "v3 against DeepCW v2 narrow (1, 2, 3): decoding quality", and the points are in <code>figures/deepcw_vs_v3/points.csv</code>.</p>
+
+  <h3>The short version</h3>
+  <div class="callout">
+    <p>dcw2n needs 2.5–5 dB less signal than v3 in plain noise and 7–14 dB less under ordinary HF fading. It shrugs off impulse noise, speed changes and a weaker station in the same channel, and in twenty hours of noise it printed no false characters. It costs 3.4× v3's CPU on a keyed channel, uses about half v3's RAM, and its text arrives 2–5 s behind the air, against v3's fraction of a second.</p>
+    <p>It is worse than v3 in four places:</p>
+    <ul>
+      <li>above 40 WPM;</li>
+      <li>under very fast flutter (10 Hz and more);</li>
+      <li>under strong drift;</li>
+      <li>at 12 WPM and slower, where it inserts spurious word spaces before digits.</li>
+    </ul>
+    <p>It also loses near a channel's edge with the skimmer's default channel filter. The flat filter the channelizer already offers removes that loss.</p>
+    <p>Against impulse noise the bigger lever is not the decoder but the impulse repair in front of the channelizer. With it, both decoders read within half a dB of a clean band under nearly every impulse type, and dcw2n keeps its 3 dB lead. It costs 2.4 % of one core for a whole 48 kHz band. It is not in a pipeline yet.</p>
+  </div>
+
+  <h3>Where each one wins</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Condition (24 WPM unless stated)</th><th class="num">v3</th><th class="num">dcw2n</th><th>Who wins, and by how much</th></tr></thead>
+    <tbody>
+      <tr><td>White noise, 10 % point</td><td class="num">−0.5 dB</td><td class="num">−3.6 dB</td><td>dcw2n, 3 dB</td></tr>
+      <tr><td>White noise at 12 WPM / 35 WPM</td><td class="num">−1.1 / +0.6</td><td class="num">−6.2 / −2.1</td><td>dcw2n, 5 dB / 2.6 dB</td></tr>
+      <tr><td>White noise at 45 WPM</td><td class="num">+1.8</td><td class="num">+4.1</td><td><b>v3</b>, 2.3 dB</td></tr>
+      <tr><td>ITU poor fading (1 Hz), 10 % point; CER at +30 dB</td><td class="num">+23.8; 8.0 %</td><td class="num">+11.6; 3.2 %</td><td>dcw2n, 12 dB</td></tr>
+      <tr><td>Flat fading 3 Hz, CER at +30 dB</td><td class="num">11.5 %</td><td class="num">10.9 %</td><td>dcw2n below +20 dB, then equal</td></tr>
+      <tr><td>Flutter 10 Hz (ITU low/high latitude), CER at +30 dB</td><td class="num">13 %</td><td class="num">28 %</td><td>dcw2n below about +15 dB, <b>v3</b> above</td></tr>
+      <tr><td>Flutter 30 Hz (high latitude, disturbed), CER at +30 dB</td><td class="num">8 %</td><td class="num">100 %</td><td><b>v3</b>: dcw2n decodes nothing</td></tr>
+      <tr><td>Sferics 3/s, CER at +20 dB, no impulse repair</td><td class="num">12 %</td><td class="num">0.1 %</td><td>dcw2n</td></tr>
+      <tr><td>Receiver clicks 10/s, CER at +20 dB, no impulse repair</td><td class="num">18 %</td><td class="num">0.05 %</td><td>dcw2n</td></tr>
+      <tr><td>Strong clicks clipped by the receiver, CER at +20 dB, no impulse repair</td><td class="num">95 %</td><td class="num">29 %</td><td>dcw2n</td></tr>
+      <tr><td>Sferics 3/s, 10 % point, no repair / with impulse repair</td><td class="num">never / −0.2</td><td class="num">+8.0 / −3.3</td><td>dcw2n, 3 dB with the repair; v3 + repair beats dcw2n without it</td></tr>
+      <tr><td>Rasp 100/s (power line), 10 % point, no repair / with impulse repair</td><td class="num">+10.8 / +2.4</td><td class="num">+4.3 / −0.1</td><td>dcw2n, 2.5 dB with the repair</td></tr>
+      <tr><td>Keying jitter ±30 %, 3 % point</td><td class="num">+9.5</td><td class="num">+0.2</td><td>dcw2n, 9 dB</td></tr>
+      <tr><td>Speed step 18 → 30 WPM mid-over, CER above +12 dB</td><td class="num">10–16 %</td><td class="num">0 %</td><td>dcw2n</td></tr>
+      <tr><td>Station 10 dB weaker, 50 Hz away in the same channel, CER at +20 dB</td><td class="num">8.4 %</td><td class="num">0 %</td><td>dcw2n</td></tr>
+      <tr><td>Drift 2 Hz/s, CER at +20 dB</td><td class="num">1.4 %</td><td class="num">4.3 %</td><td><b>v3</b></td></tr>
+      <tr><td>10 WPM, CER at +20 dB (spaces counted)</td><td class="num">0.0 %</td><td class="num">6.0 %</td><td><b>v3</b>: dcw2n's errors are spurious spaces before digits</td></tr>
+      <tr><td>Clean signal, CER at +20 dB</td><td class="num">1.3 %</td><td class="num">0.0 %</td><td>dcw2n: v3 sometimes prints junk at an over's start</td></tr>
+      <tr><td>False characters from noise, per hour</td><td class="num">0–4 (148 under static crashes); 0–9 with the repair</td><td class="num">0</td><td>dcw2n</td></tr>
+      <tr><td>Tone at the channel boundary (62.5 Hz), default filter, 10 % point</td><td class="num">+2.5</td><td class="num">+1.8</td><td>dcw2n, 0.7 dB; 5.8 dB with the flat filter for dcw2n</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure>
+    <div class="svgwrap"><img src="figures/deepcw_vs_v3/speed_thresholds.png" alt="SNR500 needed for 10 % and 3 % payload CER against keying speed, 10 to 45 WPM. dcw2n sits 2.5 to 5 dB below v3 from 10 to 40 WPM and crosses above it at 45 WPM."></div>
+    <figcaption>Sensitivity by keying speed in white noise. dcw2n's lead grows as the keying slows. At 10 WPM it never reaches 3 %, because of the spurious spaces described below.</figcaption>
+  </figure>
+
+  <h3>Why it reads better</h3>
+  <p>The measurements show where dcw2n wins. The explanations below are the likely mechanisms; the bench does not isolate them one by one.</p>
+  <ul>
+    <li><b>It weighs whole characters, not single elements.</b> A matched decoder should need 4.6 dB less signal at 12 WPM than at 35 WPM, because each element carries three times the energy. v3's thresholds barely move with speed (ALGORITHM.md §5.3.6); dcw2n's move by 4 dB. It uses the longer elements, and it reads each one in the context of the elements around it.</li>
+    <li><b>It was trained on fading.</b> A dah that fades halfway is still a dah to a model that has seen thousands of them. v3 classifies the envelope against its timing model, so a deep fade looks like a space or a dit. That is the 7–14 dB gap under slow fading.</li>
+    <li><b>Impulses look nothing like keying in a spectrogram.</b> A click is short and spreads over all bins. A keyed tone sits in one bin. v3's envelope sees only energy, so a click looks like a dit.</li>
+    <li><b>There is no timing state to lose.</b> v3 learns the station's dit length and keeps it, which is why a mid-over speed change or heavy jitter breaks it. dcw2n infers the timing afresh in every window.</li>
+    <li><b>It sees only ±19 Hz around the tone.</b> Three 12.5 Hz bins shut out a second station 50 Hz away. The same narrowness is behind two of its losses: under 30 Hz flutter the tone is smeared wider than its view, and a tone that drifts 60 Hz in an over ends up at the channel's edge.</li>
+    <li><b>It prints only when the gate opens.</b> The model runs only while the line is keyed. In twenty hours of noise and impulses, with and without the impulse repair, that gate never produced a character.</li>
+  </ul>
+
+  <h3>Where it is worse, and why</h3>
+  <ul>
+    <li><b>Above 40 WPM.</b> It costs 2.3 dB at 45 WPM and leaves a 2.8 % floor. This looks like the edge of its training range; its output frames are 32 ms, and a 45 WPM dit is 27 ms.</li>
+    <li><b>Flutter of 10 Hz and more.</b> Above about +15 dB its CER stops at about 27 %, where v3 goes on to 12 %. At 30 Hz spread it decodes nothing: the result is the same with the gate off and with the default stitcher, so this is the model. Such conditions occur on disturbed high- and low-latitude paths.</li>
+    <li><b>2 Hz/s drift</b>, a 4.3 % floor. A drifting tone ends the over near the channel edge, see below.</li>
+    <li><b>12 WPM and slower</b>, before digits. It splits "H1SH" into "H 1SH" (6 % CER at 10 WPM, 1 % at 12 WPM). The characters are right: without spaces the CER is 0.09 %. Pure letter text shows none. The cause is in the model, since every stitcher setting tried gives the same.</li>
+  </ul>
+
+  <h3>Ham exchanges against random letter groups</h3>
+  <p>In white noise both decoders read random 2–6 letter groups exactly as well as ham exchanges (CQ, contest, ragchew, sign-off), within 0.2 dB. Neither relies on language, so dcw2n's lead does not come from guessing likely text. Under fading, exchanges are 1.2–1.7 dB easier for both, probably because of their short, frequent characters (E, T, 5, N). Digits make any text harder: they are the longest characters, so a fade is more likely to break one.</p>
+
+  <h3>Where the tone sits in the channel</h3>
+  <p>The skimmer splits the band into channels 125 Hz apart, each a 250 Hz baseband, so a station can sit up to 62.5 Hz from its channel's centre. The default channel filter is flat to ±30 Hz and 6 dB down at the boundary. Position within a 12.5 Hz DFT bin makes no difference to either decoder (within 0.3 dB). Distance from the channel centre does:</p>
+  <figure>
+    <div class="svgwrap"><img src="figures/deepcw_vs_v3/position.png" alt="SNR500 for 10 % and 3 % payload CER against the tone's offset from the channel centre, 0 to 62.5 Hz, for both decoders with the default and with the flat channel filter. With the default filter both decoders lose beyond 40 Hz, dcw2n more. With the flat filter dcw2n is flat to the boundary, while v3 loses about 1.2 dB near the centre and its 3 % point becomes erratic."></div>
+    <figcaption>Solid lines: the default channel filter. Dashed lines: the flat one (<code>SkimChannelizer::create_ex(…, 85, 12)</code>).</figcaption>
+  </figure>
+  <ul>
+    <li><b>With the default filter</b> both decoders are flat to about 40 Hz. By the boundary v3 has lost 2.9 dB and dcw2n 5.3 dB. dcw2n's lead shrinks from 3 dB to 0.7 dB there.</li>
+    <li><b>With the flat filter</b> dcw2n stays within 0.3 dB of its centre value right up to the boundary. All of its edge loss was the filter.</li>
+    <li><b>The flat filter hurts v3</b> near the centre, where most stations are: its 10 % point is 1.2 dB worse (+0.8 against −0.4 dB). It also gains a 1–6 % error tail between +3 and +8 dB, which makes its 3 % point erratic (+2.6 to +9.6 dB). Only at the boundary does the flat filter help v3 (+0.5 against +2.5 dB). The wider filter lets in more noise and more of the neighbouring channel; v3's tone and threshold tracking pays for that, dcw2n's three bins do not.</li>
+    <li><b>Averaged over a random position</b>, which is what a skimmer sees, the 10 % point is v3 +0.07 dB and dcw2n −2.85 dB with the default filter. The flat filter gains dcw2n about 0.6 dB on average and 5 dB for stations near a boundary.</li>
+    <li>So the filter should go with the decoder: flat when dcw2n decodes, the default when v3 does. A bank with twice the channels at half the spacing is not needed. Not measured yet with the flat filter: adjacent stations, false characters, and how strongly each signal shows in the neighbouring channel.</li>
+  </ul>
+
+  <h3 id="impulse-repair">Impulse repair in front of the channelizer</h3>
+  <p><b>What it is.</b> <code>ImpulseRepair</code> (<code>engine/impulse_repair.h</code>, ALGORITHM.md §5.7) is an optional stage on the wideband IQ stream, before the filter bank splits it into channels. It treats an impulse as missing data, not as signal to be blanked:</p>
+  <ol>
+    <li>Strong carriers are split off first, as in Linrad: 31 Hz FFT bins that stand 25 dB over the median bin (averaged over 0.5 s) bypass the repair and are added back after it. One predictor cannot follow dozens of independently keyed strong stations.</li>
+    <li>A complex AR(32) model of the rest, refitted every 32 ms, predicts each sample.</li>
+    <li>Where the prediction error jumps 12 dB over its recent median, a gap opens. It is accepted as an impulse only if the error's spectrum is white: a narrowband error is a carrier keying on or a fade ending, and is left alone.</li>
+    <li>The gap is filled by forward and backward prediction, crossfaded. Nothing is zeroed, so carriers run straight through the gap and no blanker splatter is created.</li>
+  </ol>
+  <p><b>Why it works, and why there.</b> In the wideband stream an impulse is a few samples long and spread over the whole band, which is easy to tell apart from any keyed carrier. After the channelizer it is neither: the channel filter smears it over 64 ms (16 output samples) in every channel, the length of a dit at 19 WPM. Repairing before the split also fixes every channel at once, so the cost is per band, not per station.</p>
+  <figure>
+    <div class="svgwrap"><img src="figures/deepcw_vs_v3/impulse_repair.png" alt="Payload CER against SNR500 for eleven conditions, both decoders, with the impulse repair (solid) and without it (dashed). With the repair, the curves under clicks, sferics, ignition and crashes fall back almost onto the clean-band curves. Under clipped 70 dB clicks both decoders read well up to +16 dB and then fail."></div>
+    <figcaption>Solid: with the impulse repair. Dashed: without. 24 WPM, 300 overs a point.</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>10 % point, 24 WPM</th><th class="num">v3</th><th class="num">v3 + repair</th><th class="num">dcw2n</th><th class="num">dcw2n + repair</th></tr></thead>
+    <tbody>
+      <tr><td>No impulses</td><td class="num">−0.5</td><td class="num">−0.6</td><td class="num">−3.6</td><td class="num">−3.6</td></tr>
+      <tr><td>Receiver clicks 1/s, 40 dB</td><td class="num">+9.2</td><td class="num">−0.5</td><td class="num">+1.3</td><td class="num">−3.5</td></tr>
+      <tr><td>Sferics 3/s, 40 dB</td><td class="num">never (12 % floor)</td><td class="num">−0.2</td><td class="num">+8.0</td><td class="num">−3.3</td></tr>
+      <tr><td>Receiver clicks 10/s, 40 dB</td><td class="num">never (18 % floor)</td><td class="num">−0.2</td><td class="num">+10.9</td><td class="num">−3.4</td></tr>
+      <tr><td>Ignition 50/s, 30 dB</td><td class="num">+7.8</td><td class="num">−0.2</td><td class="num">+5.9</td><td class="num">−3.1</td></tr>
+      <tr><td>Power-line rasp 100/s, 25 dB</td><td class="num">+10.8</td><td class="num">+2.4</td><td class="num">+4.3</td><td class="num">−0.1</td></tr>
+      <tr><td>Static crashes 0.2/s, 40 dB</td><td class="num">+9.1</td><td class="num">−0.3</td><td class="num">+6.1</td><td class="num">−3.3</td></tr>
+      <tr><td>Heavy-tailed noise (Middleton Class A)</td><td class="num">−0.4</td><td class="num">−0.9</td><td class="num">−3.4</td><td class="num">−4.2</td></tr>
+      <tr><td>Clicks 3/s, 70 dB, clipped at 60 dB</td><td class="num">never</td><td class="num">−0.2 *</td><td class="num">never</td><td class="num">−3.3 *</td></tr>
+      <tr><td>60 other stations up to +30 dB, no impulses</td><td class="num">−0.5</td><td class="num">−0.3</td><td class="num">−3.5</td><td class="num">−3.3</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">* Good only up to about +16 dB; see "where it fails".</p>
+  <ul>
+    <li><b>Utility.</b> It nearly undoes impulse noise for both decoders: under clicks, sferics, ignition and crashes the 10 % point comes back to within 0.5 dB of the clean band, gains of 5–14 dB. Rasp still costs about 3 dB, against 8–11 dB without. The gains add to the decoder's: dcw2n + repair keeps its 3 dB lead over v3 + repair. v3 with the repair beats dcw2n without it under every impulse type, so against impulses the repair matters more than which decoder runs.</li>
+    <li><b>Where it fails.</b> The split that protects strong carriers also lets impulse energy in their own bins through unrepaired. A keyed carrier crosses the split's 25 dB line at about SNR500 +16.5 dB. Above that, very strong pulses (70 dB, clipped at 60) break through: both decoders read well from 0 to +16 dB, then jump to 17–63 % CER. With 40 dB pulses the same leak only nudges v3's floor up (2 → 3.4 % under sferics). Subtracting a fitted pulse instead of predicting through it, as Linrad's smart blanker does, would cover those bins; that is not built yet.</li>
+    <li><b>What it costs where there are no impulses.</b> dcw2n: nothing in a clean band; with 60 strong neighbours, 0.2 dB and a 0.12 % floor. v3: the 10 % point stays put, but its high-SNR floor rises from 1.3 to 1.9 % and its false characters from 1 to 9 an hour. Under impulses dcw2n + repair floors at 0.3–0.5 %: the impulses it misses or fills badly cost a few characters, where dcw2n alone gets to 0.1 % only 5–15 dB higher.</li>
+    <li><b>Cost.</b> 2.4 % of one core for a whole 48 kHz band, 10.6 % at 192 kHz, once for the band rather than per channel. 70 ms of latency, negligible next to dcw2n's 2–5 s. A crowded narrow band costs it a little, as above. At 48 kHz, where the same crowd is spread over six times the band, 30–200 stations cost nothing (ALGORITHM.md §5.7).</li>
+    <li><b>When it is used.</b> It is not used yet in any pipeline: cw_bench (<code>--repair</code>) and bench.py run it, and <code>SkimChannelizer::create_ex(…, &amp;repair_config)</code> is ready for a skimmer to switch it on. Both decoders here get the repaired IQ only. It also hands out per-frame repair weights, but neither v3 nor dcw2n uses them yet; the coherent Bell decoder does.</li>
+  </ul>
+  <p>Every other number in this section is without the repair, as are the impulse rows of the table above unless they say otherwise.</p>
+
+  <h3>What it costs</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Per channel, i5-13400</th><th class="num">v3</th><th class="num">dcw2n (L 1, G 2, S 3)</th><th class="num">ratio</th></tr></thead>
+    <tbody>
+      <tr><td>CPU while keyed, ms per channel-second</td><td class="num">0.12</td><td class="num">0.41</td><td class="num">3.4×</td></tr>
+      <tr><td>CPU while idle (gate closed), ms per channel-second</td><td class="num">0.009</td><td class="num">0.019</td><td class="num">2.1×</td></tr>
+      <tr><td>Stations decoded with 11 of 16 threads busy (2/3 load)</td><td class="num">60,200</td><td class="num">19,300</td><td class="num">1/3.1</td></tr>
+      <tr><td>A 96 kHz band (768 channels), 50 keyed, % of one core</td><td class="num">1.6</td><td class="num">3.8</td><td class="num">2.4×</td></tr>
+      <tr><td>RAM, a new channel</td><td class="num">51 KB</td><td class="num">51 KB</td><td class="num">1×</td></tr>
+      <tr><td>RAM, a keyed channel</td><td class="num">155 KB</td><td class="num">79 KB</td><td class="num">0.5×</td></tr>
+      <tr><td>Text behind the air</td><td class="num">4–8 dits (0.2–0.4 s at 24 WPM)</td><td class="num">2–5 s</td><td></td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>CPU.</b> 97 % of a keyed dcw2n channel's time is the model. The engine runs it on its own fused kernel rather than ONNX Runtime: 1.4 ms a window with AVX2, with SSE2, NEON and 32-bit ARM paths, and bit-for-bit checked against ONNX Runtime. The (1, 2, 3) stitcher reads 6 s every 3 s instead of 7 s every second, which makes it 3.4× cheaper than the default with no measured loss. Even so, one desktop core carries about 2,400 keyed dcw2n channels: every channel of a 96 kHz band keyed at once takes about a third of a core.</li>
+    <li><b>RAM.</b> v3's Viterbi lattice is 104 KB once a channel keys. dcw2n keeps a 14 s spectrogram ring (38 KB), a small window tile and the stitcher's history. The shared weights are under 1 MB per process.</li>
+    <li><b>Latency.</b> dcw2n commits a character only once it is 2 s old (the freeze guard) and decides every 3 s, so text arrives 2–5 s behind the air. The code's default stitcher, (4, 2, 1), gives 2–3 s at 3.4× the CPU; (1, 2, 3) is the recommended setting wherever the extra 2 s are acceptable.</li>
+  </ul>
+</section>
+
 <section class="col">
-  <span class="sec-no">§7 · not measured</span>
+  <span class="sec-no">§8 · not measured</span>
   <h2>What this page does not know</h2>
   <ul>
     <li>No GPU run of any model in this engine; the GPU figures are counts against an assumed efficiency.</li>
