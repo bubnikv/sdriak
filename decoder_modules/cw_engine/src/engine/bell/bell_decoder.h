@@ -54,11 +54,13 @@ struct BellConfig {
     // times this; the pause keeps the listing's. 1: the listing.
     float  dur_sharpness = 1.0f;
     // The station's timing (PLAN.md R8; with speed_lock, while it holds):
-    // the sure runs' distance from the nearest nominal length (key-down 1
-    // or 3 locked dits, key-up under 5 dits 1 or 3) averaged, as XTRANS's
-    // Laplace scale (the listing's: 1/3 dit), and dur_sharpness times 1/3
-    // over it, 1 … dur_learn_max: sharp for a machine, the listing's for a
-    // hand key. Back to dur_sharpness when the lock opens.
+    // each sample, the mass of the nodes where an element or a space under
+    // a word space ends, with the ended element's distance from its
+    // nominal length at the path's own speed (what the decoder believes of
+    // the timing); its average (about 20 elements) is XTRANS's Laplace
+    // scale (the listing's: 1/3 dit), and the sharpness dur_sharpness
+    // times 1/3 over it, 1 … dur_learn_max: sharp for a machine, the
+    // listing's for a hand key. Back to dur_sharpness when the lock opens.
     bool   dur_learn = false;
     float  dur_learn_max = 3.0f;
     // The station's speed (PLAN.md R7): a slow average (speed_lock_tau_s)
@@ -171,10 +173,9 @@ public:
     // −5 dB and ±10 % jitter; a 1.7x or 2.5x step passes 0.45 within a
     // second; 1.4x reaches 0.34 and slower steps 0.24 (the range follows).
     // dur_learn: XTRANS's Laplace scale in the listing (1/α, α = 3 a dit),
-    // a sure key-up run (P under kLearnSure throughout), the average's gain
-    // (about 20 runs), and the distance counted at most (a misread run).
-    static constexpr float kLearnSpaceMax = 5.0f;   // dur_learn: longer key-up runs are word spaces
-    static constexpr float kListingMad = 1.0f / 3.0f, kLearnSure = 0.01f, kLearnGain = 0.05f, kLearnCap = 1.0f;
+    // the average's gain per ended element's mass (about 20 elements), and
+    // the distance counted at most (a misread element).
+    static constexpr float kListingMad = 1.0f / 3.0f, kLearnGain = 0.05f, kLearnCap = 1.0f;
     static constexpr float kOddCap = 1.0f, kLn3 = 1.0986123f, kOddGain = 0.1f, kOddRelease = 0.38f, kOddSure = 0.99f;
     static constexpr double kRateHz  = 200.0;
 
@@ -249,8 +250,6 @@ private:
     // speed_lock: the average, the range, and the paths kept inside it.
     void   lock_speed();
     void   unlock_speed();
-    // dur_learn: one sure run of run_s seconds, key-down or key-up.
-    void   learn_duration(float run_s, bool mark);
     void   path(int ip, int lambda, float dur, int ilrate);
     void   likhd(float z, float rn, int ip, int lambda, float dur, int ilrate);
     float  kalfil(float z, int ip, float rn, int ixs, int kelem, int jnode, float dur,
@@ -293,10 +292,12 @@ private:
     float m_sdev = 0.0f;                    // … the posterior's relative spread about it, squared
     float m_run_s = 0.0f;                   // … the key-down run in progress, s
     float m_run_pmax = 0.0f;                // … and its largest P(key down)
-    float m_up_s = 0.0f, m_up_pmin = 1.0f;  // … the key-up run in progress, s, and its smallest P
     // dur_learn: the sure runs' mean distance from their nominal length
     // (locked dits), and the sharpness XTRANS uses.
     float m_mad = kListingMad, m_dsharp = 1.0f;
+    // dur_learn: this sample's ended-element mass, and its mass-weighted
+    // distance from the nominal length (dits), from SPROB.
+    float m_end_p = 0.0f, m_end_pd = 0.0f;
     float m_odd = 0.0f;                     // … the share of recent runs that do not fit the lock
     float m_kgr = 0.0f, m_kgi = 0.0f;
     std::vector<float> m_coha;

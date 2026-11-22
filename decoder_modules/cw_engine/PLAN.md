@@ -182,7 +182,7 @@ measured against v3 + K2 and DeepCW v2 narrow:
 | R5 | impulses: repair weights, the sferic anomaly | done, below: the impulse term (ε 0.01, κ 100, scoring only) and the repair weights |
 | R6 | within 1.5 dB of `dcw2n` at 12–25 WPM, no false characters: a v4 backend | — |
 | R7 | the station's speed: the paths kept within ±15 % of an average of the posterior speed (`BellConfig::speed_lock`, `:slock`) | built, below: 12 WPM +0.65 dB (3 %: +1.0), 25–35 WPM unchanged |
-| R8 | the duration model's sharpness learned per station (`BellConfig::dur_learn`, `:dlearn`) | built, below: 10 % CER +0.1–0.2 dB, 3 % +0.3–0.5 dB; the bound's 2x was worth 0.6 dB |
+| R8 | the duration model's sharpness learned per station from the posterior's ended elements (`BellConfig::dur_learn`, `:dlearn`) | built, below: 10 % CER +0.1–0.2 dB, 3 % +0.3–0.7 dB; the bound's fixed 2x was worth 0.6 dB |
 
 Bell with the gate and the coarse AFC, white noise, SNR500 for 10 % / 3 %
 at 12 / 25 / 35 WPM, and fading at 10 dB (ITU poor, flat 3 Hz, beat):
@@ -322,29 +322,31 @@ repair weights (`:repw`):
   (without 0.498 / 0.100 / 0.017), ITU good 0.297 / 0.035 / 0.007 (0.307
   / 0.042 / 0.009); no false characters on noise.
 - **R8, the station's timing** (`:slock:dlearn`). While the speed lock
-  holds, each sure run (key-down peaking over 0.99; key-up under 0.01
-  throughout and under 5 locked dits) is measured from the nearest
-  nominal length, 1 or 3 locked dits; the average distance (about 20
-  runs) is XTRANS's Laplace scale, and the sharpness 1/3 dit over it,
-  1–3x. It reads 3x on machine keying at high SNR, 2x at ±15 % jitter
-  and 10 dB, but only 1.4–1.8x near the thresholds, where the detection's
-  own timing error widens the runs: hence less than the fixed 2x bound.
+  holds, each sample's nodes where an element or a space under a word
+  space ends carry the ended element's distance from its nominal length
+  at the path's own speed; the mass-weighted average (about 20 elements)
+  is XTRANS's Laplace scale, and the sharpness 1/3 dit over it, 1–3x.
+  The same distance measured on the runs P(key down) holds over 0.5 does
+  as well on steady keying but 0.4 dB worse at 3 % with ±15 % jitter;
+  near the thresholds both read 1.4–1.8x, the timing as uncertain as
+  that, so the fixed 2x bound's 0.6 dB is not reached. The sharper model
+  does not run away on loose keying.
 
   | SNR500, 10 % / 3 % | 12 WPM | 25 WPM | 35 WPM |
   |---|---|---|---|
   | R7 | −4.99 / −3.69 | −2.04 / −0.37 | −0.37 / +1.21 |
-  | R7 + R8 | −5.10 / −4.03 | −2.12 / −0.85 | −0.44 / +0.92 |
+  | R7 + R8 | −5.11 / −4.12 | −2.13 / −0.88 | −0.46 / +0.91 |
   | R7, random text | −4.72 / −3.48 | −2.08 / −0.74 | −0.37 / +0.92 |
-  | R7 + R8, random text | −4.90 / −3.74 | −2.24 / −1.02 | −0.47 / +0.86 |
+  | R7 + R8, random text | −4.82 / −3.52 | −2.30 / −1.04 | −0.50 / +0.73 |
   | DeepCW v2 narrow | −5.82 / −4.01 | −3.67 / −1.70 | −2.13 / −0.51 |
   | DeepCW v2 narrow, random text | −6.19 / −4.35 | −3.23 / −1.78 | −1.85 / −0.31 |
 
-  Looser keying: ±10 % jitter at 12 WPM −4.92 / −3.63 (R7 −4.82 /
-  −3.38), at 25 WPM −2.01 / −0.66 (−1.94 / −0.38); ±15 % at 25 WPM
-  −2.08 / −0.65 (−1.97 / +0.04). ITU poor at 24 WPM 0.493 / 0.095 /
-  0.015 at 0 / 10 / 20 dB; speed steps 15 → 25 0.022 / 0.000 / 0.000,
-  35 → 18 0.079 / 0.002 / 0.008. The gap to DeepCW, 10 % CER: 0.7 / 1.6
-  / 1.7 dB on QSO text, 1.3 / 1.0 / 1.4 dB on random text.
+  Looser keying: ±10 % jitter at 12 WPM −5.03 / −3.61 (R7 −4.82 /
+  −3.38), at 25 WPM −2.16 / −0.70 (−1.94 / −0.38); ±15 % at 25 WPM
+  −2.12 / −1.07 (−1.97 / +0.04). ITU poor at 24 WPM 0.492 / 0.090 /
+  0.015 at 0 / 10 / 20 dB (R7 0.493 / 0.100 / 0.017). The gap to
+  DeepCW, 10 % CER: 0.7 / 1.5 / 1.7 dB on QSO text, 1.4 / 0.9 / 1.4 dB
+  on random text.
 - The decimation is not what costs at speed: every channel sample
   (250 Hz) does worse, more so the faster (an error floor of 5 % at
   25 WPM and 15 % at 35, +2 dB), and neither 200 paths nor dropping the
