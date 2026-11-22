@@ -71,6 +71,13 @@ struct BellBackendConfig {
     // decode_bell.cpp: 1.3x under 0.5 Hz, at least 0.3 Hz, 2.5x as steep
     // above). One spread class only (coh_spreads empty).
     bool   measure_spread = false;
+    // Measurement only, the bench's bounds (SkimDecodeChannel::set_reference,
+    // the target alone through the same filter bank): oracle_freq runs the
+    // AFC on the reference, so the frequency is the true one; oracle_gain
+    // also hands every path the reference's complex amplitude (held across
+    // the spaces) as its gain, known exactly.
+    bool   oracle_freq = false;
+    bool   oracle_gain = false;
 
     // The listing alone: BellConfig::listing(), no AGC clamp.
     static BellBackendConfig listing();

@@ -250,6 +250,9 @@ repair weights (`:repw`):
 | decision delay 2 s (`:delay400`) | −4.51 / −3.36 | −2.03 / −0.21 | −0.38 / +1.03 |
 | … 3 s | −4.65 / −3.41 | −2.03 / −0.23 | −0.38 / +0.99 |
 | 200 paths | −4.26 / −3.10 | −2.03 / −0.28 | −0.51 / +1.18 |
+| frequency known (`:ofreq`) | −4.31 / −2.56 | −2.04 / −0.34 | −0.33 / +1.26 |
+| frequency and gain known (`:ogain`) | −4.63 / −1.50 | −2.39 / −1.18 | −1.00 / +0.63 |
+| every channel sample, 250 Hz (`:rate250`) | −3.45 / −0.53 | +0.16 / — | — / — |
 | DeepCW v2 narrow | −5.82 / −4.01 | −3.67 / −1.70 | −2.13 / −0.51 |
 
 - None of them holds the 1.5 dB. The speed, known to ±10 %, gains 0.5 dB
@@ -260,9 +263,22 @@ repair weights (`:repw`):
 - Bell's paths started at the listing's 10–50 WPM even with a narrower
   speed range, and with a range that excluded them decoded nothing; they
   start inside the range now.
-- What is left: the evidence (the decimation's fold, below) and what
-  DeepCW reads beyond the elements (its context, about 0.5 dB of text
-  prior at 25 WPM by S1).
+- The oracles (`:ofreq`, `:ogain`; the bench hands the channel the target
+  alone through a second filter bank, SkimDecodeChannel::set_reference):
+  the frequency known gains nothing; the frequency and the complex gain
+  known (every path scores the exact likelihood, zero variance) 0.3 dB at
+  12 and 25 WPM, 0.6 dB at 35. The front end holds at most that much of
+  the gap; about 1.2 dB is in the lattice and what DeepCW reads beyond
+  the elements (its context, about 0.5 dB of text prior at 25 WPM by S1).
+  With the gain known, 12 WPM keeps an error floor of about 2.5 % up to
+  +1 dB, so its 3 % point is worse than the R-series': the lattice's own
+  errors.
+- The decimation is not what costs at speed: every channel sample
+  (250 Hz) does worse, more so the faster (an error floor of 5 % at
+  25 WPM and 15 % at 35, +2 dB), and neither 200 paths nor dropping the
+  impulse term moves it; the fold costs at most a fixed fraction of a
+  dB. The channel's edge (below) needs the station centred before any
+  narrowing, not a filter on the channel.
 
 CPU per 27 s over (one thread, bench and channelizer subtracted): v3
 0.05 s, the R-series 0.73 s with 100 paths and 0.12 s with 25, DeepCW v2

@@ -125,6 +125,12 @@ public:
     // weights mean 0.
     virtual void set_repair_weights(const float * /*w*/, unsigned /*nframes*/) {}
 
+    // Measurement only (the bench's oracles): the next process() block's
+    // frames of the target alone, through the same filter bank, without
+    // noise, impulses or other stations. A backend may read the truth from
+    // it for a bound; the live pipeline never calls it. Optional.
+    virtual void set_reference(const float * /*iq*/, unsigned /*nframes*/) {}
+
     // Pending DISPLAY-ONLY text (returns it and clears; "" when none —
     // SDRIAK: upstream returns a malloc'd string or NULL). The pipeline shows
     // it (pane, decode log) but must NEVER feed it to the callsign extractor:

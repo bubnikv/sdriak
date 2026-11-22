@@ -91,6 +91,7 @@ public:
         if (m_cfg.gate || m_cfg.coarse_afc) { m_detector.set_floor(noise_pw); }
     }
     void set_repair_weights(const float *w, unsigned nframes) override { m_w.assign(w, w + nframes); }
+    void set_reference(const float *iq, unsigned nframes) override { m_ref.assign(iq, iq + 2 * nframes); }
 
     bool process(const float *iq, unsigned nframes, SkimDecode *out) override {
         m_text.clear();
@@ -116,10 +117,12 @@ public:
                 }
                 if (++m_phase < m_decim) continue;
                 m_phase = 0;
-                coherent_sample(re, im, m_wmax);
+                const bool ref = 2 * k + 1 < m_ref.size();
+                coherent_sample(re, im, m_wmax, ref ? m_ref[2 * k] : 0.0f, ref ? m_ref[2 * k + 1] : 0.0f);
                 m_wmax = 0.0f;
             }
             m_w.clear();             // the weights belonged to this block
+            m_ref.clear();
             return emit(out);
         }
         for (unsigned k = 0; k < nframes; k++) {
@@ -162,6 +165,7 @@ public:
         m_afc_hz = m_phi = 0.0;
         m_delay.clear();
         m_delay_w.clear();
+        m_delay_ref.clear();
     }
 
     double tone_offset_hz() const override { return m_cfg.decoder.coherent && m_cfg.coh_afc ? afc_hz() : 0.0; }
@@ -174,7 +178,8 @@ private:
         return m_blocks_min > 0.0 ? m_blocks_min : 1e-12;
     }
 
-    void coherent_sample(float re, float im, float w) {
+    // rre, rim: the reference (set_reference), the oracles' truth.
+    void coherent_sample(float re, float im, float w, float rre, float rim) {
         m_bacc += static_cast<double>(re) * re + static_cast<double>(im) * im;
         if (++m_bcnt == m_block) {
             m_blocks[m_bat] = m_bacc / m_bcnt;
@@ -189,9 +194,11 @@ private:
             // The AFC sees each sample coh_afc_lookahead_s before the
             // decoder, so the first marks of an over are derotated with a
             // locked estimate.
-            afc_push(re, im);
+            if (m_cfg.oracle_freq || m_cfg.oracle_gain) afc_push(rre, rim);
+            else afc_push(re, im);
             m_delay.emplace_back(re, im);
             m_delay_w.push_back(w);
+            m_delay_ref.emplace_back(rre, rim);
             const size_t look = static_cast<size_t>(std::lround(m_cfg.coh_afc_lookahead_s * 1000.0 / m_dec_dt_ms));
             if (m_delay.size() <= look) return;
             re = m_delay.front().real();
@@ -199,14 +206,32 @@ private:
             m_delay.pop_front();
             w = m_delay_w.front();
             m_delay_w.pop_front();
+            rre = m_delay_ref.front().real();
+            rim = m_delay_ref.front().imag();
+            m_delay_ref.pop_front();
             m_phi = std::remainder(m_phi + 2.0 * kPi * m_afc_hz * m_dec_dt_ms * 1e-3, 2.0 * kPi);
             const double c = std::cos(m_phi), s = std::sin(m_phi);
             const double r2 = re * c + im * s, i2 = im * c - re * s;
             re = static_cast<float>(r2);
             im = static_cast<float>(i2);
+            const double q2 = rre * c + rim * s, j2 = rim * c - rre * s;
+            rre = static_cast<float>(q2);
+            rim = static_cast<float>(j2);
         }
         if (!(m_floor > 0.0) && m_bfill == 0) return;       // nothing to scale by yet
         const float s = static_cast<float>(1.0 / std::sqrt(n0 * m_noise_scale));
+        if (m_cfg.oracle_gain) {
+            // the carrier's complex amplitude: the reference while the key is
+            // down at its full level (over 0.95 of the peak amplitude, not a
+            // keying edge), held across the spaces
+            const float r2 = rre * rre + rim * rim;
+            m_ref_peak = std::max(m_ref_peak, r2);
+            if (r2 > 0.9f * m_ref_peak) {
+                m_held_re = rre;
+                m_held_im = rim;
+            }
+            m_dec.set_known_gain(m_held_re * s, m_held_im * s);
+        }
         m_dec.push_iq(re * s, im * s, m_text, w);
         if (m_cfg.measure_spread) {
             // K3: the decoder's key-down runs are the marks the station's
@@ -247,7 +272,8 @@ private:
         const double peak = m_pow[k];
         m_sorted = m_pow;
         std::nth_element(m_sorted.begin(), m_sorted.begin() + m_afcn / 2, m_sorted.end());
-        if (peak < kAfcPeak * m_sorted[m_afcn / 2]) return;
+        // (and no lock on silence: the oracles' reference before the station)
+        if (!(peak > 0.0) || peak < kAfcPeak * m_sorted[m_afcn / 2]) return;
         const double pm = m_pow[(k + m_afcn - 1) % m_afcn], pp = m_pow[(k + 1) % m_afcn];
         const double den = pm - 2.0 * peak + pp;
         const double d = den < 0.0 ? 0.5 * (pm - pp) / den : 0.0;
@@ -343,6 +369,11 @@ private:
     double m_afc_hz = 0.0, m_phi = 0.0;
     std::deque<std::complex<float>> m_delay;
     std::deque<float> m_delay_w;             // the repair weight of each delayed sample
+    // The oracles: the reference of the current block, delayed with the
+    // samples; the held carrier amplitude and the reference's peak power.
+    std::vector<float> m_ref;
+    std::deque<std::complex<float>> m_delay_ref;
+    float m_held_re = 0.0f, m_held_im = 0.0f, m_ref_peak = 0.0f;
     // Repair weights of the current block (set_repair_weights), and the
     // largest since the last kept sample.
     std::vector<float> m_w;

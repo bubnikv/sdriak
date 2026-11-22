@@ -167,6 +167,13 @@ public:
     // Coherent, one spread class: the spread, measured on the station
     // (BellBackendConfig::measure_spread), in place of coh_spread.
     void  set_spread(float b);
+    // Coherent, measurement only: the next sample's gain, known (every path
+    // takes it, zero variance) in place of the paths' own filters.
+    void  set_known_gain(float re, float im) {
+        m_known = true;
+        m_kgr = re;
+        m_kgi = im;
+    }
 
 private:
     // Element types k.
@@ -228,6 +235,8 @@ private:
     static constexpr float kNoLog = -1e30f;
     float m_yr = 0.0f, m_yi = 0.0f;
     float m_wt = 0.0f;                      // the sample's repair weight
+    bool  m_known = false;                  // set_known_gain(): the gain known
+    float m_kgr = 0.0f, m_kgi = 0.0f;
     std::vector<float> m_coha;
     float m_omega = 10.0f;
     std::vector<float> m_yikip, m_yiksv;

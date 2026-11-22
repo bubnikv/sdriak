@@ -677,6 +677,8 @@ std::unique_ptr<SkimDecodeBackend> make_backend(const std::string &name) {
             else if (suf == "gate") c.gate = true;
             else if (suf == "cafc") c.coarse_afc = true;
             else if (suf == "mspread") c.measure_spread = true;
+            else if (suf == "ofreq") c.oracle_freq = true;
+            else if (suf == "ogain") c.oracle_gain = true;
             else if (suf.rfind("dsharp", 0) == 0) c.decoder.dur_sharpness = static_cast<float>(std::atof(suf.c_str() + 6));
             else if (suf.rfind("delay", 0) == 0) c.decoder.ndelay = std::atoi(suf.c_str() + 5);
             else if (suf.rfind("floor", 0) == 0) c.decoder.coh_floor_ratio = static_cast<float>(std::atof(suf.c_str() + 5));
@@ -740,6 +742,11 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     if (!ch) { std::fprintf(stderr, "bad channelizer geometry\n"); std::exit(2); }
     auto dec = backend.channel_new(ch->out_rate());
     const ImpulseRepair *repair = ch->repair();
+    // The bounds' truth (Bell :ofreq, :ogain): the target alone through a
+    // second filter bank, handed to the channel as its reference.
+    const bool want_ref = o.cfg.find(":ofreq") != std::string::npos || o.cfg.find(":ogain") != std::string::npos;
+    auto chr = want_ref ? SkimChannelizer::create_ex(o.rate, 125.0, o.passband, o.taps) : nullptr;
+    std::vector<float> riq(want_ref ? 2 * 512 : 0), rbuf(want_ref ? 2 * 4096 : 0);
     std::vector<float> wch(4096);           // the channel frames' repair weights
     const double enbw = channel_enbw(o);
     const double chan_hz = ch->offset_hz(o.channel);
@@ -980,6 +987,10 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
                 }
             }
             if (k >= step_at && !o.step_noise) s *= step_g;
+            if (want_ref) {
+                riq[2 * i] = static_cast<float>(s.real() * out_g);
+                riq[2 * i + 1] = static_cast<float>(s.imag() * out_g);
+            }
             for (Qrm &q : qrm) {
                 const float e = q.key.next(qw, qsum);
                 if (e > 0.0f) s += std::polar(q.amp * e, q.w * static_cast<double>(k));
@@ -1035,6 +1046,11 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
         ch->push(iq.data(), static_cast<unsigned>(n));
         const unsigned got = ch->read(o.channel, cbuf.data(), 4096, wch.data());
         if (repair && got) dec->set_repair_weights(wch.data(), got);
+        if (chr) {
+            chr->push(riq.data(), static_cast<unsigned>(n));
+            const unsigned rgot = chr->read(o.channel, rbuf.data(), 4096);
+            if (rgot == got && got) dec->set_reference(rbuf.data(), got);
+        }
         SkimDecode d{};
         if (got && dec->process(cbuf.data(), got, &d)) out += d.text;
     }

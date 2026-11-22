@@ -572,8 +572,8 @@ float BellDecoder::kalfil_coh(int ip, int ixs, int jnode, float pin, int c) {
         return kNoLog;
     }
     const float a = m_coha[c];
-    const float gr = a * m_ykkip[ip], gi = a * m_yikip[ip];
-    const float ppred = a * a * m_pkkip[ip] + (1.0f - a * a) * m_omega;
+    const float gr = m_known ? m_kgr : a * m_ykkip[ip], gi = m_known ? m_kgi : a * m_yikip[ip];
+    const float ppred = m_known ? 0.0f : a * a * m_pkkip[ip] + (1.0f - a * a) * m_omega;
     const bool imp = m_cfg.coh_imp_eps > 0.0f;
     const float kappa = m_cfg.coh_imp_kappa;
     // ln(e^a + e^b), for the impulse mixture.
