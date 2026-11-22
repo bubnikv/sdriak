@@ -136,4 +136,22 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_test(NAME cw_engine_bench_startup COMMAND cw_engine_bench --gate startup)
     set_tests_properties(cw_engine_bench cw_engine_bench_startup PROPERTIES TIMEOUT 300)
     set_tests_properties(cw_engine_bench_startup PROPERTIES WILL_FAIL TRUE)
+
+    # The DeepCW CPU throughput measurement (experiments/deepcw_throughput):
+    # windows per CPU-second over batch, worker and thread counts. A
+    # measurement, not a gate: no add_test.
+    if (OPT_BUILD_CW_DEEPCW)
+        add_executable(cw_engine_deepcw_throughput experiments/deepcw_throughput/deepcw_throughput.cpp)
+        target_link_libraries(cw_engine_deepcw_throughput PRIVATE cw_engine)
+        set_target_properties(cw_engine_deepcw_throughput PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED ON)
+        if (SDRPP_RUNTIME_OUTPUT_DIRECTORY)
+            set_target_properties(cw_engine_deepcw_throughput PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${SDRPP_RUNTIME_OUTPUT_DIRECTORY}")
+        endif ()
+        if (MSVC)
+            target_compile_definitions(cw_engine_deepcw_throughput PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif ()
+    endif ()
 endif ()

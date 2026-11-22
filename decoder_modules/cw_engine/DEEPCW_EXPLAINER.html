@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DeepCW Decoder Structure</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Space+Grotesk:wght@500;600;700&display=swap">
+<style>
+/* Layout: one reading column (~68ch) with wide figures and the two labs breaking out to 1040px. */
+:root {
+  --bg: #f3f6f7;
+  --surface: #ffffff;
+  --sunk: #e8eef1;
+  --fg: #142029;
+  --muted: #566573;
+  --line: #d3dce2;
+  --accent: #0a6a86;
+  --accent-soft: rgba(10, 106, 134, 0.16);
+  --truth: #a85b16;
+  --bad: #b42318;
+  --good: #2b7a4b;
+  --warn: #9a6a00;
+  --shade: rgba(20, 32, 41, 0.07);
+  --f-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e151a; --surface: #152029; --sunk: #1b2933; --fg: #e2e9ee; --muted: #93a3b0; --line: #2a3a45;
+    --accent: #52b6d4; --accent-soft: rgba(82, 182, 212, 0.20); --truth: #e39a55; --bad: #f2776c; --good: #6cc792; --warn: #e0b54a;
+    --shade: rgba(226, 233, 238, 0.07); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e151a; --surface: #152029; --sunk: #1b2933; --fg: #e2e9ee; --muted: #93a3b0; --line: #2a3a45;
+  --accent: #52b6d4; --accent-soft: rgba(82, 182, 212, 0.20); --truth: #e39a55; --bad: #f2776c; --good: #6cc792; --warn: #e0b54a;
+  --shade: rgba(226, 233, 238, 0.07); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 16.5px; line-height: 1.62;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 64px;
+}
+main { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 0; }
+.col { max-width: 68ch; width: 100%; margin: 0 auto; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.2; letter-spacing: -0.01em; }
+h1 { font-size: clamp(2rem, 4.6vw, 3rem); margin: 0 0 12px; font-weight: 700; }
+h2 { font-size: 1.6rem; margin: 56px 0 10px; font-weight: 600; }
+h3 { font-size: 1.15rem; margin: 28px 0 6px; font-weight: 600; }
+p { margin: 0 0 14px; }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code, .mono { font-family: var(--f-mono); font-size: 0.88em; }
+code { background: var(--sunk); padding: 1px 5px; border-radius: 4px; }
+.eyebrow { font-family: var(--f-mono); font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+header.top { padding-block: 48px 8px; }
+.lede { font-size: 1.12rem; color: var(--fg); }
+.sub { color: var(--muted); font-size: 0.95rem; }
+.sec-no { font-family: var(--f-mono); font-size: 0.8rem; color: var(--accent); letter-spacing: 0.06em; display: block; margin-bottom: 4px; }
+.eq {
+  font-family: var(--f-mono); font-size: 0.9rem; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 6px; padding: 12px 14px; margin: 0 0 16px; overflow-x: auto; white-space: pre; line-height: 1.55;
+}
+.eq .c { color: var(--muted); }
+ul, ol { margin: 0 0 14px; padding-left: 1.3em; }
+li { margin-bottom: 6px; }
+li::marker { color: var(--muted); }
+.answers { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px 6px; margin: 18px 0 8px; }
+.answers h2 { margin-top: 0; font-size: 1.15rem; }
+.answers dl { margin: 0; display: grid; grid-template-columns: minmax(0, 14em) minmax(0, 1fr); gap: 10px 18px; }
+.answers dt { font-weight: 600; font-family: var(--f-display); }
+.answers dd { margin: 0; }
+@media (max-width: 640px) { .answers dl { grid-template-columns: minmax(0, 1fr); gap: 2px 0; } .answers dd { margin-bottom: 10px; } }
+figure { margin: 18px 0 22px; }
+figure .svgwrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+figcaption { font-size: 0.88rem; color: var(--muted); margin-top: 6px; }
+svg text { font-family: var(--f-body); fill: var(--fg); }
+svg .m { fill: var(--muted); }
+svg .mono { font-family: var(--f-mono); }
+.tbl { overflow-x: auto; margin: 0 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--f-display); font-weight: 600; font-size: 0.85rem; color: var(--muted); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--f-mono); font-size: 0.86rem; }
+.lab { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 22px 0; }
+.lab h3 { margin-top: 0; }
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 18px; margin-bottom: 14px; }
+.ctl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ctl label { font-size: 0.8rem; color: var(--muted); font-family: var(--f-mono); letter-spacing: 0.02em; display: flex; justify-content: space-between; gap: 8px; }
+.ctl label b { color: var(--fg); font-weight: 500; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+select, button { font: inherit; font-size: 0.9rem; color: var(--fg); background: var(--sunk); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+.seg { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; width: fit-content; max-width: 100%; flex-wrap: wrap; }
+.seg button { border: 0; border-radius: 0; background: transparent; padding: 6px 12px; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
+canvas { display: block; width: 100%; background: var(--bg); border-radius: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.82rem; color: var(--muted); margin: 8px 0 12px; }
+.legend span::before { content: ""; display: inline-block; width: 18px; height: 3px; border-radius: 2px; background: var(--c); vertical-align: middle; margin-right: 6px; }
+.legend span.box::before { height: 10px; background: var(--c); opacity: 0.9; }
+.metrics td.best { color: var(--good); font-weight: 500; }
+.note { font-size: 0.88rem; color: var(--muted); }
+.callout { border-left: 3px solid var(--accent); padding: 4px 0 4px 14px; margin: 0 0 16px; }
+.finding { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.finding:first-of-type { border-top: 1px solid var(--line); }
+.finding .tag { font-family: var(--f-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; height: fit-content; white-space: nowrap; border: 1px solid currentColor; }
+.tag.bug { color: var(--bad); }
+.tag.model { color: var(--warn); }
+.finding h3 { margin: 0 0 4px; font-size: 1.02rem; }
+.finding p { margin: 0 0 8px; }
+.finding .loc { font-family: var(--f-mono); font-size: 0.8rem; color: var(--muted); }
+.steps { counter-reset: s; list-style: none; padding: 0; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 2.2em minmax(0, 1fr); gap: 0 10px; margin-bottom: 12px; }
+.steps li::before { content: counter(s); font-family: var(--f-mono); color: var(--accent); font-size: 0.9rem; padding-top: 2px; }
+.readout { font-family: var(--f-mono); font-size: 0.85rem; background: var(--sunk); border-radius: 6px; padding: 10px 12px; margin-top: 10px; line-height: 1.6; }
+.readout .neg { color: var(--bad); font-weight: 500; }
+.refs li { font-size: 0.9rem; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<style>
+.arch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+@media (max-width: 760px) { .arch { grid-template-columns: minmax(0, 1fr); } }
+.arch .m { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.arch h3 { margin: 0 0 2px; font-size: 1.05rem; }
+.arch .who { font-family: var(--f-mono); font-size: 0.75rem; color: var(--muted); margin: 0 0 10px; }
+.arch ol { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.arch li { margin: 0; background: var(--sunk); border-radius: 6px; padding: 6px 9px; font-size: 0.86rem; line-height: 1.4; }
+.arch li b { font-family: var(--f-display); font-weight: 600; }
+.arch li .d { display: block; font-family: var(--f-mono); font-size: 0.76rem; color: var(--muted); }
+.arch li.diff { box-shadow: inset 3px 0 0 var(--truth); }
+.arch .foot { font-family: var(--f-mono); font-size: 0.78rem; color: var(--muted); margin-top: 10px; }
+.bars { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px; }
+.bar { display: grid; grid-template-columns: 9.5em minmax(0, 1fr) 6.5em; gap: 10px; align-items: center; font-size: 0.86rem; }
+.bar .track { height: 16px; background: var(--sunk); border-radius: 4px; overflow: hidden; display: flex; }
+.bar .track span { height: 100%; }
+.bar .v { font-family: var(--f-mono); font-size: 0.8rem; text-align: right; }
+.k-front { background: var(--truth); } .k-lin { background: var(--accent); } .k-attn { background: var(--warn); }
+.out { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 12px; }
+.out div { background: var(--sunk); border-radius: 8px; padding: 10px 12px; }
+.out .lbl { font-size: 0.76rem; color: var(--muted); font-family: var(--f-mono); }
+.out .val { font-family: var(--f-display); font-size: 1.35rem; font-weight: 600; }
+.out .val small { font-size: 0.8rem; color: var(--muted); font-weight: 500; }
+</style>
+
+<main>
+<header class="top col">
+  <p class="eyebrow">cw_engine · DeepCW · explainer</p>
+  <h1>The DeepCW decoders: what is inside, and how to run hundreds</h1>
+  <p class="lede">The three neural CW models the engine runs — DeepCW v1, v2 wide and v2 narrow — layer by layer, how they differ, why their windows can neither be padded nor cached, what one channel costs, and how to spread hundreds of parallel signals over a CPU or a GPU.</p>
+  <p class="sub">The architecture is read from the pinned ONNX files themselves (sha256 as in <code>deepcw_runtime.h</code>: v1 <code>ef120799…</code>, v2 <code>cd5ee381…</code>, v2 narrow <code>fc80c4ba…</code>): operator counts, initialiser shapes, convolution attributes, quantisation nodes. The streaming side is from <code>decode_deepcw.cpp</code>, <code>decode_deepcw2.cpp</code> and <code>deepcw_runtime.cpp</code>; measurements from <code>DeepCW.md</code>. Compute figures are multiply-accumulates (MAC) counted from the layer shapes; a FLOP is two of them.</p>
+</header>
+
+<section class="col">
+<div class="answers">
+  <h2>Short answers</h2>
+  <dl>
+    <dt>What they are</dt>
+    <dd>All three are the same design: a log-magnitude spectrogram tile, a small strided 2-D conv front end, a Conformer encoder, a 42-class CTC head read greedily. None is a streaming model: every window is read whole, every frame sees every other.</dd>
+    <dt>v1 → v2 wide</dt>
+    <dd>Same encoder (6 blocks, d 192, 3.6 M parameters). v2 normalises its input by a noise level, quantises the front end to int8/uint8, swaps SiLU for ReLU there, and halves the time resolution in the first conv (30 ms output frames). About ⅓ the compute per second of audio.</dd>
+    <dt>v2 narrow</dt>
+    <dd>A different scale: 3 input bins instead of 65, 2 convs (12, 24 channels), 3 Conformer blocks at d 64, 0.2 M parameters — 1/17 of v2 wide's compute, 1/59 of v1's at their window lengths.</dd>
+    <dt>Quality</dt>
+    <dd>Equal in white noise. Under fast fading and multipath v1 reads 2–4× better than both v2 models at 0–10 dB; the stitcher is not the cause (<code>DeepCW.md</code>).</dd>
+    <dt>Hundreds on a CPU</dt>
+    <dd>Only the narrow model: ≈ 0.06 GMAC per channel-second, a few cores for 300 keyed channels. The wide models cost 0.1 (v2) to 0.36 (v1) of a core per channel.</dd>
+    <dt>Hundreds on a GPU</dt>
+    <dd>The way to run v1 or v2 wide at scale: 300 channels of v1 are ≈ 2.2 TFLOP/s, one mid-range GPU. It needs batches, so the channels must tick together and their windows must have equal length — the runtime's job queue already batches by length, the channels stagger their ticks on purpose.</dd>
+    <dt>The biggest lever</dt>
+    <dd>Neither device: each 1 s tick re-reads 7 s (v2) or 10 s (v1) of audio, so 85–90 % of the work is a re-read. The tick step, a narrow-first cascade and, with retraining, a streaming encoder move the bill more than any runtime tuning.</dd>
+  </dl>
+</div>
+</section>
+
+<section class="col">
+  <span class="sec-no">§1 · the common shape</span>
+  <h2>One design at two scales</h2>
+  <p>e04's models read a spectrogram tile <code>[batch, 1, time, bins]</code> at 12.5 Hz per bin and one frame per 15 ms (here 16 ms: the channel front end's hop, a 6.7 % stretch). The output is <code>[batch, frames, 42]</code> log-probabilities over <code>, . / 0–9 ? A–Z</code>, space and the CTC blank; a greedy CTC collapse (argmax per frame, merge repeats, drop blanks) turns it into text. No beam search, no language model.</p>
+</section>
+
+<div class="arch" role="list">
+  <div class="m" role="listitem">
+    <h3>DeepCW v1</h3>
+    <p class="who">deepcw-engine 8e264d2 · 3 614 481 params · fp32</p>
+    <ol>
+      <li><b>Input</b> 65 bins, 400–1200 Hz<span class="d">log1p |X| (here: window peak → 30 first)</span></li>
+      <li><b>Conv 3×3, 1→32</b>, stride (1,2)<span class="d">GroupNorm 8 · SiLU · freq 65→33</span></li>
+      <li><b>Conv 3×3, 32→64</b>, stride (1,2)<span class="d">GroupNorm 8 · SiLU · freq 33→17</span></li>
+      <li><b>Conv 3×3, 64→96</b>, stride (1,2)<span class="d">GroupNorm 8 · SiLU · freq 17→9</span></li>
+      <li><b>Linear 864→192</b> + sinusoidal position</li>
+      <li><b>6 × Conformer</b>, d 192<span class="d">½FFN 192→384→192 · MHSA 6×32 · conv: pw→384, GLU, depthwise k17, SiLU, pw · ½FFN · LN</span></li>
+      <li><b>Linear 192→42</b>, LogSoftmax<span class="d">one frame per input frame (15 ms)</span></li>
+    </ol>
+  </div>
+  <div class="m" role="listitem">
+    <h3>DeepCW v2 wide</h3>
+    <p class="who">deepcw-engine c18fce5 · 3 614 874 params · QDQ front end</p>
+    <ol>
+      <li class="diff"><b>Input</b> 65 bins<span class="d">noise_q90_log1p, then uint8 (scale 0.0211: clips ≈ 47 dB over noise)</span></li>
+      <li class="diff"><b>Conv 3×3, 1→32</b>, stride <b>(2,2)</b><span class="d">int8 weights · GroupNorm 8 · ReLU · time halves here</span></li>
+      <li class="diff"><b>Conv 3×3, 32→64</b>, stride (1,2)<span class="d">int8 weights · GroupNorm 8 · ReLU</span></li>
+      <li class="diff"><b>Conv 3×3, 64→96</b>, stride (1,2)<span class="d">int8 weights · GroupNorm 8 · ReLU</span></li>
+      <li><b>Linear 864→192</b> + sinusoidal position</li>
+      <li><b>6 × Conformer</b>, d 192<span class="d">identical shapes to v1 (retrained weights)</span></li>
+      <li class="diff"><b>Linear 192→42</b><span class="d">one frame per 2 input frames (30 ms)</span></li>
+    </ol>
+  </div>
+  <div class="m" role="listitem">
+    <h3>DeepCW v2 narrow</h3>
+    <p class="who">model_narrow.onnx · 199 331 params · QDQ front end</p>
+    <ol>
+      <li class="diff"><b>Input</b> 3 bins, 787.5–812.5 Hz<span class="d">noise_q90_log1p, uint8 (scale 0.0136: clips ≈ 30 dB)</span></li>
+      <li class="diff"><b>Conv 3×3, 1→12</b>, stride (2,2)<span class="d">int8 · GroupNorm 6 · ReLU · freq 3→2</span></li>
+      <li class="diff"><b>Conv 3×3, 12→24</b>, stride (1,2)<span class="d">int8 · GroupNorm 8 · ReLU · freq 2→1</span></li>
+      <li class="diff"><b>Linear 24→64</b> + sinusoidal position</li>
+      <li class="diff"><b>3 × Conformer</b>, d 64<span class="d">½FFN 64→128→64 · MHSA 4×16 · depthwise k15</span></li>
+      <li><b>Linear 64→42</b><span class="d">30 ms frames</span></li>
+    </ol>
+  </div>
+</div>
+<p class="col note">Marked rows differ from v1. Read from the graphs: 21 / 21 / 11 <code>Conv</code> nodes, 6 / 6 / 3 <code>Softmax</code> (one per attention), 27 / 24 / 12 <code>Sigmoid</code> (SiLU and GLU gates), 32 / 32 / 17 <code>LayerNormalization</code>; head size from the reshape constants (32 for v1/v2, 16 for narrow). The GroupNorms are exported as <code>InstanceNormalization</code> over channel groups, time included.</p>
+
+<section class="col">
+  <span class="sec-no">§2 · how they differ</span>
+  <h2>Five differences, and which ones matter</h2>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>v1</th><th>v2 wide</th><th>v2 narrow</th></tr></thead>
+    <tbody>
+      <tr><td>Input scale</td><td>raw log1p — not scale-invariant; real IQ fell below the first norm's range, so the backend peak-normalises each window</td><td colspan="2">magnitude ÷ noise level (90th percentile ÷ 2.146), log1p, uint8: the level is fixed by the noise, strong lines clip</td></tr>
+      <tr><td>Time resolution out</td><td>15 ms (16 ms here)</td><td colspan="2">30 ms (32 ms here): a 24 WPM dit is 1.6 output frames</td></tr>
+      <tr><td>Front end</td><td>fp32, SiLU</td><td colspan="2">int8 weights, uint8 activations (QDQ), ReLU</td></tr>
+      <tr><td>Frequency view</td><td colspan="2">65 bins (800 Hz); in this engine only the channel's 11 bins are filled, the other 54 are zero</td><td>3 bins (37.5 Hz) around the line: needs the tone centred</td></tr>
+      <tr><td>Encoder</td><td colspan="2">6 blocks, d 192, 6 heads, k 17</td><td>3 blocks, d 64, 4 heads, k 15</td></tr>
+      <tr><td>Streaming here</td><td>OK1BR/OK1HRA: re-read the 10 s ring each tick, commit spikes ≥ 1 s from the end, frame cursor</td><td colspan="2">e04's stitcher: ≤ 12 s windows (7 s steady), log-probs averaged over overlapping windows with smoothstep edges, commit before a 2 s guard</td></tr>
+    </tbody>
+  </table></div>
+  <p>The first difference is the one an integrator meets: v2 is calibrated by the noise, so the noise estimate is part of the model's input. In an 11-of-65-bin tile the model's own 90th-percentile rule lands on the signal, which is why <code>deepcw2</code> takes the populated bins' median (<code>noise_mode</code> "median"). The second and fifth are the candidates for the quality gap under fading — v2 is both coarser in time and retrained, and running v1 through v2's stitcher (<code>deepcw2v1</code>) reads as well as v1 does with its own commit rule, so the streaming is ruled out.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Payload CER (cw_bench, 24 WPM)</th><th class="num">v1</th><th class="num">v2 wide</th><th class="num">v2 narrow</th><th class="num">Bayesian v3</th></tr></thead>
+    <tbody>
+      <tr><td>AWGN, SNR500 at 10 % CER (25 WPM)</td><td class="num">−3.4 dB</td><td class="num">−3.2 dB</td><td class="num">−3.6 dB</td><td class="num">−0.9 dB</td></tr>
+      <tr><td>ITU poor, +10 dB</td><td class="num">0.06</td><td class="num">0.17</td><td class="num">0.13</td><td class="num">0.46</td></tr>
+      <tr><td>ITU low latitude (10 Hz), +10 dB</td><td class="num">0.17</td><td class="num">0.18</td><td class="num">0.32</td><td class="num">0.66</td></tr>
+      <tr><td>flat 3 Hz, +10 dB</td><td class="num">0.08</td><td class="num">0.26</td><td class="num">0.24</td><td class="num">0.59</td></tr>
+      <tr><td>two-path beat, +10 dB</td><td class="num">0.13</td><td class="num">0.49</td><td class="num">0.41</td><td class="num">0.64</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">v2 wide with the median noise level (the default). Full table and conditions: <code>DeepCW.md</code>, "Synthetic bench".</p>
+</section>
+
+<section class="col">
+  <span class="sec-no">§3 · why windows are read whole</span>
+  <h2>No padding, no cache: three properties of the graph</h2>
+  <ol class="steps">
+    <li><span><b>The front-end norms span time.</b> Each GroupNorm normalises a channel group over the whole window — every time step of it. Append zeros and the mean and variance change for every real frame.</span></li>
+    <li><span><b>The attention has no mask.</b> Every output frame is a softmax over all frames of the window, padding included. There is no attention mask input to the graph at all.</span></li>
+    <li><span><b>The position code is absolute.</b> The sinusoidal table is built at run time for the window's length and added once; frame 0 is the window's start, not the stream's.</span></li>
+  </ol>
+  <p>Two consequences shape everything below. A batch may only hold windows of <em>equal length</em> — <code>DeepcwRuntime::worker_main</code> takes the oldest job and every queued job of its length, where upstream zero-padded to the longest and got different readings batched than alone. And nothing computed for one tick can be reused at the next: there is no key/value cache to extend, so each tick pays for the whole window again. A model that streams would have to be trained to (§6).</p>
+</section>
+
+<section class="col">
+  <span class="sec-no">§4 · what one window costs</span>
+  <h2>Compute per window, and per channel-second</h2>
+  <p>Counted from the layer shapes at the engine's 62.5 frames/s, for each backend's steady-state window: v1 re-reads its 10 s ring (625 frames); <code>deepcw2</code> reads 4 s of left context + 2 s freeze guard + 1 s step = 7 s (438 frames). With one tick per second this is also the cost per channel-second.</p>
+  <div class="bars" aria-label="Compute per steady-state window, split into front end, linear layers and attention">
+    <div class="bar"><span>v1 · 10 s</span><span class="track"><span class="k-front" style="width:11.3%"></span><span class="k-lin" style="width:48.3%"></span><span class="k-attn" style="width:19.8%"></span></span><span class="v">3.61 GMAC</span></div>
+    <div class="bar"><span>v1 · 7 s</span><span class="track"><span class="k-front" style="width:7.9%"></span><span class="k-lin" style="width:33.8%"></span><span class="k-attn" style="width:9.7%"></span></span><span class="v">2.34 GMAC</span></div>
+    <div class="bar"><span>v2 wide · 7 s</span><span class="track"><span class="k-front" style="width:4.0%"></span><span class="k-lin" style="width:16.9%"></span><span class="k-attn" style="width:2.4%"></span></span><span class="v">1.06 GMAC</span></div>
+    <div class="bar"><span>v2 narrow · 7 s</span><span class="track"><span class="k-front" style="width:0.1%"></span><span class="k-lin" style="width:0.92%"></span><span class="k-attn" style="width:0.4%"></span></span><span class="v">0.061 GMAC</span></div>
+  </div>
+  <div class="legend"><span class="box" style="--c: var(--truth)">conv front end</span><span class="box" style="--c: var(--accent)">projections, FFN, conv module, head</span><span class="box" style="--c: var(--warn)">attention QKᵀ and AV</span></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Model, window</th><th class="num">front</th><th class="num">linear</th><th class="num">attention</th><th class="num">total</th><th class="num">attn matrix / window / layer</th></tr></thead>
+    <tbody>
+      <tr><td>v1, 10 s</td><td class="num">0.51 G</td><td class="num">2.19 G</td><td class="num">0.90 G</td><td class="num">3.61 G</td><td class="num">9.4 MB</td></tr>
+      <tr><td>v2 wide, 7 s</td><td class="num">0.18 G</td><td class="num">0.77 G</td><td class="num">0.11 G</td><td class="num">1.06 G</td><td class="num">1.2 MB</td></tr>
+      <tr><td>v2 wide, 12 s (max)</td><td class="num">0.31 G</td><td class="num">1.32 G</td><td class="num">0.32 G</td><td class="num">1.95 G</td><td class="num">3.4 MB</td></tr>
+      <tr><td>v2 narrow, 7 s</td><td class="num">0.6 M</td><td class="num">42 M</td><td class="num">18 M</td><td class="num">61 M</td><td class="num">0.8 MB</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three things stand out. The linear layers dominate, so cost is close to linear in window length for v2; v1's attention is already a quarter of its bill at 10 s because it attends over twice the frames. The front end of both wide models runs mostly on zeros: 54 of the 65 bins are empty in this engine, but the convolution computes them anyway. And v2's time stride is where its ⅓ comes from — the encoder sees half the frames, attention a quarter.</p>
+  <h3>Against the bench</h3>
+  <p>Summing these counts over the bench's ticks (a 27 s over plus a 4 s tail, the ring filling up) and dividing by the measured single-thread times gives what ONNX Runtime achieves on one core:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Model</th><th class="num">GMAC over the over</th><th class="num">measured</th><th class="num">achieved</th><th class="num">core share per keyed channel</th></tr></thead>
+    <tbody>
+      <tr><td>v1</td><td class="num">94</td><td class="num">9.4 s</td><td class="num">10.0 GMAC/s</td><td class="num">≈ 0.36</td></tr>
+      <tr><td>v2 wide</td><td class="num">29</td><td class="num">3.0 s</td><td class="num">9.8 GMAC/s</td><td class="num">≈ 0.11</td></tr>
+      <tr><td>v2 narrow</td><td class="num">1.7</td><td class="num">0.39 s</td><td class="num">4.3 GMAC/s</td><td class="num">≈ 0.014</td></tr>
+    </tbody>
+  </table></div>
+  <p>The wide models run at the same rate, so the counts explain their timings. The narrow model runs at less than half that rate: with d 64 its matrix products are small and the ~200 graph nodes of a run cost a fixed overhead each. That is what batching recovers, on either device.</p>
+</section>
+
+<section class="col">
+  <span class="sec-no">§5 · hundreds of signals</span>
+  <h2>CPU or GPU</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>300 keyed channels, 1 s ticks</th><th class="num">GMAC/s</th><th class="num">TFLOP/s</th><th class="num">CPU cores at the bench rate</th><th>where it fits</th></tr></thead>
+    <tbody>
+      <tr><td>v1, 10 s ring</td><td class="num">1 080</td><td class="num">2.2</td><td class="num">≈ 108</td><td>GPU</td></tr>
+      <tr><td>v2 wide, 7 s</td><td class="num">318</td><td class="num">0.64</td><td class="num">≈ 32</td><td>GPU (or a server CPU)</td></tr>
+      <tr><td>v2 narrow, 7 s</td><td class="num">18</td><td class="num">0.04</td><td class="num">≈ 4 (batch 1), fewer batched</td><td>CPU</td></tr>
+    </tbody>
+  </table></div>
+  <p>Data movement is no constraint anywhere: a 7 s wide tile is 114 KB, 300 of them per second are 34 MB/s over PCIe; the narrow tile is 5 KB. What decides is arithmetic and whether the work arrives in batches.</p>
+
+  <h3>On a CPU: the narrow model, many workers, small threads</h3>
+  <ul>
+    <li><b>Model.</b> Only v2 narrow scales to hundreds on a desktop. The wide models are 9 (v2) to 3 (v1) channels per core.</li>
+    <li><b>Threads.</b> Prefer parallelism across runs over parallelism inside one: <code>workers</code> ≈ physical cores, <code>threads</code> 1–2. The products of a d-64 model are too small to split well over 4 intra-op threads (the default is 4 × 2 workers), and independent runs scale nearly linearly. <code>DeepcwRuntimeConfig::workers</code> is clamped to 8, which a larger machine would need lifted. Leave cores for the channelizer and the engine thread.</li>
+    <li><b>Batching.</b> The queue already batches equal-length windows (<code>batch</code> 32). On a CPU batching does not save arithmetic, it amortises the per-node overhead — the 4.3 → ~10 GMAC/s gap above. The staggered ticks (<code>m_tick_phase</code>) are right for the CPU: they spread the load over the second, and with hundreds of channels a worker still finds several windows of one length queued.</li>
+    <li><b>Quantisation.</b> Dynamic int8 on the encoder's MatMuls (VNNI/AMX) is the usual 2–3× on a CPU, but it changes the model; it would need the bench tables re-run before it could be trusted.</li>
+  </ul>
+
+  <h3>On a GPU: v1 or v2 wide, in big aligned batches</h3>
+  <ul>
+    <li><b>Model.</b> The GPU is how the better-under-fading v1 (or v2 wide) runs at scale. 2.2 TFLOP/s for 300 channels of v1 is a fraction of a current mid-range card's fp32 peak; at the 20–40 % of peak ONNX Runtime typically reaches on shapes like these it is one card, with margin. (An estimate from counts, not a measurement.)</li>
+    <li><b>Align the ticks.</b> A GPU wants one launch for all channels, not one per channel. Today each channel ticks at its own phase (<code>(registration × 7) mod tick</code>), which on a GPU yields many small batches. With a common phase, every second brings one batch per window length.</li>
+    <li><b>Make lengths equal without padding.</b> v1's windows are all 10 s once the ring is full. <code>deepcw2</code>'s are 7 s in steady state, but shorter for a young channel and up to 12 s after the gate was shut. Snap each window's start to a length grid — 0.5 s, say — by taking a little more real left context from the 14 s ring, never by padding (§3). The stitcher's weights tolerate a window starting slightly earlier; padding they do not.</li>
+    <li><b>Cap the batch by memory.</b> The graph spells attention out as MatMul → Softmax → MatMul, so the full score matrix is materialised: 9.4 MB per v1 window per layer, plus the softmax's output. A batch of 256 v1 windows is several GB transient; v2's 1.2 MB is easy.</li>
+    <li><b>Fixed shapes.</b> With a length grid and a few batch sizes the shapes are a small fixed set: the CUDA execution provider stops re-searching convolution algorithms per shape, and TensorRT (fp16) or CUDA graphs become possible. fp16 against the uint8 input quantisation of v2 should be checked on cw_bench first. Bind inputs and outputs to pinned buffers (I/O binding) and keep one session, shared by the workers.</li>
+    <li><b>Replays stay on the CPU.</b> Batched GPU results can differ in the last bits from a batch-1 CPU run; the deterministic replay path (<code>sync</code>) should remain CPU, batch 1.</li>
+  </ul>
+</section>
+
+<section class="col">
+  <span class="sec-no">§6 · levers before hardware</span>
+  <h2>What moves the bill more than the device</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Lever</th><th class="num">factor</th><th>cost</th></tr></thead>
+    <tbody>
+      <tr><td><b>Gate</b> (already in): infer only on a keyed line, with a hangover</td><td class="num">÷ 1/duty</td><td>none; the calculator's "active share"</td></tr>
+      <tr><td><b>Narrow-first cascade</b>: v2 narrow on every channel, v1/v2 wide only where the narrow reading is uncertain or the channel fades fast — where v1's advantage is</td><td class="num">≈ ÷ 3–10 on the wide bill</td><td>a trigger rule to design and measure</td></tr>
+      <tr><td><b>Longer tick</b>: 2 s instead of 1 s</td><td class="num">÷ 2</td><td>+1 s latency; stitcher overlap halves</td></tr>
+      <tr><td><b>Shorter v1 window</b>: 7 s instead of the 10 s ring</td><td class="num">÷ 1.5</td><td>less left context; OK1BR tuned 10 s</td></tr>
+      <tr><td><b>Crop the zero bins</b> — impossible without retraining; the front end is ~15 % of the wide bill</td><td class="num">—</td><td>a model trained on the channel's bins</td></tr>
+      <tr><td><b>A streaming encoder</b>: chunked attention with a key/value cache, causal or bounded norms, relative positions; each tick then costs its new second, not the window</td><td class="num">≈ ÷ 7–10</td><td>retraining; e04 publishes no training code (VE3NEA's MIT generator is the route, <code>doc/research/nn-cw-decoders-denoisers.md</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The structural waste is the re-read: each tick advances the stream by one second and pays for seven or ten. A GPU makes that waste affordable; only a streaming model removes it.</p>
+</section>
+
+<section class="col">
+<div class="lab">
+  <h3>Load calculator</h3>
+  <p class="note">MAC counts as in §4. CPU rate defaults to the bench's single-core figure; the GPU rate is the effective (not peak) throughput you expect — an assumption, set it to your card.</p>
+  <div class="controls">
+    <div class="ctl"><label>model</label>
+      <div class="seg" id="mdl"><button aria-pressed="true" data-m="v1">v1</button><button aria-pressed="false" data-m="v2">v2 wide</button><button aria-pressed="false" data-m="v2n">v2 narrow</button></div></div>
+    <div class="ctl"><label for="ch">channels <b id="chv"></b></label><input id="ch" type="range" min="10" max="1000" step="10" value="300"></div>
+    <div class="ctl"><label for="act">active share (gate) <b id="actv"></b></label><input id="act" type="range" min="0.1" max="1" step="0.05" value="1"></div>
+    <div class="ctl"><label for="win">window, s <b id="winv"></b></label><input id="win" type="range" min="3" max="12" step="0.5" value="10"></div>
+    <div class="ctl"><label for="step">tick step, s <b id="stepv"></b></label><input id="step" type="range" min="0.5" max="4" step="0.5" value="1"></div>
+    <div class="ctl"><label for="cpu">CPU GMAC/s per core <b id="cpuv"></b></label><input id="cpu" type="range" min="2" max="40" step="0.5" value="10"></div>
+    <div class="ctl"><label for="gpu">GPU effective TFLOP/s <b id="gpuv"></b></label><input id="gpu" type="range" min="1" max="40" step="1" value="5"></div>
+  </div>
+  <div class="out">
+    <div><div class="lbl">per window</div><div class="val" id="o1"></div></div>
+    <div><div class="lbl">total</div><div class="val" id="o2"></div></div>
+    <div><div class="lbl">CPU cores</div><div class="val" id="o3"></div></div>
+    <div><div class="lbl">GPU load</div><div class="val" id="o4"></div></div>
+    <div><div class="lbl">attn scores, whole batch, one layer</div><div class="val" id="o5"></div></div>
+    <div><div class="lbl">redundancy (window ÷ step)</div><div class="val" id="o6"></div></div>
+  </div>
+</div>
+</section>
+
+<section class="col">
+  <span class="sec-no">§7 · not measured</span>
+  <h2>What this page does not know</h2>
+  <ul>
+    <li>No GPU run of any model in this engine; the GPU figures are counts against an assumed efficiency.</li>
+    <li>The narrow model's batched CPU rate (the 4.3 → ~10 GMAC/s recovery is expected, not measured).</li>
+    <li>fp16 or int8 encoders against the bench's CER tables.</li>
+    <li>The cascade's trigger rule, and the stitcher's behaviour with 2 s ticks or grid-snapped window starts.</li>
+    <li>From <code>DeepCW.md</code>: nothing of v2 has run on channelized off-air IQ yet.</li>
+  </ul>
+</section>
+</main>
+
+<script>
+(() => {
+  const P = {
+    v1:  { d: 192, ff: 384, B: 6, k: 17, heads: 6, ts: 1, proj: 864, front: 32*33*9 + 64*17*288 + 96*9*576, frontAtTe: false, win: 10 },
+    v2:  { d: 192, ff: 384, B: 6, k: 17, heads: 6, ts: 2, proj: 864, front: 32*33*9 + 64*17*288 + 96*9*576, frontAtTe: true, win: 7 },
+    v2n: { d: 64,  ff: 128, B: 3, k: 15, heads: 4, ts: 2, proj: 24,  front: 12*2*9 + 24*1*108,               frontAtTe: true, win: 7 },
+  };
+  const fps = 62.5;
+  let m = 'v1';
+  const $ = id => document.getElementById(id);
+  function macs(p, T) {
+    const Te = Math.ceil(T / p.ts), d = p.d;
+    const blk = 2 * (d * p.ff * 2) + 3 * d * d + d * d + 2 * d * d + d * p.k + d * d;
+    return { tot: p.front * (p.frontAtTe ? Te : T) + Te * (p.proj * d + p.B * blk + d * 42) + p.B * 2 * Te * Te * d, Te };
+  }
+  const f = (x, u) => x >= 100 ? Math.round(x) + u : x >= 10 ? x.toFixed(1) + u : x.toFixed(2) + u;
+  function run() {
+    const p = P[m];
+    const ch = +$('ch').value, act = +$('act').value, win = +$('win').value, step = +$('step').value;
+    const cpu = +$('cpu').value, gpu = +$('gpu').value;
+    $('chv').textContent = ch; $('actv').textContent = act.toFixed(2); $('winv').textContent = win;
+    $('stepv').textContent = step; $('cpuv').textContent = cpu; $('gpuv').textContent = gpu;
+    const { tot, Te } = macs(p, Math.round(win * fps));
+    const rate = tot * ch * act / step;                 // MAC/s
+    $('o1').innerHTML = f(tot / 1e9, ' <small>GMAC</small>');
+    $('o2').innerHTML = f(rate / 1e9, ' <small>GMAC/s</small>');
+    $('o3').innerHTML = f(rate / 1e9 / cpu, '');
+    $('o4').innerHTML = f(100 * 2 * rate / (gpu * 1e12), ' <small>%</small>');
+    const batch = Math.max(1, Math.round(ch * act));
+    $('o5').innerHTML = f(batch * p.heads * Te * Te * 4 / 1e9, ' <small>GB</small>');
+    $('o6').innerHTML = f(win / step, ' <small>×</small>');
+  }
+  document.querySelectorAll('#mdl button').forEach(b => b.addEventListener('click', () => {
+    m = b.dataset.m;
+    document.querySelectorAll('#mdl button').forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+    $('win').value = P[m].win;
+    $('cpu').value = m === 'v2n' ? 4.3 : 10;
+    run();
+  }));
+  ['ch', 'act', 'win', 'step', 'cpu', 'gpu'].forEach(id => $(id).addEventListener('input', run));
+  run();
+})();
+</script>
+</html>
