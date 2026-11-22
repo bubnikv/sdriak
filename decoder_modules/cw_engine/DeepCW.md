@@ -11,7 +11,9 @@ optional (`OPT_BUILD_CW_DEEPCW`), so they can be compared on the same input:
 Both run on `engine/deepcw_runtime.{h,cpp}` (the session, the sha256 pin, the
 inference workers) over `engine/ort_shim.{h,cpp}` (ONNX Runtime loaded at run
 time). This file records what upstream publishes, how the two backends
-differ from it and from each other, and what is not measured yet.
+differ from it and from each other, how the v2 narrow decoder works from the
+channel to the text ("The v2 narrow decoder, end to end"), and what is not
+measured yet.
 
 ## Upstreams
 
@@ -69,6 +71,396 @@ ticks. `deepcw_runtime` refuses it twice over: the file's sha256 must be the
 backend's pinned one (`kDeepcwModelV1` / `kDeepcwModelV2` /
 `kDeepcwModelV2Narrow`), and every run's output must be
 `[batch, ceil(T / stride), 42]`.
+
+## The v2 narrow decoder, end to end
+
+What `deepcw2n` does with one channel, from the channelizer's output to the
+committed text, with the numbers the code uses. File references are to
+`src/engine/`. The rates are the CW bank's: 125 Hz channel spacing, 250 Hz
+complex output per channel.
+
+### The whole chain
+
+```mermaid
+flowchart TD
+    A["Wideband IQ<br/>(8 kHz on the bench, the receiver's rate live)"] --> B["SkimChannelizer<br/>2x-oversampled polyphase bank<br/>125 Hz spacing, 8 taps a branch"]
+    B --> C["One channel: complex baseband<br/>250 Hz, passband about ±62.5 Hz"]
+    C --> D["STFT: 20-point periodic Hann, hop 4<br/>80 ms window, 16 ms hop, 12.5 Hz bins<br/>11 bins kept: −62.5 … +62.5 Hz"]
+    D --> E["Frame ring, 14 s<br/>875 frames × 11 magnitudes"]
+    E -->|"every 1 s"| F["Window: from 4 s before the frozen point<br/>to now, at most 12 s (≈ 7 s steady)"]
+    F --> G{"Gate: line ≥ 6 dB over the floor<br/>and keyed 3–97 % of the frames<br/>(or within the 5 s hangover)"}
+    G -->|closed| X["No inference, the draft is cleared"]
+    G -->|open| H["Tile: the window's line bin ±1<br/>T × 3 magnitudes"]
+    H --> I["noise_q90_log1p<br/>÷ (90th percentile ÷ 2.146), log1p"]
+    I --> J["Job queue → inference worker<br/>fused kernel or ONNX Runtime"]
+    J --> K["Model: QDQ front end → 3 Conformer blocks → 42 log-probs<br/>one output frame per 32 ms"]
+    K --> L["Mailbox → the channel's next process()"]
+    L --> M["Stitcher: ±1-frame dilation,<br/>weighted average over the windows"]
+    M --> N["Greedy CTC + word gaps<br/>(blank run ≥ 2.01 s)"]
+    N --> O["Committed: characters ending<br/>before the frozen point"]
+    N --> P["Pending: the rest, as the pane's draft"]
+    O --> Q["Text, confidence, WPM, SNR500"]
+```
+
+### Stage by stage
+
+| # | Stage | Input → output | Rate, size | Where |
+|---|---|---|---|---|
+| 1 | Polyphase channelizer | wideband IQ → M channels | M = in_rate / 125 (64 at 8 kHz), hop M/2, 250 Hz out | `channelizer.cpp` |
+| 2 | STFT | 250 Hz IQ → 11 magnitudes | N = 20 (80 ms), hop 4 (16 ms): 62.5 frames/s, 80 % overlap | `decode_deepcw2.cpp` `frame()` |
+| 3 | Frame ring | — | 14 s = 875 frames × 11 floats | `m_ring` |
+| 4 | Scheduler | ring → window [w0, E) | every 63 frames (1.008 s), the phase staggered per channel | `tick()`, `window()` |
+| 5 | Gate, line bin, SNR | window → open / closed, bin p | over the window's 11-bin profile | `window_stats()` |
+| 6 | Tile | window → [T][3] | T ≤ 750 (12 s), ≈ 438 (7 s) steady | `tile()` |
+| 7 | Normalisation | [T][3] → [T][3] | one noise level per window | `deepcw2_normalize()` |
+| 8 | Inference | [T][3] → [ceil(T/2)][42] | 31.25 output frames/s | `deepcw_narrow_fused.cpp` / ORT |
+| 9 | Stitcher | windows → averaged log-probs | rows from the committed point to the covered end | `DeepcwStitcher` |
+| 10 | CTC read-out | log-probs → spans → text | greedy best path | `decode_greedy()`, `take()` |
+
+### 1. The channelizer
+
+`SkimChannelizer` is a 2×-oversampled polyphase filter bank (Crochiere and
+Rabiner; harris, *Multirate Signal Processing*, ch. 6–7):
+
+- M = in_rate / 125 Hz branches, an M-point FFT (FFTW) every M/2 input
+  samples, so each channel comes out at 2 × 125 = 250 Hz complex.
+- The prototype is WDSP's `fir_bandpass`, a 4-term Blackman-Harris window,
+  8 taps per branch (8 M taps; 512 at 8 kHz), cut off at ±62.5 Hz.
+- Neighbouring channels overlap: a station halfway between two channel
+  centres is at +62.5 Hz in one and −62.5 Hz in the other, inside both
+  outputs' ±125 Hz Nyquist band.
+
+DeepCW reads one channel's 250 Hz stream. The channel's centre is 0 Hz; a
+station anywhere in ±62.5 Hz falls into one of the 11 bins below.
+
+### 2. The short-time Fourier transform
+
+Per channel, every 4 samples (16 ms), a 20-point DFT of the last 20 samples
+(80 ms) under a periodic Hann window, evaluated only at the 11 bins
+k = −5 … +5 (`frame()`; Oppenheim and Schafer, *Discrete-Time Signal
+Processing*, §10.3):
+
+| Quantity | Value | Reference model (3200 Hz audio) |
+|---|---|---|
+| Window | 20 samples = 80 ms, periodic Hann | 256 samples = 80 ms |
+| Hop | 4 samples = 16 ms (62.5 frames/s) | 48 samples = 15 ms |
+| Overlap | 16 of 20 samples, 80 % | 208 of 256, 81 % |
+| Bin spacing | 250 / 20 = 12.5 Hz | 3200 / 256 = 12.5 Hz |
+| Bins | 11, −62.5 … +62.5 Hz | 65, 400 … 1200 Hz (wide); 3 (narrow) |
+| Noise bandwidth of a bin | 1.5 × 12.5 = 18.75 Hz (Hann ENBW, harris 1978) | the same |
+| Frame alignment | causal, end-aligned | centred, reflect-padded |
+
+The hop is 16 ms against the model's 15 ms: every duration reads 6.7 %
+longer than in training. At 25 WPM a dit (48 ms) spans 3 frames; at 12 WPM
+(100 ms), 6.25.
+
+The same pass keeps the channel's level (the peak bin's magnitude, held and
+decaying with a 2 s time constant), its tone offset (a parabolic fit of the log magnitudes around the
+peak bin, smoothed 0.05 a frame) and the band-noise statistic for SNR500.
+
+### 3–5. The window, the gate and the line bin
+
+Every 63 frames (1.008 s; each channel's phase offset by 7 frames per
+registration, so a full band does not infer all at once) `tick()` asks the
+stitcher where the next window starts:
+
+- **start** = max(stream start, frozen point − 4 s, end − 12 s), on an
+  output-frame boundary (an even input frame);
+- **end** = the current frame, rounded down to an even frame;
+- the first window waits until 2 s of frames exist.
+
+In steady state the frozen point is 2 s behind the previous window's end, so
+the window starts 2 + 4 = 6 s before the previous end, i.e. 7 s before now:
+about 438 input frames, 219 output frames.
+
+`window_stats()` then reads the window's 11-bin profile (the magnitudes
+summed over time):
+
+- p = the strongest bin; the floor = the mean of the bins at least 3 bins
+  from p;
+- **line ratio** = 20 log10(line / floor); **duty** = the share of frames
+  where bin p is over the midpoint between its maximum and the floor;
+- the gate opens when ratio ≥ 6 dB and 3 % ≤ duty ≤ 97 %. After it closes,
+  windows keep coming for 5 s (the 2 s freeze guard + the 1 s right ramp +
+  two steps) so the over's last characters commit;
+- the line bin is p clamped to 1 … 9, so the tile always has two neighbours.
+
+The tile follows the strongest bin of each window. A station drifting across
+a bin edge changes the tile's centre between windows; the stitcher's
+averaging then mixes readings of two centrings.
+
+### 6–7. The tile and its normalisation
+
+The narrow tile is the window's three bins p − 1, p, p + 1: a [T][3] array of
+magnitudes, 37.5 Hz of spectrum around the line. The model was trained on
+787.5–812.5 Hz of 3200 Hz audio, the same three 12.5 Hz bins.
+
+`deepcw2_normalize()` applies the model's `noise_q90_log1p` rule to the
+3T values of the window:
+
+1. q = the 90th percentile of the magnitudes;
+2. noise = max(q / sqrt(−2 ln 0.1), peak · 10⁻³, 10⁻⁵), where
+   sqrt(−2 ln 0.1) = 2.146 is the Rayleigh distribution's 90th percentile
+   in units of its σ (Papoulis and Pillai, §4.3): if the cells are noise,
+   noise is their Rayleigh σ;
+3. x ← log1p(x / noise).
+
+What the numbers mean for the model's input:
+
+| Cell | x / noise | log1p | uint8 step (scale 0.0136) |
+|---|---|---|---|
+| noise, median | 1.18 | 0.78 | 57 |
+| noise, 90th percentile | 2.15 | 1.15 | 84 |
+| a line 10 dB over the noise σ | 3.16 | 1.43 | 105 |
+| a line 20 dB over | 10 | 2.40 | 176 |
+| a line 30 dB over | 31.6 | 3.48 | 255: the clip |
+
+Anything more than about 30 dB over the per-bin noise reads as the same
+value. In a 3-bin tile a keyed line lifts all three bins: a tone on a bin
+centre leaks into both neighbours at half its amplitude (−6 dB) through the
+Hann window. With any usual duty cycle more than 10 % of the cells are then
+key-down, the 90th percentile falls on the signal, and the noise estimate
+rises with the signal: the input is closer to "relative to the line" than
+"relative to the noise". The model was trained so; the wide model's tile
+takes a median instead (`noise_mode`).
+
+### 8. The model
+
+199,331 parameters. Shapes for a window of T input frames; T1 = ceil(T / 2)
+output frames (219 for a 7 s window).
+
+```mermaid
+flowchart TD
+    I["tile [T][3]"] --> Q0["QuantizeLinear / DequantizeLinear<br/>uint8, scale 0.0136"]
+    Q0 --> C0["Conv 3×3, stride (2, 2), pad 1<br/>1 → 12 channels, int8 weights<br/>[T1][2][12]"]
+    C0 --> G0["GroupNorm, 6 groups of 2<br/>over time × frequency, then ReLU"]
+    G0 --> Q1["QDQ uint8"]
+    Q1 --> C1["Conv 3×3, stride (1, 2), pad 1<br/>12 → 24 channels<br/>[T1][1][24]"]
+    C1 --> G1["GroupNorm, 8 groups of 3, ReLU<br/>[T1][24]"]
+    G1 --> P["Linear 24 → 64, LayerNorm<br/>+ sinusoidal position code"]
+    P --> B1["Conformer block 1"] --> B2["Conformer block 2"] --> B3["Conformer block 3"]
+    B3 --> LN["LayerNorm"]
+    LN --> H["Linear 64 → 42, log-softmax<br/>[T1][42]"]
+```
+
+Each block is a macaron Conformer (Gulati et al. 2020; the half-step FFNs
+from Lu et al. 2019), d = 64:
+
+```mermaid
+flowchart TD
+    X["h [T1][64]"] --> F1["½ FFN: LN → 64→128 → SiLU → 128→64, × 0.5, + h"]
+    F1 --> A["MHSA: LN → QKV 64→192 → 4 heads × 16<br/>softmax(q kᵀ / 4) v, no mask → 64→64, + h"]
+    A --> C["Conv module: LN → 64→128 → GLU → 64<br/>depthwise k 15 (±7 frames), SiLU → 64→64, + h"]
+    C --> F2["½ FFN, as the first"]
+    F2 --> N["LayerNorm"]
+```
+
+| Part | Shape | Parameters | MAC per 7 s window (T1 = 219) |
+|---|---|---|---|
+| Conv 0 (int8, dequantised) | 3×3, 1 → 12, stride (2, 2) | 108 | 0.05 M |
+| Conv 1 | 3×3, 12 → 24, stride (1, 2) | 2,592 | 0.38 M |
+| Projection 24 → 64 | | 1,600 | 0.34 M |
+| ½ FFN × 2, per block | 64 → 128 → 64 | 33,152 | 7.2 M |
+| Self-attention, per block: projections | 64 → 192, 64 → 64 | 16,640 | 3.6 M |
+| Self-attention, per block: scores and sum | 2 · T1² · 64 | — | 6.1 M |
+| Conv module, per block | 64 → 128, GLU, dw 15, 64 → 64 | 13,504 | 2.9 M |
+| Head 64 → 42 | | 2,730 | 0.59 M |
+| Total (3 blocks, LayerNorms incl.) | | 199,331 | ≈ 61 M |
+
+The MAC counts are derived from the shapes (multiply-accumulates; the
+norms, activations and softmax are not counted). The attention is quadratic
+in the window: at the 12 s maximum (T1 = 375) it is 18 M per block, about
+as much as the rest of the block (23 M).
+
+**What each output frame sees.** The front end looks ±1 input frame (±16 ms)
+per conv. Each conv module looks ±7 output frames (±224 ms), and attention
+reaches the whole window without a mask, so every output frame depends on
+the whole tile, its noise level and its padding. The first GroupNorm is
+computed over the whole window too (ONNX `InstanceNormalization`, time
+included). The same keyed frame therefore reads slightly differently in
+each window that holds it; that is what the stitcher averages.
+
+**The classes.** 42 per output frame: the 40 characters
+`, . / 0–9 ? A–Z` (indices 0–39), the word space (40) and the CTC blank
+(41) (Graves et al. 2006). An output frame is 32 ms here (2 × 16 ms; 30 ms
+in training), so at 25 WPM a dit is 1.5 output frames, at 35 WPM 1.07.
+
+### 9. The stitcher
+
+`DeepcwStitcher` is e04's `PosteriorStitcher` (`decode_morse.py`, MIT),
+on output frames (31.25 a second):
+
+| Constant | Seconds | Output frames | Upstream name |
+|---|---|---|---|
+| Window, at most | 12 | 375 | `MAX_SEGMENT_SECONDS` |
+| First window after | 2 | (125 input frames) | `MIN_PENDING_SECONDS` |
+| Step | 1 | 31.25 | `STEP_SECONDS` |
+| Left context | 4 | 125 | `STITCH_LEFT_CONTEXT_SECONDS` |
+| Freeze guard | 2 | 63 | `STITCH_FREEZE_GUARD_SECONDS` |
+| Left ramp | 2 | 62.5 | `STITCH_LEFT_RAMP_SECONDS` |
+| Right ramp | 1 | 31.25 | `STITCH_RIGHT_RAMP_SECONDS` |
+| Dilation | ±32 ms | ±1 | `STITCH_DILATION_FRAMES` |
+| Word gap | 2.01 | 63 | `WORD_BOUNDARY_BLANK_HOPS` (134 hops of 15 ms) |
+| Weight floor | — | 10⁻³ | `MIN_VIEW_WEIGHT` |
+| An uncovered frame | — | blank 0, others −30 | `UNCOVERED_LOG_PROB` |
+
+Three positions move forward along the output frames:
+
+```
+                     committed_end      frozen_end              covered_end
+                          │                  │                        │
+ ─── text already out ────┼── settled: no ───┼── still averaged: new ──┤
+                          │   new window     │   windows add to it     │
+                          │   adds to it     │                         │
+                          ◄────────── rows kept (sums, weights) ──────►
+```
+
+Each window adds its frames from the frozen point on, each weighted
+
+  w(f) = max(10⁻³, smoothstep(left / 2 s) · smoothstep(right / 1 s)),
+  smoothstep(t) = 3t² − 2t³ for t in [0, 1],
+
+where left and right are the frame's distance in seconds from the window's
+start and end (no left ramp on the stream's first window, no right ramp on a
+final one). In steady state the frames a window adds are at least 4 s from
+its start, so only the right ramp matters:
+
+| A frame's age at the window's end | 0 s | 0.25 s | 0.5 s | 0.75 s | ≥ 1 s |
+|---|---|---|---|---|---|
+| weight | 0.001 | 0.16 | 0.50 | 0.84 | 1 |
+
+Before averaging, each window's log-probs are log-softmaxed, then every class
+except the blank takes its maximum over ±1 frame and the row is
+renormalised (`dilated_log_probs()`): a character two windows place one frame
+apart still adds up.
+
+**Three readings per frame.** A window ending at E starts at E − 7 s and adds
+frames from E − 3 s (the frozen point it inherits, 2 s behind the previous
+end at E − 1 s); the 4 s before that are context only. So
+every frame is read by three windows, at ages 0–1 s, 1–2 s and 2–3 s, the
+youngest down-weighted by the ramp:
+
+```
+ time (s)      E-8   E-7   E-6   E-5   E-4   E-3   E-2   E-1   E     E+1
+               |     |     |     |     |     |     |     |     |     |
+ ends at E-1   [ctx ··················][added ···········]
+ ends at E           [ctx ··················][added ···········]
+ ends at E+1               [ctx ··················][added ···········]
+                                                   ▲     ▲
+                          a frame between E-2 and E-1 is added by all three:
+                          at age 2–3 s, 1–2 s and 0–1 s (the last one ramped)
+```
+
+After each window: `frozen_end` = its end − 2 s, and `take()` reads the
+average from `committed_end` to `covered_end`:
+
+1. **greedy CTC**: per frame the best class; repeats merged, blanks dropped
+   (Graves et al. 2006; Hannun 2017);
+2. **word gaps**: a run of ≥ 63 blank frames (2.01 s) between two
+   characters becomes a space, counting the blanks carried over from the
+   previous take;
+3. **commit** every character whose last frame is before the frozen point,
+   and the spaces between them;
+4. **release** the frames up to the next character's start (their blanks and
+   spaces now settled), drop their rows;
+5. the rest is **pending**: the pane's gray draft.
+
+Confidence is the mean averaged posterior of the committed characters; the
+WPM is 12 × letters / seconds over a committed span of ≥ 6 letters and
+≥ 2 s (the PARIS convention).
+
+At a TX hold (`hold_begin()`) a final window runs: no right ramp,
+everything committed.
+
+### 10. Inference, threads and buffers
+
+```mermaid
+sequenceDiagram
+    participant Ch as Channel (pipeline thread)
+    participant Q as DeepcwRuntime queue
+    participant W as Worker thread
+    participant M as Mailbox
+    Ch->>Ch: frame() every 16 ms, tick() every 1 s
+    Ch->>Q: submit(tile [T][3], w0) if the gate is open and none in flight
+    Q->>W: next job (FIFO)
+    W->>W: fused kernel run() or ORT Run(): [T1][42]
+    W->>M: log-probs, ready = true
+    Ch->>M: next process(): poll
+    M-->>Ch: log-probs
+    Ch->>Ch: stitcher add_window(), take(): text, draft
+```
+
+A channel has at most one window in flight; a tick that finds one pending is
+skipped. The workers run batch 1 (batching costs on the CPU, "Runtime
+defaults"), one thread each, hardware threads − 2 of them; the fused kernel
+keeps its scratch per thread.
+
+Buffers (floats are 4 bytes; derived from the code's sizes):
+
+| Buffer | Size | Bytes |
+|---|---|---|
+| Sample ring | 20 complex samples | 160 |
+| Twiddles and window | 11 × 20 × 2 + 20 | 1.8 K |
+| Frame ring | 875 frames × 11 | 38.5 K |
+| Tile buffer | 875 × 65 (sized for the wide model) | 228 K |
+| A queued job | T × 3, ≈ 438 × 3 | 5.3 K (7 s) |
+| Stitcher rows | ≤ ≈ 7 s × 31.25 × 43 | ≈ 38 K |
+| Fused kernel scratch, per worker | T1 × 384 + T1p × 38 floats | ≈ 370 K (T1 = 219) |
+| Fused weights, shared | 199,300 values | ≈ 0.8 M |
+| The queue | ≥ 256 windows, more while they fit 64 MB | |
+
+### Time and latency
+
+| Event | When |
+|---|---|
+| First window | 2 s after the channel starts (and the gate is open) |
+| A character is committed | 2–3 s after its last element ends (the freeze guard plus up to one step), plus the queue and the run |
+| A word gap is read | after 2.01 s of blank between two characters |
+| The over's tail | the hangover keeps windows coming 5 s after the gate closes |
+| One window's inference | 1.43 ms (fused, AVX2) / 2.0 ms (ONNX Runtime), i5-13400, one thread; GEMMs 0.58 ms, attention 0.48 ms, front end 35 µs |
+| Per busy channel | one window a second: 0.5 % of a core fused, 0.73–0.99 % on ONNX Runtime (cw_bench `--time`, this repository's bench machine, which runs a window in about 5 ms) |
+| Per idle channel | 0.01 %: the STFT and the gate only |
+
+### Further reading
+
+- A. Graves, S. Fernández, F. Gomez, J. Schmidhuber, "Connectionist
+  Temporal Classification: Labelling Unsegmented Sequence Data with
+  Recurrent Neural Networks", ICML 2006. The CTC loss and best-path
+  decoding.
+- A. Hannun, "Sequence Modeling with CTC", Distill, 2017. An illustrated
+  introduction to CTC.
+- A. Gulati et al., "Conformer: Convolution-augmented Transformer for Speech
+  Recognition", Interspeech 2020. The block used here.
+- Y. Lu et al., "Understanding and Improving Transformer From a
+  Multi-Particle Dynamic System Point of View" (Macaron Net), 2019. The
+  half-step FFNs.
+- A. Vaswani et al., "Attention Is All You Need", NeurIPS 2017. Multi-head
+  attention and the sinusoidal position code.
+- Y. Wu, K. He, "Group Normalization", ECCV 2018; J. L. Ba, J. R. Kiros,
+  G. E. Hinton, "Layer Normalization", 2016.
+- Y. N. Dauphin et al., "Language Modeling with Gated Convolutional
+  Networks", ICML 2017 (GLU); S. Elfwing, E. Uchibe, K. Doya,
+  "Sigmoid-Weighted Linear Units", Neural Networks 2018 (SiLU).
+- B. Jacob et al., "Quantization and Training of Neural Networks for
+  Efficient Integer-Arithmetic-Only Inference", CVPR 2018. The uint8 / int8
+  QDQ scheme.
+- I. Goodfellow, Y. Bengio, A. Courville, *Deep Learning*, MIT Press, 2016.
+  Textbook background for all of the above.
+- A. V. Oppenheim, R. W. Schafer, *Discrete-Time Signal Processing*, 3rd ed.,
+  Pearson, 2010. The short-time Fourier transform.
+- F. J. Harris, "On the Use of Windows for Harmonic Analysis with the
+  Discrete Fourier Transform", Proc. IEEE 66(1), 1978. The Hann window's
+  noise bandwidth; the Blackman-Harris window of the channelizer.
+- R. E. Crochiere, L. R. Rabiner, *Multirate Digital Signal Processing*,
+  Prentice-Hall, 1983; f. j. harris, *Multirate Signal Processing for
+  Communication Systems*, Prentice Hall, 2004. Polyphase filter banks and
+  oversampled channelizers.
+- A. Papoulis, S. U. Pillai, *Probability, Random Variables and Stochastic
+  Processes*, 4th ed., McGraw-Hill, 2002. The Rayleigh magnitude of noise
+  behind the 2.146 and 1.1774 factors.
+- K. Chellapilla, S. Puri, P. Simard, "High Performance Convolutional Neural
+  Networks for Document Processing", 2006. The im2col form of a conv the
+  fused kernel uses.
 
 ## The front end against the reference
 
