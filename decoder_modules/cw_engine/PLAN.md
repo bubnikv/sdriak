@@ -273,6 +273,26 @@ repair weights (`:repw`):
   With the gain known, 12 WPM keeps an error floor of about 2.5 % up to
   +1 dB, so its 3 % point is worse than the R-series': the lattice's own
   errors.
+- Random text (`--text random`, the same table's form) takes away what
+  DeepCW knows of QSO text:
+
+  | | 12 WPM | 25 WPM | 35 WPM |
+  |---|---|---|---|
+  | R-series | −4.26 / −3.14 | −2.15 / −0.58 | −0.37 / +0.92 |
+  | gain known | −4.69 / −3.27 | −2.50 / −1.30 | −0.92 / +0.32 |
+  | … and the speed to ±10 % | −5.36 / −4.14 | −2.51 / −1.08 | −0.93 / +0.49 |
+  | … and durations 2x sharper | −6.00 / −4.50 | −3.12 / −1.42 | −1.55 / −0.10 |
+  | DeepCW v2 narrow | −6.19 / −4.35 | −3.23 / −1.78 | −1.85 / −0.31 |
+
+  DeepCW's text prior is 0.3–0.4 dB at 25 and 35 WPM, none at 12 (the
+  two texts' characters differ, so loosely). With the gain, the speed
+  and sharp durations given, Bell is within 0.1–0.3 dB of DeepCW at every
+  speed and past it at 3 % at 12 WPM. The gap is, at 10 % CER: the gain
+  filters 0.35–0.55 dB, the speed 0.7 dB at 12 WPM (none faster), the
+  duration model 0.6 dB at every speed. The bench keys with ±3 % jitter;
+  DeepCW reads a fist's timing from its 8 s of context, so the fair
+  equivalent is the speed and the durations' spread learned per station,
+  not fixed.
 - The decimation is not what costs at speed: every channel sample
   (250 Hz) does worse, more so the faster (an error floor of 5 % at
   25 WPM and 15 % at 35, +2 dB), and neither 200 paths nor dropping the
