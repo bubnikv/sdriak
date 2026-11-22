@@ -411,6 +411,146 @@ The Android build does not set `OPT_BUILD_CW_DEEPCW`, and no SDRIAK module
 constructs a DeepCW backend yet (cw_bench and the gates do). The fused path
 needs neither ONNX Runtime nor the `.onnx` file, only the weights blob.
 
+## Where a keyed channel's CPU goes
+
+i5-13400, dcw2n on the fused kernel (AVX2), `cw_bench --time` (the
+decoder's own `process()`), 24 WPM, +10 dB, 5 overs (169 s of audio):
+
+| | per channel and second of audio |
+|---|---|
+| decoder, keyed (gate open): DSP, stitcher, inference | 1.38 ms (0.14 % of a core) |
+| of it, inference: 0.92 windows/s × ≈ 1.45 ms | ≈ 1.33 ms |
+| decoder, noise only (gate closed: the DSP alone) | 0.025 ms |
+| channelizer (125 Hz channels; 48, 96, 192 kHz bands) | ≈ 0.005 ms per channel |
+
+Inference is about 97 % of a keyed channel's cost. The channelizer for a
+whole 96 kHz band (768 channels) takes 0.4 % of a core, and idle channels
+cost next to nothing. For comparison, v3 takes 0.12 ms per keyed
+channel-second.
+
+The gate (line over floor, `SKIM_DEEPCW2_GATE_DB` 6) already skips every
+window on noise: 0 of 351 windows run in 3 × 120 s of noise, against 351
+with `:nogate`. During an over it stays open for 96 % of the ticks (301 of
+314 windows). It costs nothing in CER from −6 to +10 dB; at −9 dB under
+fading, 0.89 against 0.85. A learned gate has room only on non-CW signals
+(carriers, digital modes, QRM), which the bench does not model; count them
+on a band recording (`--bed`) first.
+
+## Time decimation (SKIM_DEEPCW2_DECIM): measured, not taken
+
+The model's input hop is k × 16 ms (k = 1..3), so the model reads the keying
+k times faster and a window costs ~1/k (attention ~1/k²). The stitcher's
+frame rate follows the hop, and its word gap (upstream's 134 model hops) is
+scaled by k. The plan's rule was k = ⌊40 / WPM⌋: 3 at 12 WPM, 2 at 18, 1 at 25.
+
+SNR500 (dB) where payload CER falls to 10 %, AWGN, 10 overs a point:
+
+| | 12 WPM | 18 WPM | 25 WPM |
+|---|---|---|---|
+| k = 1 | −6.0 | −5.1 | −3.5 |
+| k = 2 | −4.7 | −3.5 | never |
+| k = 3 | −3.4 | — | — |
+
+Payload CER at +10 / +20 dB under fading, 10 overs a point:
+
+| | k = 1 | k = 2 | k = 3 |
+|---|---|---|---|
+| 12 WPM, ITU poor | 0.13 / 0.05 | 0.15 / 0.07 | 0.16 / 0.11 |
+| 12 WPM, flat 3 Hz | 0.11 / 0.06 | 0.19 / 0.15 | 0.23 / 0.20 |
+| 18 WPM, ITU poor | 0.09 / 0.02 | 0.12 / 0.05 | — |
+| 18 WPM, flat 3 Hz | 0.20 / 0.09 | 0.26 / 0.20 | — |
+
+- Under the plan's rule slow stations lose 1.6–2.6 dB at the 10 % point
+  (most of DeepCW's lead over v3), and under fast fading the CER at +20 dB
+  doubles. Compressing time also makes the fading k times faster to the
+  model, and fast fading is where v2 is already weak.
+- At 3 % CER, k = 2 at 12 WPM costs nothing (−3.6 against −3.4): the loss
+  sits at the weak-signal edge.
+- Not taken: the switch stays as an experiment, default 1.
+
+### Against v3 (OK1HRA's decoder), the whole pipeline
+
+i5-13400, one core, `cw_bench --time` (each run alone). The decoder's
+`process()` per channel and second of audio, in ms. "During an over" is the
+over's average: it includes its 2 s lead-in and its tail, where the gate
+closes.
+
+| | over, 24 WPM, +10 dB | over, 24 WPM, 0 dB | over, 12 WPM, +10 dB | noise only (detector closed) |
+|---|---|---|---|---|
+| v3 | 0.121 | 0.119 | 0.169 | 0.0091 |
+| dcw2n (L 4, G 2, S 1; default) | 1.385 | 1.386 | 1.477 | 0.0244 |
+| dcw2n (L 1, G 2, S 3) | 0.410 | 0.410 | 0.427 | 0.0193 |
+
+The channelizer (125 Hz channels) takes 0.0042–0.0047 ms per channel and
+second, for every channel, decoded or not.
+
+A 96 kHz band (768 channels), in % of one core:
+
+| | decoders off (channelizer only) | all idle | 50 keyed | 200 keyed |
+|---|---|---|---|---|
+| v3 | 0.32 | 1.0 | 1.6 | 3.3 |
+| dcw2n (4, 2, 1) | 0.32 | 2.2 | 9.0 | 29 |
+| dcw2n (1, 2, 3) | 0.32 | 1.8 | 3.8 | 9.6 |
+
+- A keyed channel: dcw2n costs 11× v3 by default and 3.4× with (1, 2, 3).
+- An idle one: 2.1–2.7× v3 (its 20-point DFT per 16 ms frame against v3's
+  front end), both under 0.025 ms/s.
+- With few stations on the band the channelizer and the idle channels are
+  most of the cost for every decoder.
+
+Under load: continuously keyed 24 WPM stations, each a 250 Hz channel
+baseband (AWGN, random groups), decoded by T threads with 40 channels each,
+in lockstep as a bank delivers them, each thread as fast as it runs. dcw2n is
+(L 1, G 2, S 3) on the fused kernel, inline. Real-time stations carried
+(channel-seconds per wall second), and ms per station-second:
+
+| busy threads (of 16) | v3 | dcw2n (1, 2, 3) | ratio |
+|---|---|---|---|
+| 1 | 7,290 (0.14) | 2,370 (0.42) | 3.1× |
+| 6 (one per P-core) | 39,300 (0.15) | 13,000 (0.46) | 3.0× |
+| 11 (2/3 of the threads) | 60,200 (0.18) | 19,300 (0.57) | 3.1× |
+| 16 | 65,500 (0.24) | 19,400 (0.82) | 3.4× |
+
+- dcw2n's throughput stops at about 11 threads: the HT siblings and E-cores
+  share the vector units its GEMMs already fill. Per station it costs 2×
+  more at 16 threads than at 1; v3 costs 1.3× more.
+- At 2/3 of the machine's maximum throughput, v3 carries about 43,700
+  stations and dcw2n about 12,900; at 2/3 of the threads busy, 60,200 and
+  19,300.
+- A 96 kHz band is 768 channels, and its channelizer and idle channels add
+  about 2 % of a core. So at 2/3 load dcw2n (1, 2, 3) decodes every channel of
+  about 25 bands keyed at once, and v3 about 78.
+- Both read the same amount (45,600 and 47,300 characters at 11 threads).
+
+### Memory per channel
+
+Heap per channel, measured with `mallinfo2` over 200 channels: a probe
+creates them, then feeds each 40 s of a keyed pattern at 24 WPM dit length,
+on the 250 Hz channel input. Per-process shared
+data is not included: the fused weights (199 K parameters, under 1 MB) and
+one scratch buffer per worker thread.
+
+| | new channel | after 40 s keyed |
+|---|---|---|
+| v2 (Viterbi, v2 preset) | 8 KB | 112 KB |
+| v3 (Viterbi, v3 preset) | 51 KB | 155 KB |
+| dcw2n (L 1, G 2, S 3), before the tile fix | 268 KB | 296 KB |
+| dcw2n (L 1, G 2, S 3) | 51 KB | 79 KB |
+
+- **v2 and v3:** the Viterbi lattice's rings (`CwLatticeRings`, 104 KB) are
+  allocated when a channel first keys.
+- **dcw2n:**
+  - a 14 s ring of 11 DFT bins (38 KB);
+  - the window tile, 3 bins over the ring (10 KB);
+  - the stitcher's log-probabilities, which grow while keyed.
+- **The tile fix:** the tile used to be sized for the wide model's 65 bins
+  (222 KB) on every channel. It now takes the model's bin count, and the
+  `fill` noise mode's generator (5 KB) is made only when used. The decoded
+  text is byte-identical: campaign overs rerun, and the wide model
+  checked old against new code in all three noise modes.
+- A 96 kHz band of 768 channels, 50 of them keyed: v3 about 44 MB, dcw2n
+  about 41 MB.
+
 ## Not measured yet
 
 Nothing of v2 has run on channelized IQ. To measure before trusting it:

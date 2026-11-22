@@ -112,7 +112,17 @@ struct DeepcwV2Config {
     // what the stitcher does; name "deepcw2v1".
     bool   model_v1 = false;
     double win_ring_s = 14.0;    // the channel's frame ring (≥ max_segment_s)
-    DeepcwStitchConfig stitch;   // SKIM_DEEPCW2_STEP, SKIM_DEEPCW2_WIN (max_segment_s)
+    // SKIM_DEEPCW2_DECIM (1..3): an experiment — the model's input hop is
+    // decim × 16 ms, so it reads the keying decim times faster and every
+    // window costs ~1/decim (the attention ~1/decim²). The stitcher's frame
+    // rate follows the hop; its word gap (upstream: 134 model hops) is
+    // scaled by decim. Fixed per run: an adaptive choice from the station's
+    // speed needs this measured first (DeepCW.md, "Time decimation").
+    int    decim = 1;
+    // SKIM_DEEPCW2_STEP (step_s), SKIM_DEEPCW2_LEFT (left_context_s),
+    // SKIM_DEEPCW2_GUARD (freeze_guard_s), SKIM_DEEPCW2_LRAMP / _RRAMP
+    // (left_ramp_s / right_ramp_s), SKIM_DEEPCW2_WIN (max_segment_s)
+    DeepcwStitchConfig stitch;
 
     static DeepcwV2Config from_env();
     static DeepcwV2Config from_env(const DeepcwV2Config &base);
