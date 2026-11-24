@@ -21,9 +21,14 @@ namespace net {
 #endif
     }
 
+    // Wakes threads blocked in recv()/send()/accept() on sock without
+    // releasing the descriptor. On Linux shutdown() does that; Winsock's
+    // shutdown() leaves a blocked recv()/accept() waiting, so the socket's
+    // pending I/O is also cancelled (the call fails with WSAEINTR).
     static void shutdownSocket(Socket sock) {
 #ifdef _WIN32
         ::shutdown(sock, SD_BOTH);
+        CancelIoEx(reinterpret_cast<HANDLE>(sock), nullptr);
 #else
         ::shutdown(sock, SHUT_RDWR);
 #endif

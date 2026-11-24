@@ -1,13 +1,17 @@
 // ConnClass / ListenerClass lifetime: close() from a foreign thread wakes a
 // blocked reader without releasing the descriptor under it, a closed listener
 // frees its port at once, a read handler may close its own connection, and a
-// pending read notices a peer that closes while no data flows.
+// pending read notices a peer that closes while no data flows, and close()
+// returns while a worker's read is pending on a silent peer.
 #include <utils/networking.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace {
     using clock_type = std::chrono::steady_clock;
@@ -91,6 +95,33 @@ namespace {
         require(!udp->setLivenessChecks(10, 5, 3, 20000), "liveness checks accepted a UDP socket");
     }
 
+    // close() joins the read worker, so it returns only if the worker's
+    // pending recv() is woken while the peer stays silent (rigctl,
+    // network_sink and iq_exporter stopping with an idle client).
+    void closeWithPendingAsyncRead() {
+        Pair p = connectPair();
+        uint8_t buf[16];
+        p.server->readAsync(sizeof(buf), buf, [](int, uint8_t*, void*) {}, NULL, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::atomic<bool> closed{false};
+        const auto started = clock_type::now();
+        std::thread closer([&] {
+            p.server->close();
+            closed = true;
+        });
+        while (!closed && clock_type::now() - started < std::chrono::seconds(2)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!closed) {
+            // The closer is stuck in join(); nothing can unwind it.
+            std::printf("FAIL close with a pending async read: close() did not return\n");
+            std::fflush(stdout);
+            std::_Exit(2);
+        }
+        closer.join();
+        require(!p.server->isOpen(), "connection still open after close()");
+    }
+
     struct SelfClose {
         net::Conn conn;
         uint8_t buf[4];
@@ -118,9 +149,24 @@ namespace {
 }
 
 int main() {
-    closeWakesBlockedReader();
-    closedListenerFreesPort();
-    handlerMayCloseItsConnection();
-    pendingReadSeesSilentClose();
-    return 0;
+    const std::pair<const char*, void (*)()> tests[] = {
+        { "close wakes a blocked reader", closeWakesBlockedReader },
+        { "closed listener frees its port", closedListenerFreesPort },
+        { "handler may close its connection", handlerMayCloseItsConnection },
+        { "pending read sees a silent close", pendingReadSeesSilentClose },
+        { "close with a pending async read", closeWithPendingAsyncRead },
+    };
+    int failures = 0;
+    for (const auto& [name, fn] : tests) {
+        try {
+            fn();
+            std::printf("PASS %s\n", name);
+        }
+        catch (const std::exception& e) {
+            std::printf("FAIL %s: %s\n", name, e.what());
+            failures++;
+        }
+        std::fflush(stdout);
+    }
+    return failures == 0 ? 0 : 1;
 }
