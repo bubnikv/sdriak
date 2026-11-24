@@ -75,6 +75,10 @@ namespace backend {
     bool audioOutputUsesOpenSLES();
     bool hasUsbDeviceAvailable(const std::vector<DevVIDPID>& allowedVidPids);
 
+    // The system HTTP proxy, "host:port\nexclusion,exclusion", or "" when
+    // none (MainActivity.getSystemProxy()). Callable from any thread.
+    std::string getSystemProxy();
+
     // Short haptic tick for UI feedback, e.g. a splitter drag handle engaging
     // (calls into MainActivity via JNI).
     void hapticTick();

@@ -32,6 +32,10 @@
 #include <windows.h>
 #endif
 
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
+
 namespace net::proxy {
 
     namespace {
@@ -129,6 +133,25 @@ namespace net::proxy {
             w.autoConfigUrl = readRegistryString(key, L"AutoConfigURL");
             RegCloseKey(key);
             return w;
+        }
+#endif
+
+#ifdef __ANDROID__
+        // MainActivity.getSystemProxy() over JNI; effective() runs for every
+        // libcurl handle and once a second in the Network menu.
+        std::string androidSystemProxy() {
+            static std::mutex mtx;
+            static std::string cached;
+            static std::chrono::steady_clock::time_point at;
+            static bool have = false;
+            std::lock_guard<std::mutex> lock(mtx);
+            const auto now = std::chrono::steady_clock::now();
+            if (!have || now - at > std::chrono::seconds(3)) {
+                cached = backend::getSystemProxy();
+                at = now;
+                have = true;
+            }
+            return cached;
         }
 #endif
     }
@@ -310,6 +333,25 @@ namespace net::proxy {
             break;
         }
 
+#ifdef __ANDROID__
+        {
+            // "host:port\nexclusion,exclusion"; the exclusions use the same
+            // globs as ProxyOverride ("*.example.com", "192.168.*").
+            const std::string sys = androidSystemProxy();
+            const size_t nl = sys.find('\n');
+            e.url = normalizeUrl(sys.substr(0, nl));
+            if (!e.url.empty()) {
+                std::string exclusions = nl == std::string::npos ? std::string() : sys.substr(nl + 1);
+                for (char& ch : exclusions) {
+                    if (ch == ',') { ch = ';'; }
+                }
+                e.kind = Effective::Kind::Proxy;
+                e.noProxy = winInetBypassToNoProxy(exclusions);
+                e.description = "Android proxy " + e.url + (e.noProxy.empty() ? "" : ", not for " + e.noProxy);
+                return e;
+            }
+        }
+#endif
 #ifdef _WIN32
         const WinInet w = readWinInet();
         if (w.enabled && !w.server.empty()) {

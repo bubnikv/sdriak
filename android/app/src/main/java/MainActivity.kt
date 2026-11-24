@@ -14,6 +14,7 @@ import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.Manifest;
+import android.net.ConnectivityManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
@@ -562,6 +563,31 @@ class MainActivity : NativeActivity() {
         runOnUiThread {
             window.decorView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         }
+    }
+
+    /**
+     * The system HTTP proxy as "host:port\nexclusion,exclusion", or "" when
+     * there is none. Read by net::proxy (core/src/utils/proxy.cpp) in system
+     * mode, from any native thread via JNI. A PAC-only setup has no
+     * host:port and reads as "".
+     */
+    fun getSystemProxy(): String {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val info = cm.getDefaultProxy()
+            if (info != null && !info.host.isNullOrEmpty() && info.port > 0) {
+                return info.host + ":" + info.port + "\n" + info.exclusionList.joinToString(",")
+            }
+        } catch (e: Exception) {
+            Log.w("SDRIAK", "getDefaultProxy failed: " + e)
+        }
+        // The framework mirrors the default proxy into these properties.
+        val host = System.getProperty("http.proxyHost")
+        val port = System.getProperty("http.proxyPort")
+        if (!host.isNullOrEmpty() && !port.isNullOrEmpty()) {
+            return host + ":" + port + "\n" + (System.getProperty("http.nonProxyHosts") ?: "").replace('|', ',')
+        }
+        return ""
     }
 
     /**

@@ -25,7 +25,7 @@ namespace net::proxy {
 
     enum class Mode {
         None,   // direct, also ignoring the proxy environment variables
-        System, // Windows Internet Settings, else http_proxy/https_proxy/no_proxy
+        System, // Windows Internet Settings, the Android system proxy, else http_proxy/https_proxy/no_proxy
         Manual, // url, credentials and noProxy below
     };
 

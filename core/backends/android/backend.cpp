@@ -1069,6 +1069,28 @@ namespace backend {
         return 0;
     }
 
+    std::string getSystemProxy() {
+        JniSession jni;
+        if (!jni.valid()) { return {}; }
+        jmethodID method = jni.env->GetMethodID(jni.clazz, "getSystemProxy", "()Ljava/lang/String;");
+        if (!method) {
+            jni.env->ExceptionClear();
+            return {};
+        }
+        jstring jstr = (jstring)jni.env->CallObjectMethod(app->activity->clazz, method);
+        if (jni.env->ExceptionCheck()) {
+            jni.env->ExceptionClear();
+            return {};
+        }
+        if (!jstr) { return {}; }
+        const char* chars = jni.env->GetStringUTFChars(jstr, nullptr);
+        std::string out = chars ? chars : "";
+        if (chars) { jni.env->ReleaseStringUTFChars(jstr, chars); }
+        jni.env->DeleteLocalRef(jstr);
+        jni.env->DeleteLocalRef(jni.clazz);
+        return out;
+    }
+
     std::string getAppFilesDir() {
         JniSession jni;
         if (!jni.env)   throw std::runtime_error("Could not attach to JNI thread");
