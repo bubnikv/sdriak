@@ -59,6 +59,7 @@ public:
             auto configAccess = config.read();
             configAccess.tryGet("hostname", host);
             configAccess.tryGet("port", port);
+            configAccess.tryGet("viaProxy", viaProxy);
         }
 
         handler.ctx = this;
@@ -185,6 +186,10 @@ private:
         if (SmGui::InputInt(CONCAT("##_spyserver_srv_port_", _this->name), &_this->port, 0, 0)) {
             config.edit().set("port", _this->port);
         }
+        // CONNECT through the Network proxy; many proxies allow it only to 443.
+        if (SmGui::Checkbox(CONCAT("Through the proxy##_spyserver_proxy_", _this->name), &_this->viaProxy)) {
+            config.edit().set("viaProxy", _this->viaProxy);
+        }
         if (connected || connecting) { SmGui::EndDisabled(); }
 
         if (_this->running) { SmGui::BeginDisabled(); }
@@ -262,8 +267,9 @@ private:
 
         const std::string host = hostname;
         const uint16_t targetPort = port;
-        connector.begin([this, host, targetPort]() {
-            auto newClient = spyserver::connect(host, targetPort, &stream, 3000);
+        const bool throughProxy = viaProxy;
+        connector.begin([this, host, targetPort, throughProxy]() {
+            auto newClient = spyserver::connect(host, targetPort, &stream, 3000, throughProxy);
             if (!newClient) {
                 throw std::runtime_error("Could not connect to SpyServer");
             }
@@ -350,6 +356,7 @@ private:
 
     char hostname[1024];
     int port = 5555;
+    bool viaProxy = false;
     int iqType = 0;
 
     int srId = 0;

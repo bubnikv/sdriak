@@ -223,6 +223,6 @@ namespace server {
     // timeoutMS bounds DNS resolution and the TCP connect (NO_TIMEOUT for the
     // OS default); cancellation, when given, lets the protocol handshake be
     // aborted early (see AsyncConnector::cancelToken()).
-    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const std::string& password = "", int timeoutMS = net::NO_TIMEOUT, const std::atomic<bool>* cancellation = nullptr);
-    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const AuthKey& authKey, int timeoutMS = net::NO_TIMEOUT, const std::atomic<bool>* cancellation = nullptr);
+    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const std::string& password = "", int timeoutMS = net::NO_TIMEOUT, const std::atomic<bool>* cancellation = nullptr, bool viaProxy = false);
+    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const AuthKey& authKey, int timeoutMS = net::NO_TIMEOUT, const std::atomic<bool>* cancellation = nullptr, bool viaProxy = false);
 }

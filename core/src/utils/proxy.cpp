@@ -8,11 +8,22 @@
  */
 #include "proxy.h"
 
+// Before <windows.h>: WinSock2 must come ahead of winsock.h.
+#include <utils/networking.h>
+
+#include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <utils/base64.h>
+#include <utils/flog.h>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -323,5 +334,221 @@ namespace net::proxy {
             e.description = "direct (no system proxy)" + pacNote;
         }
         return e;
+    }
+
+    namespace {
+        std::string percentDecode(const std::string& s) {
+            std::string out;
+            for (size_t i = 0; i < s.size(); i++) {
+                if (s[i] == '%' && i + 2 < s.size() && std::isxdigit((unsigned char)s[i + 1]) &&
+                    std::isxdigit((unsigned char)s[i + 2])) {
+                    out.push_back((char)std::stoi(s.substr(i + 1, 2), nullptr, 16));
+                    i += 2;
+                }
+                else {
+                    out.push_back(s[i]);
+                }
+            }
+            return out;
+        }
+
+        // "user:pass" between "://" and '@' of a proxy URL.
+        void urlCredentials(const std::string& url, std::string& user, std::string& password) {
+            const size_t scheme = url.find("://");
+            const size_t start = scheme == std::string::npos ? 0 : scheme + 3;
+            const size_t at = url.find('@', start);
+            const size_t slash = url.find('/', start);
+            if (at == std::string::npos || (slash != std::string::npos && at > slash)) { return; }
+            const std::string cred = url.substr(start, at - start);
+            const size_t colon = cred.find(':');
+            user = percentDecode(cred.substr(0, colon));
+            password = colon == std::string::npos ? std::string() : percentDecode(cred.substr(colon + 1));
+        }
+
+        bool parseIPv4(const std::string& s, uint32_t& out) {
+            const std::vector<std::string> parts = split(s, '.');
+            if (parts.size() != 4) { return false; }
+            out = 0;
+            for (const auto& p : parts) {
+                if (p.empty() || p.size() > 3 || p.find_first_not_of("0123456789") != std::string::npos) { return false; }
+                const int v = std::atoi(p.c_str());
+                if (v > 255) { return false; }
+                out = (out << 8) | (uint32_t)v;
+            }
+            return true;
+        }
+
+        const char* firstEnv(std::initializer_list<const char*> names) {
+            for (const char* n : names) {
+                const char* v = std::getenv(n);
+                if (v && *v) { return v; }
+            }
+            return nullptr;
+        }
+    }
+
+    bool noProxyMatches(const std::string& noProxy, const std::string& hostIn) {
+        std::string host = lower(trim(hostIn));
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']') { host = host.substr(1, host.size() - 2); }
+        uint32_t hostIp = 0;
+        const bool hostIsIPv4 = parseIPv4(host, hostIp);
+        for (std::string entry : split(noProxy, ',')) {
+            entry = lower(trim(entry));
+            if (entry.empty()) { continue; }
+            if (entry == "*") { return true; }
+            const size_t slash = entry.find('/');
+            if (slash != std::string::npos) {
+                uint32_t net = 0;
+                const int bits = std::atoi(entry.c_str() + slash + 1);
+                if (hostIsIPv4 && parseIPv4(entry.substr(0, slash), net) && bits >= 0 && bits <= 32) {
+                    const uint32_t mask = bits == 0 ? 0 : 0xFFFFFFFFu << (32 - bits);
+                    if ((hostIp & mask) == (net & mask)) { return true; }
+                }
+                continue;
+            }
+            if (entry.front() == '.') { entry = entry.substr(1); }
+            if (entry.size() >= 2 && entry.front() == '[' && entry.back() == ']') { entry = entry.substr(1, entry.size() - 2); }
+            if (host == entry) { return true; }
+            if (!hostIsIPv4 && host.size() > entry.size() &&
+                host.compare(host.size() - entry.size(), entry.size(), entry) == 0 &&
+                host[host.size() - entry.size() - 1] == '.') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    TcpRoute tcpRoute(const std::string& host) {
+        TcpRoute r;
+        const Effective e = effective();
+        std::string url;
+        std::string noProxy;
+        switch (e.kind) {
+        case Effective::Kind::Direct:
+            r.description = "direct";
+            return r;
+        case Effective::Kind::Proxy:
+            url = e.url;
+            noProxy = e.noProxy;
+            r.user = e.user;
+            r.password = e.password;
+            break;
+        case Effective::Kind::Environment: {
+            // libcurl's order for a non-HTTP transfer; http_proxy only in
+            // lower case, as libcurl reads it.
+            const char* v = firstEnv({ "all_proxy", "ALL_PROXY", "https_proxy", "HTTPS_PROXY", "http_proxy" });
+            if (!v) {
+                r.description = "direct";
+                return r;
+            }
+            url = v;
+            const char* np = firstEnv({ "no_proxy", "NO_PROXY" });
+            noProxy = np ? np : "";
+            urlCredentials(url, r.user, r.password);
+            break;
+        }
+        }
+        if (noProxyMatches(noProxy, host)) {
+            r.description = "direct (no proxy for " + host + ")";
+            return r;
+        }
+        const std::string scheme = lower(url.substr(0, url.find("://") == std::string::npos ? 0 : url.find("://")));
+        if (!scheme.empty() && scheme != "http") {
+            r.error = "a " + scheme + " proxy cannot tunnel raw TCP (" + redact(url) + ")";
+            return r;
+        }
+        if (!parseHostPort(url, r.proxyHost, r.proxyPort)) {
+            r.error = "cannot parse proxy '" + redact(url) + "'";
+            return r;
+        }
+        r.direct = false;
+        r.description = "CONNECT through " + redact(normalizeUrl(url)) + (r.user.empty() ? "" : " as " + r.user);
+        return r;
+    }
+
+    namespace detail {
+        // The CONNECT request for host:port along route.
+        std::string connectRequest(const TcpRoute& route, const std::string& authority) {
+            std::string request = "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n";
+            if (!route.user.empty()) {
+                const std::string cred = route.user + ":" + route.password;
+                request += "Proxy-Authorization: Basic " +
+                           base64::encode(reinterpret_cast<const uint8_t*>(cred.data()), cred.size()) + "\r\n";
+            }
+            return request + "\r\n";
+        }
+
+        std::string authorityOf(const std::string& host, int port) {
+            const bool v6 = host.find(':') != std::string::npos && host.front() != '[';
+            return (v6 ? "[" + host + "]" : host) + ":" + std::to_string(port);
+        }
+
+        // Throws unless head is a complete 2xx answer to CONNECT.
+        void checkConnectReply(const std::string& head, bool timedOut, int budgetMs,
+                               const TcpRoute& route, const std::string& authority) {
+            if (timedOut) {
+                throw std::runtime_error("proxy: no answer to CONNECT " + authority + " within " + std::to_string(budgetMs) + " ms");
+            }
+            if (head.find("\r\n\r\n") == std::string::npos) {
+                throw std::runtime_error("proxy: connection closed during CONNECT " + authority);
+            }
+            const std::string statusLine = head.substr(0, head.find("\r\n"));
+            const size_t sp = statusLine.find(' ');
+            const int status = sp == std::string::npos ? 0 : std::atoi(statusLine.c_str() + sp + 1);
+            if (status == 407) {
+                throw std::runtime_error("proxy: " + route.proxyHost + " requires authentication (" + statusLine + ")");
+            }
+            if (status < 200 || status > 299) {
+                throw std::runtime_error("proxy: CONNECT " + authority + " refused: " + statusLine);
+            }
+            flog::info("proxy: tunnel to {} {}", authority, route.description);
+        }
+    }
+
+    net::Conn connect(const std::string& host, uint16_t port, int timeoutMs) {
+        const TcpRoute route = tcpRoute(host);
+        if (!route.error.empty()) { throw std::runtime_error("proxy: " + route.error); }
+        if (route.direct) { return net::connect(host, port, timeoutMs); }
+
+        const int budgetMs = timeoutMs < 0 ? 10000 : timeoutMs;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+        net::Conn conn = net::connect(route.proxyHost, (uint16_t)route.proxyPort, budgetMs);
+        if (!conn) { throw std::runtime_error("proxy: could not connect to " + route.proxyHost); }
+
+        const std::string authority = detail::authorityOf(host, port);
+        std::string request = detail::connectRequest(route, authority);
+        if (!conn->write((int)request.size(), reinterpret_cast<uint8_t*>(request.data()))) {
+            throw std::runtime_error("proxy: sending CONNECT to " + route.proxyHost + " failed");
+        }
+
+        // ConnClass::read() has no timeout: a watchdog closes the socket at
+        // the deadline, which wakes the read. One byte at a time, so nothing
+        // the server sends through the tunnel is consumed here.
+        std::mutex mtx;
+        std::condition_variable cv;
+        bool done = false;
+        bool timedOut = false;
+        std::thread watchdog([&] {
+            std::unique_lock<std::mutex> lock(mtx);
+            if (!cv.wait_until(lock, deadline, [&] { return done; })) {
+                timedOut = true;
+                conn->close();
+            }
+        });
+        std::string head;
+        uint8_t ch = 0;
+        while (head.size() < 8192 && head.find("\r\n\r\n") == std::string::npos) {
+            if (conn->read(1, &ch, true) != 1) { break; }
+            head.push_back((char)ch);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            done = true;
+        }
+        cv.notify_all();
+        watchdog.join();
+
+        detail::checkConnectReply(head, timedOut, budgetMs, route, authority);
+        return conn;
     }
 }

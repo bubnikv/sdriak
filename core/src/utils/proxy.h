@@ -12,7 +12,14 @@
  */
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
+
+namespace net {
+    class ConnClass;
+    typedef std::unique_ptr<ConnClass> Conn; // utils/networking.h
+}
 
 namespace net::proxy {
 
@@ -70,6 +77,46 @@ namespace net::proxy {
     // WinINET ProxyServer ("host:port" or "http=h:p;https=h:p;socks=h:p") to
     // one proxy URL: http= first, then https=, then socks= as socks4a://.
     std::string winInetProxyUrl(const std::string& proxyServer);
+
+    // Raw TCP (SpyServer, SDRIAK server), which libcurl does not carry.
+
+    // How a raw TCP connection to host goes: direct, or through an HTTP proxy
+    // with CONNECT. Resolved like effective(); in Environment mode from
+    // all_proxy / https_proxy / http_proxy and no_proxy, credentials taken
+    // from the URL. error is set for a proxy CONNECT cannot use (SOCKS).
+    struct TcpRoute {
+        bool direct = true;
+        std::string proxyHost;
+        int proxyPort = 0;
+        std::string user;
+        std::string password;
+        std::string description;
+        std::string error;
+    };
+    TcpRoute tcpRoute(const std::string& host);
+
+    // TCP to host:port along tcpRoute(host). A tunnel sends CONNECT with
+    // Proxy-Authorization: Basic when credentials are set and waits for a 2xx
+    // within timeoutMs (10 s when negative). Throws std::runtime_error like
+    // net::connect(). Many proxies allow CONNECT only to port 443, so sources
+    // call this only when the user enabled it for them.
+    net::Conn connect(const std::string& host, uint16_t port, int timeoutMs);
+    // connectSocket() in utils/proxy_socket.h is the same for the utils/net.h
+    // socket; the two socket libraries cannot share a translation unit.
+
+    namespace detail {
+        // The CONNECT request for authority ("host:port", "[v6]:port").
+        std::string connectRequest(const TcpRoute& route, const std::string& authority);
+        std::string authorityOf(const std::string& host, int port);
+        // Throws unless head is a complete 2xx answer to CONNECT.
+        void checkConnectReply(const std::string& head, bool timedOut, int budgetMs,
+                               const TcpRoute& route, const std::string& authority);
+    }
+
+    // True when a libcurl-syntax no_proxy list says host is reached
+    // directly: "*", a host or domain (also its subdomains, a leading dot
+    // optional), an IPv4 CIDR, an exact address.
+    bool noProxyMatches(const std::string& noProxy, const std::string& host);
 
     // WinINET ProxyOverride ("*.local;192.168.*;<local>") to libcurl's
     // no_proxy syntax: "*.x" -> ".x", "a.b.*" -> CIDR, "<local>" -> the

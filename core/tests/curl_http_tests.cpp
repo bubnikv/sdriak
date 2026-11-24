@@ -5,7 +5,8 @@
 // shouldCancel ending a stalled response. Plus urlOrigin / urlPath.
 // Proxy: settings parsing, GET/POST through an authenticating test proxy, a
 // wrong password (407), noProxy, http_proxy honoured by system mode and
-// ignored by none.
+// ignored by none. Raw TCP (net::proxy::connect): an authenticated CONNECT
+// tunnel, 407, noProxy, SOCKS refused, a silent proxy timing out.
 // `curl_http_tests --directory [--via-test-proxy]` fetches the real KiwiSDR
 // directory once, optionally through the in-process authenticating proxy.
 #include <gui/brown/kiwisdr_directory.h>
@@ -372,6 +373,117 @@ namespace {
         setEnv("http_proxy", nullptr);
     }
 
+    // A raw TCP echo server: reads, writes back; one connection at a time.
+    class EchoServer {
+    public:
+        explicit EchoServer(bool silent = false) : m_silent(silent) {
+            for (m_port = 24560; m_port < 24580; m_port++) {
+                try {
+                    m_listener = net::listen("127.0.0.1", m_port);
+                    break;
+                }
+                catch (const std::exception&) {}
+            }
+            if (!m_listener) { throw std::runtime_error("echo: no free port"); }
+            m_thread = std::thread([this] {
+                for (;;) {
+                    net::Conn c;
+                    try { c = m_listener->accept(); }
+                    catch (...) { return; }
+                    if (m_stop || !c) { return; }
+                    uint8_t b[4096];
+                    for (;;) {
+                        const int n = c->read(sizeof(b), b, false);
+                        if (n <= 0) { break; }
+                        if (!m_silent && !c->write(n, b)) { break; }
+                    }
+                }
+            });
+        }
+        ~EchoServer() {
+            m_stop = true;
+            try {
+                auto wake = net::connect("127.0.0.1", m_port, 1000);
+                if (wake) { wake->close(); }
+            }
+            catch (...) {}
+            m_listener->close();
+            m_thread.join();
+        }
+        uint16_t port() const { return m_port; }
+
+    private:
+        bool m_silent;
+        uint16_t m_port = 0;
+        net::Listener m_listener;
+        std::thread m_thread;
+        std::atomic<bool> m_stop{false};
+    };
+
+    std::string echoOnce(net::Conn& c, const std::string& msg) {
+        require(c->write((int)msg.size(), reinterpret_cast<uint8_t*>(const_cast<char*>(msg.data()))), "echo write");
+        std::string got(msg.size(), '\0');
+        require(c->read((int)got.size(), reinterpret_cast<uint8_t*>(got.data()), true) == (int)got.size(), "echo read");
+        return got;
+    }
+
+    void noProxyMatching() {
+        using net::proxy::noProxyMatches;
+        require(noProxyMatches("*", "anything.example"), "*");
+        require(noProxyMatches("example.com", "example.com") && noProxyMatches("example.com", "rx.example.com"), "domain");
+        require(noProxyMatches(".example.com", "rx.example.com") && !noProxyMatches("example.com", "badexample.com"), "suffix");
+        require(noProxyMatches(" localhost , 10.0.0.0/8", "10.20.30.40") && !noProxyMatches("10.0.0.0/8", "11.0.0.1"), "CIDR");
+        require(noProxyMatches("192.168.1.5", "192.168.1.5") && !noProxyMatches("192.168.1.5", "192.168.1.50"), "exact IP");
+        require(noProxyMatches("::1", "[::1]") && !noProxyMatches("", "localhost"), "IPv6 and empty");
+    }
+
+    void rawTcpThroughProxy() {
+        EchoServer echoSrv;
+        test_proxy::HttpProxy proxy("alice", "secret", 24520);
+        {
+            ProxyScope scope(manual(proxy.url(), "alice", "secret"));
+            const auto route = net::proxy::tcpRoute("127.0.0.1");
+            require(!route.direct && route.proxyHost == "127.0.0.1", "route: " + route.description + route.error);
+            net::Conn c = net::proxy::connect("127.0.0.1", echoSrv.port(), 3000);
+            require(echoOnce(c, "spyserver hello") == "spyserver hello", "tunnelled echo differs");
+            c->close();
+            require(proxy.tunnels() == 1 && proxy.rejected() == 0, "expected one authenticated CONNECT");
+        }
+        {
+            ProxyScope scope(manual(proxy.url(), "alice", "wrong"));
+            bool threw = false;
+            try { net::proxy::connect("127.0.0.1", echoSrv.port(), 3000); }
+            catch (const std::exception& e) { threw = std::string(e.what()).find("407") != std::string::npos; }
+            require(threw, "wrong password must throw with the 407 status");
+        }
+        {
+            ProxyScope scope(manual(proxy.url(), "", "", "127.0.0.0/8"));
+            net::Conn c = net::proxy::connect("127.0.0.1", echoSrv.port(), 3000);
+            require(echoOnce(c, "direct") == "direct", "bypassed echo differs");
+            c->close();
+            require(proxy.tunnels() == 1, "a noProxy host was tunnelled");
+        }
+        {
+            ProxyScope scope(manual("socks5://127.0.0.1:1080"));
+            bool threw = false;
+            try { net::proxy::connect("127.0.0.1", echoSrv.port(), 1000); }
+            catch (const std::exception& e) { threw = std::string(e.what()).find("socks5") != std::string::npos; }
+            require(threw, "a SOCKS proxy must be refused for raw TCP");
+        }
+    }
+
+    void rawTcpProxyTimeout() {
+        EchoServer silentProxy(true); // accepts and reads, never answers
+        ProxyScope scope(manual("http://127.0.0.1:" + std::to_string(silentProxy.port())));
+        const auto t0 = Clock::now();
+        bool threw = false;
+        try { net::proxy::connect("example.invalid", 5555, 500); }
+        catch (const std::exception& e) { threw = std::string(e.what()).find("no answer") != std::string::npos; }
+        const long long ms = msSince(t0);
+        require(threw, "silent proxy did not time out");
+        require(ms < 2000, "CONNECT timeout took " + std::to_string(ms) + " ms");
+    }
+
     // One real fetch of the KiwiSDR directory into an empty cache folder.
     int liveDirectory() {
         const auto dir = std::filesystem::temp_directory_path() /
@@ -432,6 +544,9 @@ int main(int argc, char** argv) {
         { "wrong proxy password", wrongProxyPassword },
         { "noProxy bypass", noProxyBypass },
         { "environment proxy and mode none", environmentAndNone },
+        { "noProxy matching", noProxyMatching },
+        { "raw TCP through the proxy", rawTcpThroughProxy },
+        { "raw TCP CONNECT timeout", rawTcpProxyTimeout },
     };
     int failures = 0;
     for (const auto& [name, fn] : tests) {

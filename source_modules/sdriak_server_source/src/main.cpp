@@ -65,6 +65,7 @@ public:
             std::string hostStr;
             if (configAccess.tryGet("hostname", hostStr)) { strcpy(hostname, hostStr.c_str()); }
             configAccess.tryGet("port", port);
+            configAccess.tryGet("viaProxy", viaProxy);
         }
         loadPasswordForServer();
 
@@ -218,6 +219,10 @@ private:
             config.edit().set("port", _this->port);
             _this->loadPasswordForServer();
         }
+        // CONNECT through the Network proxy; many proxies allow it only to 443.
+        if (ImGui::Checkbox(CONCAT("Through the proxy##sdrpp_srv_srv_proxy_", _this->name), &_this->viaProxy)) {
+            config.edit().set("viaProxy", _this->viaProxy);
+        }
         ImGui::LeftLabel("Password");
         ImGui::FillWidth();
         if (ImGui::InputTextWithHint(CONCAT("##sdrpp_srv_srv_password_", _this->name), _this->savedAuthKeyValid ? "Saved" : "", _this->password, sizeof(_this->password), ImGuiInputTextFlags_Password)) {
@@ -334,7 +339,8 @@ private:
             server::deriveAuthKey(std::string(password), *authKey);
         }
 
-        connector.begin([this, host, targetPort, authKey, useAuth]() {
+        const bool throughProxy = viaProxy;
+        connector.begin([this, host, targetPort, authKey, useAuth, throughProxy]() {
             // Zero the key however the factory exits.
             struct KeyGuard {
                 std::shared_ptr<server::AuthKey> key;
@@ -342,8 +348,8 @@ private:
             } keyGuard{ authKey };
 
             return useAuth
-                ? server::connect(host, targetPort, &stream, *authKey, 3000, connector.cancelToken())
-                : server::connect(host, targetPort, &stream, std::string(), 3000, connector.cancelToken());
+                ? server::connect(host, targetPort, &stream, *authKey, 3000, connector.cancelToken(), throughProxy)
+                : server::connect(host, targetPort, &stream, std::string(), 3000, connector.cancelToken(), throughProxy);
         });
     }
 
@@ -527,6 +533,7 @@ private:
     server::AuthKey savedAuthKey{};
     bool savedAuthKeyValid = false;
     int port = 50000;
+    bool viaProxy = false;
     std::string devConfName = "";
 
     dsp::stream<dsp::complex_t> stream;

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <chrono>
 #include <utils/flog.h>
+#include <utils/proxy.h>
 
 using namespace std::chrono_literals;
 
@@ -206,8 +207,8 @@ namespace spyserver {
         _this->client->readAsync(sizeof(SpyServerMessageHeader), (uint8_t*)&_this->receivedHeader, dataHandler, _this);
     }
 
-    SpyServerClient connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, int timeoutMS) {
-        net::Conn conn = net::connect(host, port, timeoutMS);
+    SpyServerClient connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, int timeoutMS, bool viaProxy) {
+        net::Conn conn = viaProxy ? net::proxy::connect(host, port, timeoutMS) : net::connect(host, port, timeoutMS);
         if (!conn) {
             return NULL;
         }

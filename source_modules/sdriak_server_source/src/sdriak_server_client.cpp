@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cmath>
 #include <utils/flog.h>
+#include <utils/proxy_socket.h>
 #include <core.h>
 #include <signal_path/signal_path.h>
 #include <utils/proto/pbkdf2_sha256.h>
@@ -615,11 +616,11 @@ namespace server {
         _this->output->swap(count);
     }
 
-    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const std::string& password, int timeoutMS, const std::atomic<bool>* cancellation) {
-        return std::make_shared<Client>(net::connect(host, port, timeoutMS), out, password, cancellation);
+    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const std::string& password, int timeoutMS, const std::atomic<bool>* cancellation, bool viaProxy) {
+        return std::make_shared<Client>(viaProxy ? net::proxy::connectSocket(host, port, timeoutMS) : net::connect(host, port, timeoutMS), out, password, cancellation);
     }
 
-    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const AuthKey& authKey, int timeoutMS, const std::atomic<bool>* cancellation) {
-        return std::make_shared<Client>(net::connect(host, port, timeoutMS), out, authKey, cancellation);
+    std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, const AuthKey& authKey, int timeoutMS, const std::atomic<bool>* cancellation, bool viaProxy) {
+        return std::make_shared<Client>(viaProxy ? net::proxy::connectSocket(host, port, timeoutMS) : net::connect(host, port, timeoutMS), out, authKey, cancellation);
     }
 }
