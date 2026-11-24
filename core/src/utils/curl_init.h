@@ -10,8 +10,8 @@ namespace curl {
     void cleanup();
 
     // Allocates a CURL easy handle with shared defaults applied: User-Agent,
-    // follow-redirects, no SIGPIPE/SIGALRM, and on Android the OS trust store
-    // via CURLOPT_CAPATH. Caller owns the handle and must curl_easy_cleanup()
+    // follow-redirects, no SIGPIPE/SIGALRM, on Windows best-effort revocation
+    // checks, and on Android the OS trust store via CURLOPT_CAPATH. Caller owns the handle and must curl_easy_cleanup()
     // it. Returns nullptr on allocation failure.
     CURL* make_easy();
 }

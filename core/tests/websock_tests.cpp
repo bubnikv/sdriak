@@ -9,9 +9,12 @@
 //
 // `websock_tests --live <url> [--kiwi]` instead opens one real connection
 // (for wss:// checks); "{ts}" in the url is replaced by the time in ms.
+// `websock_tests --kiwi-client host:port` runs KiwiSDRClient's whole connect
+// path once: the /VER scheme probe, then the websocket, until IQ arrives.
 #include <utils/base64.h>
 #include <utils/networking.h>
 #include <utils/proto/picohash.h>
+#include <utils/proto/kiwisdr.h>
 #include <utils/proto/websock.h>
 
 #include <algorithm>
@@ -732,11 +735,43 @@ namespace {
         if (run.failed()) { std::printf("error:     %s\n", run.errorText().c_str()); }
         return (!run.failed() && !c.msgs.empty()) ? 0 : 1;
     }
+
+    int kiwiClient(const std::string& hostPort) {
+        KiwiSDRClient client;
+        std::atomic<int> samples{0};
+        std::atomic<bool> connected{false};
+        std::atomic<bool> failed{false};
+        client.onConnected = [&] { connected = true; };
+        client.onError = [&](const std::string&) { failed = true; };
+        client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
+        client.init(hostPort);
+        const auto t0 = Clock::now();
+        client.start();
+        client.tune(14074000.0, KiwiSDRClient::TUNE_IQ);
+        bool tuned = false;
+        while (msSince(t0) < 15000 && samples.load() < 12000 && !failed) {
+            if (connected && !tuned) {
+                client.tune(14074000.0, KiwiSDRClient::TUNE_IQ);
+                tuned = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        const long long elapsed = msSince(t0);
+        const std::string status = client.getConnectionStatus();
+        const std::string eff = client.wsClient.effectiveUrl();
+        client.stop();
+        std::printf("host:      %s\neffective: %s\nconnected: %d  samples: %d  after %lld ms\nstatus:    %s\n",
+                    hostPort.c_str(), eff.c_str(), (int)connected.load(), samples.load(), elapsed, status.c_str());
+        return (connected && samples.load() > 0) ? 0 : 1;
+    }
 }
 
 int main(int argc, char** argv) {
     // Unbuffered, so the log up to a crash survives.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc >= 3 && std::string(argv[1]) == "--kiwi-client") {
+        return kiwiClient(argv[2]);
+    }
     if (argc >= 3 && std::string(argv[1]) == "--live") {
         return live(argv[2], argc >= 4 && std::string(argv[3]) == "--kiwi");
     }

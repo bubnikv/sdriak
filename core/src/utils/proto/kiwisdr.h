@@ -161,7 +161,9 @@ private:
     // servers reject paths whose timestamp drifts too far from their own
     // clock. Falls back to the local epoch ms if the fetch or parse fails —
     // local-clock ms is still unique enough for session disambiguation.
-    uint64_t fetchServerTimestamp(const std::string& host, int port);
+    // origin receives the server's http(s)://host[:port] after redirects
+    // (the scheme probe), or http://host:port when the fetch fails.
+    uint64_t fetchServerTimestamp(const std::string& host, int port, std::string& origin);
 
     void resetSessionState();
 

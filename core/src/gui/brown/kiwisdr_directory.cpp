@@ -37,7 +37,7 @@
 
 #include <core.h>
 #include <utils/flog.h>
-#include "utils/proto/http.h"
+#include "utils/proto/curl_http.h"
 #include "utils/proto/kiwisdr.h"
 #include "utils/url.h"
 #include <gui/brown/geomap.h>
@@ -45,8 +45,9 @@
 
 namespace {
 
-    constexpr const char* DIRECTORY_HOST = "rx.linkfanel.net";
-    constexpr const char* DIRECTORY_PATH = "/kiwisdr_com.js";
+    // Plain http: rx.linkfanel.net serves no TLS (port 443 refused,
+    // checked 2026-11-24). libcurl still brings redirects and the proxy.
+    constexpr const char* DIRECTORY_URL = "http://rx.linkfanel.net/kiwisdr_com.js";
     constexpr const char* CACHE_FILENAME = "kiwisdr_source.receiverlist.json";
     constexpr auto CACHE_TTL = std::chrono::hours(1);
     constexpr size_t MAX_RESPONSE_SIZE = 4 * 1024 * 1024;
@@ -70,7 +71,7 @@ namespace {
         return out;
     }
 
-    std::string fetchDirectoryJson(const std::string& cachePath) {
+    std::string fetchDirectoryJson(const std::string& cachePath, const std::function<bool()>& shouldCancel) {
         auto status = std::filesystem::status(cachePath);
         if (std::filesystem::exists(status)) {
             const auto last_write_time = std::filesystem::last_write_time(cachePath);
@@ -83,35 +84,21 @@ namespace {
             }
         }
 
-        // Bound DNS + TCP connect like the 5 s response timeout below, so a
-        // dead directory host can't pin the fetch worker for minutes.
-        auto controlSock = net::connect(DIRECTORY_HOST, 80, 5000);
-        auto controlHttp = net::http::Client(controlSock);
-
-        net::http::RequestHeader rqhdr(net::http::METHOD_GET, DIRECTORY_PATH, DIRECTORY_HOST);
-        controlHttp.sendRequestHeader(rqhdr);
-        net::http::ResponseHeader rshdr;
-        controlHttp.recvResponseHeader(rshdr, 5000);
-
-        flog::debug("Response from {}: {}", DIRECTORY_HOST, rshdr.getStatusString());
-
-        std::vector<uint8_t> data(16 * 1024);
-        std::string response;
-        response.reserve(256 * 1024);
-        while (true) {
-            auto len = controlSock->recv(data.data(), data.size());
-            if (len < 1) {
-                break;
-            }
-            if (response.size() + len > MAX_RESPONSE_SIZE) {
-                controlSock->close();
-                throw std::runtime_error("Server response is too large");
-            }
-            response.append(reinterpret_cast<char*>(data.data()), len);
+        // A dead directory host must not pin the fetch worker: connect is
+        // bounded like before, the whole ~0.9 MB transfer by timeoutMs, and
+        // the destructor cancels through shouldCancel.
+        net::http::CurlRequestOptions options;
+        options.connectTimeoutMs = 5000;
+        options.timeoutMs = 60000;
+        options.maxBody = MAX_RESPONSE_SIZE;
+        options.shouldCancel = shouldCancel;
+        const auto response = net::http::curlGet(DIRECTORY_URL, options);
+        flog::debug("Response from {}: HTTP {}", response.effectiveUrl, response.status);
+        if (response.status != 200) {
+            throw std::runtime_error("Directory HTTP status " + std::to_string(response.status));
         }
-        controlSock->close();
 
-        std::string cleaned = cleanJsResponse(response);
+        std::string cleaned = cleanJsResponse(response.body);
 
         if (FILE* toSave = fopen(cachePath.c_str(), "wt")) {
             fwrite(cleaned.c_str(), 1, cleaned.size(), toSave);
@@ -194,6 +181,7 @@ KiwiSDRDirectoryClient::KiwiSDRDirectoryClient(std::string root)
     : root(std::move(root)) {}
 
 KiwiSDRDirectoryClient::~KiwiSDRDirectoryClient() {
+    stopping = true;
     if (fetchThread.joinable()) {
         fetchThread.join();
     }
@@ -239,7 +227,7 @@ void KiwiSDRDirectoryClient::fetchThreadFn() {
     std::string failure;
     try {
         const std::string cachePath = root + "/" + CACHE_FILENAME;
-        std::string jsonText = fetchDirectoryJson(cachePath);
+        std::string jsonText = fetchDirectoryJson(cachePath, [this] { return stopping.load(); });
         json doc = json::parse(jsonText);
 
         for (const auto& entry : doc) {

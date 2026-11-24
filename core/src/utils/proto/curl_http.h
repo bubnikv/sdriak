@@ -28,8 +28,30 @@ namespace net::http {
         std::string effectiveUrl;
     };
 
-    // HTTPS-capable GET implemented by core through libcurl. Modules should
-    // use this instead of including <curl/curl.h> or linking libcurl directly.
+    struct CurlRequest {
+        std::string method = "GET"; // "GET", "POST" or another verb
+        std::string url;
+        std::string body;           // sent when non-empty or method is "POST"
+        std::string contentType;    // Content-Type of body, e.g. "application/json"
+    };
+
+    // HTTP(S) request implemented by core through libcurl: TLS with the
+    // platform trust store, redirects (a POST answered by 301/302/303 is
+    // retried as GET). Any HTTP status is returned in CurlResponse::status;
+    // transport failures, cancellation and an oversized body throw
+    // std::runtime_error. Modules should use this instead of including
+    // <curl/curl.h> or linking libcurl directly.
+    SDRPP_EXPORT CurlResponse curlRequest(const CurlRequest& request, const CurlRequestOptions& options = CurlRequestOptions());
+
+    // curlRequest() with method GET.
     SDRPP_EXPORT CurlResponse curlGet(const std::string& url, const CurlRequestOptions& options = CurlRequestOptions());
+
+    // "scheme://host[:port]" of url, the port only when it is not the
+    // scheme's default; empty when url does not parse. After redirects this
+    // is how a client learns that http://host:port moved to https://.
+    SDRPP_EXPORT std::string urlOrigin(const std::string& url);
+
+    // The path of url ("/" when it has none); empty when url does not parse.
+    SDRPP_EXPORT std::string urlPath(const std::string& url);
 
 }

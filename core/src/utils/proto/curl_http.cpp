@@ -71,6 +71,55 @@ namespace net::http {
     }
 
     CurlResponse curlGet(const std::string& url, const CurlRequestOptions& options) {
+        CurlRequest request;
+        request.url = url;
+        return curlRequest(request, options);
+    }
+
+    namespace {
+        class UrlGuard {
+        public:
+            explicit UrlGuard(const std::string& url) : m_url(curl_url()) {
+                m_ok = m_url && curl_url_set(m_url, CURLUPART_URL, url.c_str(), CURLU_NON_SUPPORT_SCHEME) == CURLUE_OK;
+            }
+            ~UrlGuard() { curl_url_cleanup(m_url); }
+            UrlGuard(const UrlGuard&) = delete;
+            UrlGuard& operator=(const UrlGuard&) = delete;
+
+            bool ok() const { return m_ok; }
+
+            std::string get(CURLUPart part, unsigned int flags = 0) const {
+                char* value = nullptr;
+                if (!m_ok || curl_url_get(m_url, part, &value, flags) != CURLUE_OK || !value) { return {}; }
+                std::string out(value);
+                curl_free(value);
+                return out;
+            }
+
+        private:
+            CURLU* m_url;
+            bool m_ok = false;
+        };
+    }
+
+    std::string urlOrigin(const std::string& url) {
+        UrlGuard u(url);
+        if (!u.ok()) { return {}; }
+        std::string origin = u.get(CURLUPART_SCHEME) + "://" + u.get(CURLUPART_HOST);
+        const std::string port = u.get(CURLUPART_PORT, CURLU_NO_DEFAULT_PORT);
+        if (!port.empty()) { origin += ":" + port; }
+        return origin;
+    }
+
+    std::string urlPath(const std::string& url) {
+        UrlGuard u(url);
+        if (!u.ok()) { return {}; }
+        const std::string path = u.get(CURLUPART_PATH);
+        return path.empty() ? "/" : path;
+    }
+
+    CurlResponse curlRequest(const CurlRequest& request, const CurlRequestOptions& options) {
+        const std::string& url = request.url;
         EasyGuard easy(curl::make_easy());
         if (!easy.handle) {
             throw std::runtime_error("curl_easy_init failed");
@@ -118,14 +167,39 @@ namespace net::http {
             setOption(easy.handle, CURLOPT_NOPROGRESS, 0, "CURLOPT_NOPROGRESS");
         }
 
+        const bool post = request.method == "POST";
+        if (post || !request.body.empty()) {
+            // POSTFIELDS is not copied; request outlives the perform below.
+            setOption(easy.handle, CURLOPT_POST, 1L, "CURLOPT_POST");
+            rc = curl_easy_setopt(easy.handle, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)request.body.size());
+            if (rc != CURLE_OK) {
+                throw std::runtime_error(std::string("curl_easy_setopt(CURLOPT_POSTFIELDSIZE_LARGE) failed: ") + curl_easy_strerror(rc));
+            }
+            rc = curl_easy_setopt(easy.handle, CURLOPT_POSTFIELDS, request.body.data());
+            if (rc != CURLE_OK) {
+                throw std::runtime_error(std::string("curl_easy_setopt(CURLOPT_POSTFIELDS) failed: ") + curl_easy_strerror(rc));
+            }
+        }
+        if (!request.method.empty() && request.method != "GET" && !post) {
+            rc = curl_easy_setopt(easy.handle, CURLOPT_CUSTOMREQUEST, request.method.c_str());
+            if (rc != CURLE_OK) {
+                throw std::runtime_error(std::string("curl_easy_setopt(CURLOPT_CUSTOMREQUEST) failed: ") + curl_easy_strerror(rc));
+            }
+        }
+
         SListGuard headers;
-        for (const auto& [name, value] : options.headers) {
-            std::string header = name + ": " + value;
+        auto appendHeader = [&headers](const std::string& header) {
             curl_slist* next = curl_slist_append(headers.list, header.c_str());
             if (!next) {
                 throw std::runtime_error("curl_slist_append failed");
             }
             headers.list = next;
+        };
+        if (!request.contentType.empty() && !options.headers.count("Content-Type")) {
+            appendHeader("Content-Type: " + request.contentType);
+        }
+        for (const auto& [name, value] : options.headers) {
+            appendHeader(name + ": " + value);
         }
         if (headers.list) {
             rc = curl_easy_setopt(easy.handle, CURLOPT_HTTPHEADER, headers.list);

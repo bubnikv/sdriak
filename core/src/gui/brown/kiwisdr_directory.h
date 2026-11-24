@@ -79,6 +79,7 @@ private:
     void fetchThreadFn();
 
     const std::string root;
+    std::atomic<bool> stopping{false}; // set by the destructor; cancels the fetch
     std::thread fetchThread;
     mutable std::mutex stateMutex;
     bool loading = false;

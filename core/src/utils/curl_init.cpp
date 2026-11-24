@@ -41,6 +41,15 @@ CURL* make_easy() {
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 15L);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
 
+#ifdef _WIN32
+    // Schannel fails the whole handshake when the certificate's revocation
+    // service is unreachable (proxies, captive portals, mobile links), and
+    // the user only sees a TLS error. Best effort still rejects a
+    // certificate that is known to be revoked; Mbed-TLS on the other
+    // platforms checks no revocation at all.
+    curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_REVOKE_BEST_EFFORT);
+#endif
+
 #ifdef __ANDROID__
     // Android ships PEM-encoded CA certs in this directory; libcurl's MbedTLS
     // backend has no other way to find them, and there is no system libcurl to

@@ -10,7 +10,7 @@
 #include <json.hpp>
 
 #include "utils/flog.h"
-#include "utils/proto/http.h"
+#include "utils/proto/curl_http.h"
 #include "utils/url.h"
 
 int16_t KiwiSDRClient::readBE16(const char* data) {
@@ -278,20 +278,38 @@ int64_t KiwiSDRClient::parseKhzToHz(const std::string& value) {
     return static_cast<int64_t>(std::llround(khz * 1000.0));
 }
 
-uint64_t KiwiSDRClient::fetchServerTimestamp(const std::string& host, int port) {
+// /VER doubles as the scheme probe. A Kiwi behind TLS answers http:// with a
+// redirect (hra.remoteqth.com: 302 to its https site root), so the request
+// follows redirects and origin becomes the final URL's scheme://host[:port];
+// when the redirect lands somewhere other than /VER, /VER is asked again on
+// that origin. origin stays http://host:port when the probe fails, and the
+// websocket then follows the redirect itself.
+uint64_t KiwiSDRClient::fetchServerTimestamp(const std::string& host, int port, std::string& origin) {
     using namespace std::chrono;
     const uint64_t fallback = static_cast<uint64_t>(
         duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+    const bool bracket = host.find(':') != std::string::npos && host.front() != '[';
+    origin = "http://" + (bracket ? "[" + host + "]" : host) + ":" + std::to_string(port);
     try {
-        net::http::RequestOptions options;
+        net::http::CurlRequestOptions options;
+        options.connectTimeoutMs = 5000;
         options.timeoutMs = 5000;
         options.maxRedirects = 5;
-        options.maxBody = 64 * 1024;
+        // A redirect to the site root brings the web page along.
+        options.maxBody = 1024 * 1024;
         options.headers["Accept"] = "application/json, text/plain, */*";
-        options.headers["User-Agent"] = "SDRIAK KiwiSDR client";
+        options.shouldCancel = [this] { return !running.load(); };
 
-        auto response = net::http::get({ host, port, "/VER" }, options);
-        const int status = static_cast<int>(response.header.getStatusCode());
+        auto response = net::http::curlGet(origin + "/VER", options);
+        const std::string finalOrigin = net::http::urlOrigin(response.effectiveUrl);
+        if (!finalOrigin.empty()) {
+            origin = finalOrigin;
+        }
+        if (net::http::urlPath(response.effectiveUrl) != "/VER") {
+            flog::info("KiwiSDRClient: /VER moved to {}, asking {}/VER", response.effectiveUrl, origin);
+            response = net::http::curlGet(origin + "/VER", options);
+        }
+        const int status = static_cast<int>(response.status);
         if (status != 200) {
             throw std::runtime_error("KiwiSDRClient: /VER HTTP status " + std::to_string(status));
         }
@@ -356,8 +374,10 @@ void KiwiSDRClient::start() {
             if (!parsed) {
                 throw std::runtime_error("KiwiSDRClient: malformed host:port: " + hostPort);
             }
-            const uint64_t ts = fetchServerTimestamp(parsed->host, parsed->port);
-            wsClient.connectAndReceiveLoop(parsed->host, parsed->port, "/kiwi/" + std::to_string(ts) + "/SND");
+            std::string origin;
+            const uint64_t ts = fetchServerTimestamp(parsed->host, parsed->port, origin);
+            // origin is http(s)://host[:port]; WSClient maps it to ws(s).
+            wsClient.connectAndReceiveLoop(origin + "/kiwi/" + std::to_string(ts) + "/SND");
             flog::info("x.connectAndReceiveLoop exited.");
             setConnectionStatus("Disconnected");
             connected = false;
