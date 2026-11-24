@@ -251,8 +251,8 @@ if (NOT ANDROID)
 endif ()
 
 if (MSVC)
-    # WinSock2
-    target_link_libraries(sdrpp_core PUBLIC wsock32 ws2_32 iphlpapi advapi32)
+    # WinSock2; WinHTTP evaluates PAC scripts (utils/proxy.cpp)
+    target_link_libraries(sdrpp_core PUBLIC wsock32 ws2_32 iphlpapi advapi32 winhttp)
 elseif (ANDROID)
     target_include_directories(sdrpp_core PUBLIC
         ${ANDROID_NDK}/sources/android/native_app_glue

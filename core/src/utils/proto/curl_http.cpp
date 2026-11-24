@@ -120,7 +120,7 @@ namespace net::http {
 
     CurlResponse curlRequest(const CurlRequest& request, const CurlRequestOptions& options) {
         const std::string& url = request.url;
-        EasyGuard easy(curl::make_easy());
+        EasyGuard easy(curl::make_easy(url));
         if (!easy.handle) {
             throw std::runtime_error("curl_easy_init failed");
         }

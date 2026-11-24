@@ -33,7 +33,7 @@ void cleanup() {
     g_initialized = false;
 }
 
-CURL* make_easy() {
+CURL* make_easy(const std::string& url) {
     CURL* h = curl_easy_init();
     if (!h) return nullptr;
 
@@ -43,7 +43,7 @@ CURL* make_easy() {
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
 
     // Proxy: net::proxy resolves the user's mode (core config "network").
-    const net::proxy::Effective proxy = net::proxy::effective();
+    const net::proxy::Effective proxy = net::proxy::effective(url);
     switch (proxy.kind) {
     case net::proxy::Effective::Kind::Direct:
         // "" also stops libcurl from reading http_proxy & co.

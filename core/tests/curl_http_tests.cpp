@@ -6,7 +6,9 @@
 // Proxy: settings parsing, GET/POST through an authenticating test proxy, a
 // wrong password (407), noProxy, http_proxy honoured by system mode and
 // ignored by none. Raw TCP (net::proxy::connect): an authenticated CONNECT
-// tunnel, 407, noProxy, SOCKS refused, a silent proxy timing out.
+// tunnel, 407, noProxy, SOCKS refused, a silent proxy timing out. PAC: the
+// target a script is asked about, and on Windows a script served on loopback
+// evaluated through WinHTTP.
 // `curl_http_tests --directory [--via-test-proxy]` fetches the real KiwiSDR
 // directory once, optionally through the in-process authenticating proxy.
 #include <gui/brown/kiwisdr_directory.h>
@@ -311,6 +313,43 @@ namespace {
         require(effective().kind == Effective::Kind::Direct, "none is direct");
     }
 
+    void pacScript() {
+        using net::proxy::detail::pacTarget;
+        require(pacTarget("wss://User:pw@Hra.RemoteQTH.com:8073/kiwi/1/SND?x") == "https://hra.remoteqth.com:8073/",
+                "wss target: " + pacTarget("wss://User:pw@Hra.RemoteQTH.com:8073/kiwi/1/SND?x"));
+        require(pacTarget("ws://[::1]:8073") == "http://[::1]:8073/", "ws IPv6 target: " + pacTarget("ws://[::1]:8073"));
+        require(pacTarget("http://h.example?q") == "http://h.example/", "query only: " + pacTarget("http://h.example?q"));
+        require(pacTarget("").empty() && pacTarget("ftp://h/").empty() && pacTarget("h.example:80").empty(),
+                "no target for other schemes");
+#ifdef _WIN32
+        const std::string script =
+            "function FindProxyForURL(url, host) {\n"
+            "  if (host == \"direct.example\") return \"DIRECT\";\n"
+            "  if (shExpMatch(host, \"*.tunnel.example\")) return \"PROXY 10.1.2.3:3128; DIRECT\";\n"
+            "  if (url.substring(0, 6) == \"https:\") return \"PROXY tls.example:8443; PROXY other.example:1\";\n"
+            "  return \"PROXY p.example:8080\";\n"
+            "}\n";
+        Server srv([&script](net::Conn& c, const Request& r) {
+            if (r.path == "/proxy.pac") { respond(c, "200 OK", script, "Content-Type: application/x-ns-proxy-autoconfig\r\n"); }
+            else { respond(c, "404 Not Found", ""); }
+        });
+        auto ask = [&](const std::string& scriptUrl, const std::string& url, std::string& proxy) {
+            std::string error;
+            const bool ok = net::proxy::detail::evaluatePac(scriptUrl, false, pacTarget(url), proxy, error);
+            if (!ok) { proxy = "error: " + error; }
+            return ok;
+        };
+        std::string proxy;
+        require(ask(srv.url("/proxy.pac"), "http://direct.example/x", proxy) && proxy.empty(), "DIRECT: " + proxy);
+        require(ask(srv.url("/proxy.pac"), "ws://a.tunnel.example:8073/", proxy) && proxy == "http://10.1.2.3:3128",
+                "first of a list: " + proxy);
+        require(ask(srv.url("/proxy.pac"), "wss://k.example:8073/kiwi", proxy) && proxy == "http://tls.example:8443",
+                "wss as https: " + proxy);
+        require(ask(srv.url("/proxy.pac"), "http://k.example/", proxy) && proxy == "http://p.example:8080", "default: " + proxy);
+        require(!ask(srv.url("/missing.pac"), "http://k.example/", proxy), "a missing script must fail: " + proxy);
+#endif
+    }
+
     void getAndPostThroughProxy() {
         Server srv(echo);
         test_proxy::HttpProxy proxy("alice", "secret", 24520);
@@ -361,13 +400,14 @@ namespace {
         system.mode = net::proxy::Mode::System;
         {
             ProxyScope scope(system);
-            if (net::proxy::effective().kind == net::proxy::Effective::Kind::Environment) {
+            // With the URL: a PAC script or WPAD on this network answers first.
+            const net::proxy::Effective e = net::proxy::effective(srv.url("/VER"));
+            if (e.kind == net::proxy::Effective::Kind::Environment) {
                 auto res = net::http::curlGet(srv.url("/VER"));
                 require(res.status == 200 && proxy.forwarded() == 1, "mode system ignored http_proxy");
             }
             else {
-                std::printf("  system mode resolves to '%s'; environment case skipped\n",
-                            net::proxy::effective().description.c_str());
+                std::printf("  system mode resolves to '%s'; environment case skipped\n", e.description.c_str());
             }
         }
         setEnv("http_proxy", nullptr);
@@ -540,6 +580,7 @@ int main(int argc, char** argv) {
         { "body cap", bodyCap },
         { "cancel a stalled response", cancelStalled },
         { "proxy settings parsing", proxyParsing },
+        { "PAC script", pacScript },
         { "GET and POST through an authenticating proxy", getAndPostThroughProxy },
         { "wrong proxy password", wrongProxyPassword },
         { "noProxy bypass", noProxyBypass },

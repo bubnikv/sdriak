@@ -1,8 +1,8 @@
 /*
  * HTTP proxy settings for every libcurl handle (curl::make_easy()).
  *
- * The Windows Internet Settings reader and the ProxyServer list parsing are
- * adapted from lzh173's sdriak-zh (core/src/utils/proxy.cpp, cb338f40,
+ * The ProxyServer list and ProxyOverride parsing are adapted from lzh173's
+ * sdriak-zh (core/src/utils/proxy.cpp, cb338f40,
  * ad77b6f2), which tunnelled the KiwiSDR raw sockets itself. Here libcurl
  * does the proxying, CONNECT tunnels, authentication and no_proxy matching.
  *
@@ -25,7 +25,7 @@ namespace net::proxy {
 
     enum class Mode {
         None,   // direct, also ignoring the proxy environment variables
-        System, // Windows Internet Settings, the Android system proxy, else http_proxy/https_proxy/no_proxy
+        System, // Windows Internet Settings (PAC, WPAD, static), the Android system proxy, else http_proxy/https_proxy/no_proxy
         Manual, // url, credentials and noProxy below
     };
 
@@ -57,9 +57,14 @@ namespace net::proxy {
     void setConfig(const Config& config);
     Config config();
 
-    // The settings resolved now. System mode reads the Windows Internet
-    // Settings on every call, so a change there applies to the next request.
-    Effective effective();
+    // The settings resolved now for a request to url (http, https, ws, wss).
+    // System mode reads the Windows Internet Settings on every call, so a
+    // change there applies to the next request. When they name a PAC script
+    // or "Automatically detect settings" is on, WinHTTP evaluates the script
+    // for url's scheme, host and port (cached 5 min per target, a failure
+    // 1 min); the static proxy applies when that fails. Without url the
+    // script is not run and the description says what it falls back to.
+    Effective effective(const std::string& url = std::string());
 
     const char* modeName(Mode mode);       // "none" / "system" / "manual"
     Mode modeFromName(const std::string& name); // unknown -> System
@@ -81,7 +86,8 @@ namespace net::proxy {
     // Raw TCP (SpyServer, SDRIAK server), which libcurl does not carry.
 
     // How a raw TCP connection to host goes: direct, or through an HTTP proxy
-    // with CONNECT. Resolved like effective(); in Environment mode from
+    // with CONNECT. Resolved like effective("https://host:port/"), port 443
+    // when not given; in Environment mode from
     // all_proxy / https_proxy / http_proxy and no_proxy, credentials taken
     // from the URL. error is set for a proxy CONNECT cannot use (SOCKS).
     struct TcpRoute {
@@ -93,7 +99,7 @@ namespace net::proxy {
         std::string description;
         std::string error;
     };
-    TcpRoute tcpRoute(const std::string& host);
+    TcpRoute tcpRoute(const std::string& host, int port = 0);
 
     // TCP to host:port along tcpRoute(host). A tunnel sends CONNECT with
     // Proxy-Authorization: Basic when credentials are set and waits for a 2xx
@@ -111,6 +117,19 @@ namespace net::proxy {
         // Throws unless head is a complete 2xx answer to CONNECT.
         void checkConnectReply(const std::string& head, bool timedOut, int budgetMs,
                                const TcpRoute& route, const std::string& authority);
+
+        // What a PAC script is asked about url: "scheme://host:port/" with
+        // ws -> http, wss -> https, credentials, path and query dropped.
+        // Empty for other schemes and for no URL.
+        std::string pacTarget(const std::string& url);
+
+#ifdef _WIN32
+        // FindProxyForURL(target) through WinHTTP, uncached: the script at
+        // autoConfigUrl and/or the one WPAD finds. True with proxyUrl empty
+        // for DIRECT, true with the first proxy as a URL, false with error.
+        bool evaluatePac(const std::string& autoConfigUrl, bool autoDetect, const std::string& target,
+                         std::string& proxyUrl, std::string& error);
+#endif
     }
 
     // True when a libcurl-syntax no_proxy list says host is reached

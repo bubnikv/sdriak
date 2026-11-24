@@ -8,7 +8,7 @@
 namespace net::proxy {
 
     std::shared_ptr<net::Socket> connectSocket(const std::string& host, int port, int timeoutMs) {
-        const TcpRoute route = tcpRoute(host);
+        const TcpRoute route = tcpRoute(host, port);
         if (!route.error.empty()) { throw std::runtime_error("proxy: " + route.error); }
         if (route.direct) { return net::connect(host, port, timeoutMs); }
 

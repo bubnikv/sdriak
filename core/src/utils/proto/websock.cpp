@@ -213,7 +213,7 @@ namespace net::websock {
     std::unique_ptr<WSClient::Connection> WSClient::openConnection(std::string url) {
         for (int redirectsLeft = kMaxRedirects;; --redirectsLeft) {
             auto conn = std::make_unique<Connection>();
-            conn->curl = curl::make_easy();
+            conn->curl = curl::make_easy(url);
             if (!conn->curl) { throw std::runtime_error("websock: curl_easy_init failed"); }
             CURL* h = conn->curl;
 

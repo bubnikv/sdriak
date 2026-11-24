@@ -1,5 +1,5 @@
 /*
- * HTTP proxy settings. See proxy.h; the WinINET reader and ProxyServer
+ * HTTP proxy settings. See proxy.h; the ProxyServer and ProxyOverride
  * parsing are adapted from lzh173's sdriak-zh.
  *
  * This program is free software: you can redistribute it and/or modify
@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winhttp.h>
 #endif
 
 #ifdef __ANDROID__
@@ -89,50 +91,112 @@ namespace net::proxy {
         }
 
 #ifdef _WIN32
-        std::string readRegistryString(HKEY key, const wchar_t* name) {
-            DWORD type = 0;
-            DWORD size = 0;
-            if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS) { return {}; }
-            if (type != REG_SZ && type != REG_EXPAND_SZ) { return {}; }
-            std::wstring wbuf(size / sizeof(wchar_t), L'\0');
-            if (RegQueryValueExW(key, name, nullptr, &type, (LPBYTE)wbuf.data(), &size) != ERROR_SUCCESS) { return {}; }
-            while (!wbuf.empty() && wbuf.back() == L'\0') { wbuf.pop_back(); }
-            if (wbuf.empty()) { return {}; }
-            const int needed = WideCharToMultiByte(CP_UTF8, 0, wbuf.c_str(), (int)wbuf.size(), nullptr, 0, nullptr, nullptr);
-            std::string out(needed, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, wbuf.c_str(), (int)wbuf.size(), out.data(), needed, nullptr, nullptr);
+        std::wstring widen(const std::string& s) {
+            if (s.empty()) { return {}; }
+            const int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+            std::wstring out(needed, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), needed);
             return out;
         }
 
-        bool readRegistryDword(HKEY key, const wchar_t* name, DWORD& value) {
-            DWORD type = 0;
-            DWORD size = sizeof(value);
-            if (RegQueryValueExW(key, name, nullptr, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS) { return false; }
-            return type == REG_DWORD;
+        std::string narrow(const wchar_t* w) {
+            if (!w || !*w) { return {}; }
+            const int len = (int)wcslen(w);
+            const int needed = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
+            std::string out(needed, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, w, len, out.data(), needed, nullptr, nullptr);
+            return out;
         }
 
+        // The Internet Settings of the current connection, as Internet
+        // Options shows them. server is set only while "Use a proxy server" is
+        // on; autoDetect is "Automatically detect settings" (WPAD).
         struct WinInet {
-            bool enabled = false;
             std::string server;
             std::string override;
             std::string autoConfigUrl;
+            bool autoDetect = false;
         };
 
         WinInet readWinInet() {
             WinInet w;
-            HKEY key = nullptr;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                              L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-                              0, KEY_READ, &key) != ERROR_SUCCESS) {
-                return w;
+            WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ie = {};
+            if (!WinHttpGetIEProxyConfigForCurrentUser(&ie)) { return w; }
+            w.autoDetect = ie.fAutoDetect != FALSE;
+            w.autoConfigUrl = narrow(ie.lpszAutoConfigUrl);
+            w.server = narrow(ie.lpszProxy);
+            w.override = narrow(ie.lpszProxyBypass);
+            for (LPWSTR p : { ie.lpszAutoConfigUrl, ie.lpszProxy, ie.lpszProxyBypass }) {
+                if (p) { GlobalFree(p); }
             }
-            DWORD enable = 0;
-            w.enabled = readRegistryDword(key, L"ProxyEnable", enable) && enable;
-            w.server = readRegistryString(key, L"ProxyServer");
-            w.override = readRegistryString(key, L"ProxyOverride");
-            w.autoConfigUrl = readRegistryString(key, L"AutoConfigURL");
-            RegCloseKey(key);
             return w;
+        }
+
+        std::string winHttpErrorText(DWORD err) {
+            switch (err) {
+            case ERROR_WINHTTP_AUTODETECTION_FAILED: return "no PAC script found (WPAD)";
+            case ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT: return "cannot download the PAC script";
+            case ERROR_WINHTTP_BAD_AUTO_PROXY_SCRIPT: return "the PAC script failed";
+            case ERROR_WINHTTP_UNRECOGNIZED_SCHEME: return "URL scheme not supported";
+            default: return "WinHTTP error " + std::to_string(err);
+            }
+        }
+
+        // One session for the process: WinHTTP keeps the downloaded script
+        // with it.
+        HINTERNET pacSession() {
+            static HINTERNET session = [] {
+                HINTERNET s = WinHttpOpen(L"SDRIAK", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
+                                          WINHTTP_NO_PROXY_BYPASS, 0);
+                // Bounds the script download.
+                if (s) { WinHttpSetTimeouts(s, 5000, 5000, 5000, 5000); }
+                return s;
+            }();
+            return session;
+        }
+
+        struct PacAnswer {
+            bool ok = false;
+            std::string proxyUrl; // empty: DIRECT
+            std::string error;
+        };
+
+        // FindProxyForURL is evaluated per host, and with WPAD the lookup
+        // alone can take seconds, so answers are kept: an answer for 5 min
+        // per target, a failure for 1 min for the whole script, so that a
+        // missing WPAD server costs one lookup and not one per request.
+        PacAnswer cachedPac(const WinInet& w, const std::string& target) {
+            using Clock = std::chrono::steady_clock;
+            struct Entry {
+                PacAnswer answer;
+                Clock::time_point at;
+            };
+            static std::mutex mtx;
+            static std::map<std::string, Entry> answers;
+            static std::map<std::string, Entry> failures;
+
+            const std::string script = w.autoConfigUrl + (w.autoDetect ? "\n+wpad" : "\n");
+            const std::string key = script + "\n" + target;
+            const auto now = Clock::now();
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                const auto f = failures.find(script);
+                if (f != failures.end() && now - f->second.at < std::chrono::minutes(1)) { return f->second.answer; }
+                const auto a = answers.find(key);
+                if (a != answers.end() && now - a->second.at < std::chrono::minutes(5)) { return a->second.answer; }
+            }
+
+            // Evaluated without the lock: a slow lookup does not hold up
+            // requests that are already answered.
+            PacAnswer answer;
+            answer.ok = detail::evaluatePac(w.autoConfigUrl, w.autoDetect, target, answer.proxyUrl, answer.error);
+            flog::info("proxy: PAC for {}: {}", target,
+                       !answer.ok ? "failed, " + answer.error : answer.proxyUrl.empty() ? std::string("DIRECT") : answer.proxyUrl);
+
+            std::lock_guard<std::mutex> lock(mtx);
+            if (answers.size() > 256) { answers.clear(); }
+            (answer.ok ? answers[key] : failures[script]) = Entry{ answer, Clock::now() };
+            return answer;
         }
 #endif
 
@@ -302,7 +366,7 @@ namespace net::proxy {
         return joined;
     }
 
-    Effective effective() {
+    Effective effective(const std::string& url) {
         const Config c = config();
         Effective e;
         switch (c.mode) {
@@ -353,29 +417,121 @@ namespace net::proxy {
         }
 #endif
 #ifdef _WIN32
+        // Internet Options order: automatic configuration (WPAD, then the
+        // PAC script) first, the static proxy when it has no answer.
         const WinInet w = readWinInet();
-        if (w.enabled && !w.server.empty()) {
+        std::string pac;
+        if (w.autoDetect || !w.autoConfigUrl.empty()) {
+            pac = !w.autoConfigUrl.empty() ? "PAC script " + redact(w.autoConfigUrl) : std::string("auto-detected PAC (WPAD)");
+            if (w.autoDetect && !w.autoConfigUrl.empty()) { pac = "auto-detected PAC (WPAD) or " + pac; }
+            const std::string target = detail::pacTarget(url);
+            if (!target.empty()) {
+                const PacAnswer answer = cachedPac(w, target);
+                if (answer.ok) {
+                    // The answer is for this host; a redirect that libcurl
+                    // follows to another host keeps it.
+                    e.kind = answer.proxyUrl.empty() ? Effective::Kind::Direct : Effective::Kind::Proxy;
+                    e.url = answer.proxyUrl;
+                    e.description = "Windows " + pac + ": " + (e.url.empty() ? std::string("DIRECT") : e.url) + " for " + target;
+                    return e;
+                }
+                pac += " failed (" + answer.error + ")";
+            }
+        }
+        // Without a URL, as for the menu's "In effect" line, the automatic
+        // configuration is named in front of what it falls back to.
+        const std::string pacPrefix = pac.empty() ? "" : "Windows " + pac + (url.empty() ? " per host" : "") + ", else ";
+        if (!w.server.empty()) {
             e.url = winInetProxyUrl(w.server);
             if (!e.url.empty()) {
                 e.kind = Effective::Kind::Proxy;
                 e.noProxy = winInetBypassToNoProxy(w.override);
-                e.description = "Windows proxy " + e.url + (e.noProxy.empty() ? "" : ", not for " + e.noProxy);
+                e.description = pacPrefix + "Windows proxy " + e.url + (e.noProxy.empty() ? "" : ", not for " + e.noProxy);
                 return e;
             }
         }
-        const std::string pacNote = w.autoConfigUrl.empty() ? "" : "; Windows PAC script is not supported";
 #else
-        const std::string pacNote;
+        const std::string pacPrefix;
 #endif
         e.kind = Effective::Kind::Environment;
         std::string name;
         if (const char* v = envProxy(name)) {
-            e.description = "environment " + name + "=" + redact(v) + pacNote;
+            e.description = pacPrefix + "environment " + name + "=" + redact(v);
         }
         else {
-            e.description = "direct (no system proxy)" + pacNote;
+            e.description = pacPrefix + "direct (no system proxy)";
         }
         return e;
+    }
+
+    namespace detail {
+        std::string pacTarget(const std::string& url) {
+            const size_t sep = url.find("://");
+            if (sep == std::string::npos || sep == 0) { return {}; }
+            std::string scheme = lower(url.substr(0, sep));
+            if (scheme == "ws") { scheme = "http"; }
+            else if (scheme == "wss") { scheme = "https"; }
+            else if (scheme != "http" && scheme != "https") { return {}; }
+            const size_t end = url.find_first_of("/?#", sep + 3);
+            std::string authority = url.substr(sep + 3, end == std::string::npos ? std::string::npos : end - (sep + 3));
+            const size_t at = authority.rfind('@');
+            if (at != std::string::npos) { authority = authority.substr(at + 1); }
+            if (authority.empty()) { return {}; }
+            return scheme + "://" + lower(authority) + "/";
+        }
+
+#ifdef _WIN32
+        bool evaluatePac(const std::string& autoConfigUrl, bool autoDetect, const std::string& target,
+                         std::string& proxyUrl, std::string& error) {
+            proxyUrl.clear();
+            error.clear();
+            HINTERNET session = pacSession();
+            if (!session) {
+                error = winHttpErrorText(GetLastError());
+                return false;
+            }
+            WINHTTP_AUTOPROXY_OPTIONS options = {};
+            std::wstring configUrl;
+            if (autoDetect) {
+                options.dwFlags |= WINHTTP_AUTOPROXY_AUTO_DETECT;
+                options.dwAutoDetectFlags = WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
+            }
+            if (!autoConfigUrl.empty()) {
+                options.dwFlags |= WINHTTP_AUTOPROXY_CONFIG_URL;
+                configUrl = widen(autoConfigUrl);
+                options.lpszAutoConfigUrl = configUrl.c_str();
+            }
+            if (!options.dwFlags) {
+                error = "no PAC script configured";
+                return false;
+            }
+            // Credentials of the logged-on user for a script server that
+            // asks for them.
+            options.fAutoLogonIfChallenged = TRUE;
+
+            WINHTTP_PROXY_INFO info = {};
+            const std::wstring wtarget = widen(target);
+            if (!WinHttpGetProxyForUrl(session, wtarget.c_str(), &options, &info)) {
+                error = winHttpErrorText(GetLastError());
+                return false;
+            }
+            const std::string list = narrow(info.lpszProxy);
+            const bool named = info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+            if (info.lpszProxy) { GlobalFree(info.lpszProxy); }
+            if (info.lpszProxyBypass) { GlobalFree(info.lpszProxyBypass); }
+            if (!named || list.empty()) { return true; } // DIRECT
+
+            // "PROXY a:1; PROXY b:2" arrives as "a:1;b:2"; libcurl takes one
+            // proxy, the first.
+            const std::string first = trim(list.substr(0, list.find_first_of("; \t")));
+            proxyUrl = winInetProxyUrl(first);
+            if (proxyUrl.empty()) {
+                error = "cannot parse the PAC answer '" + list + "'";
+                return false;
+            }
+            return true;
+        }
+#endif
     }
 
     namespace {
@@ -460,9 +616,10 @@ namespace net::proxy {
         return false;
     }
 
-    TcpRoute tcpRoute(const std::string& host) {
+    TcpRoute tcpRoute(const std::string& host, int port) {
         TcpRoute r;
-        const Effective e = effective();
+        // A PAC script is asked what it does for https to host.
+        const Effective e = effective("https://" + detail::authorityOf(host, port > 0 ? port : 443) + "/");
         std::string url;
         std::string noProxy;
         switch (e.kind) {
@@ -548,7 +705,7 @@ namespace net::proxy {
     }
 
     net::Conn connect(const std::string& host, uint16_t port, int timeoutMs) {
-        const TcpRoute route = tcpRoute(host);
+        const TcpRoute route = tcpRoute(host, port);
         if (!route.error.empty()) { throw std::runtime_error("proxy: " + route.error); }
         if (route.direct) { return net::connect(host, port, timeoutMs); }
 
