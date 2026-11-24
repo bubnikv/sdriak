@@ -41,17 +41,17 @@ namespace net::http {
     // transport failures, cancellation and an oversized body throw
     // std::runtime_error. Modules should use this instead of including
     // <curl/curl.h> or linking libcurl directly.
-    SDRPP_EXPORT CurlResponse curlRequest(const CurlRequest& request, const CurlRequestOptions& options = CurlRequestOptions());
+    CurlResponse curlRequest(const CurlRequest& request, const CurlRequestOptions& options = CurlRequestOptions());
 
     // curlRequest() with method GET.
-    SDRPP_EXPORT CurlResponse curlGet(const std::string& url, const CurlRequestOptions& options = CurlRequestOptions());
+    CurlResponse curlGet(const std::string& url, const CurlRequestOptions& options = CurlRequestOptions());
 
     // "scheme://host[:port]" of url, the port only when it is not the
     // scheme's default; empty when url does not parse. After redirects this
     // is how a client learns that http://host:port moved to https://.
-    SDRPP_EXPORT std::string urlOrigin(const std::string& url);
+    std::string urlOrigin(const std::string& url);
 
     // The path of url ("/" when it has none); empty when url does not parse.
-    SDRPP_EXPORT std::string urlPath(const std::string& url);
+    std::string urlPath(const std::string& url);
 
 }
