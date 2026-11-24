@@ -177,4 +177,8 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
             target_compile_definitions(cw_engine_deepcw_throughput PRIVATE _CRT_SECURE_NO_WARNINGS)
         endif ()
     endif ()
+
+    if (COMMAND sdrpp_stage_directory_runtime_dlls)
+        sdrpp_stage_directory_runtime_dlls()
+    endif ()
 endif ()

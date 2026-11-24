@@ -15,4 +15,7 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     target_link_libraries(frequency_manager_bookmark_tests PRIVATE sdrpp_core)
     add_test(NAME frequency_manager_bookmark_tests
         COMMAND frequency_manager_bookmark_tests)
+    if (COMMAND sdrpp_stage_directory_runtime_dlls)
+        sdrpp_stage_directory_runtime_dlls()
+    endif ()
 endif ()

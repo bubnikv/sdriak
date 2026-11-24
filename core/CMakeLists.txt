@@ -114,6 +114,8 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     add_executable(websock_tests tests/websock_tests.cpp)
     target_link_libraries(websock_tests PRIVATE sdrpp_core)
     add_test(NAME websock_tests COMMAND websock_tests)
+
+    sdrpp_stage_directory_runtime_dlls()
 endif ()
 
 target_compile_definitions(sdrpp_core PRIVATE

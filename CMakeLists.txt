@@ -222,6 +222,10 @@ else ()
         $<$<NOT:$<CONFIG:Debug>>:IMGUI_DISABLE_DEMO_WINDOWS>)
 endif ()
 
+# sdrpp_stage_runtime_dlls(): MSVC tests and tools stage their DLLs beside
+# themselves, as sdriak.exe does below.
+include(${CMAKE_SOURCE_DIR}/cmake/sdrpp_stage_runtime_dlls.cmake)
+
 # Core of SDRIAK
 add_subdirectory("core")
 
@@ -357,19 +361,17 @@ if (MSVC)
     set(_sdrpp_runtime_targets sdrpp ${_sdrpp_plugin_targets})
     list(REMOVE_DUPLICATES _sdrpp_runtime_targets)
 
-    set(_sdrpp_runtime_source_dirs "")
-    foreach (_pp ${CMAKE_PREFIX_PATH})
-        if (EXISTS "${_pp}/bin")
-            list(APPEND _sdrpp_runtime_source_dirs "${_pp}/bin")
-        endif ()
-    endforeach ()
-    list(REMOVE_DUPLICATES _sdrpp_runtime_source_dirs)
+    sdrpp_runtime_source_dirs(_sdrpp_runtime_source_dirs)
+    sdrpp_asan_runtime_dll(_sdrpp_asan_dll)
 
     set(_sdrpp_runtime_manifest "${CMAKE_CURRENT_BINARY_DIR}/sdrpp_runtime_dlls_$<CONFIG>.cmake")
     set(_sdrpp_runtime_manifest_content "set(SDRPP_RUNTIME_DLLS\n")
     foreach (_target IN LISTS _sdrpp_runtime_targets)
         string(APPEND _sdrpp_runtime_manifest_content "    [=[$<TARGET_RUNTIME_DLLS:${_target}>]=]\n")
     endforeach ()
+    if (_sdrpp_asan_dll)
+        string(APPEND _sdrpp_runtime_manifest_content "    [=[${_sdrpp_asan_dll}]=]\n")
+    endif ()
     string(APPEND _sdrpp_runtime_manifest_content ")\nset(SDRPP_RUNTIME_SOURCE_DIRS\n")
     foreach (_dir IN LISTS _sdrpp_runtime_source_dirs)
         string(APPEND _sdrpp_runtime_manifest_content "    [=[${_dir}]=]\n")
