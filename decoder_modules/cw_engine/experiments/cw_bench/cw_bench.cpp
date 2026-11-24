@@ -89,7 +89,7 @@ struct Options {
     bool time = false;                 // --time: the decoder's own CPU per over, to stderr
     double drift_hz_s = 0.0;           // the target's frequency drift, Hz/s
     double gain_db = 0.0;              // the whole input scaled by this, dB
-    bool random_text = false;          // random groups in place of the payload
+    std::string text = "payload";      // --text: payload | random | letters | qso
     double wpm_step = 0.0;             // > 0: the text's second half at this speed, 2 s after the first
     double step_s = -1.0, step_db = 0.0;   // a level step at step_s (< 0: none)
     bool step_noise = false;           // … of the noise, not the target
@@ -244,10 +244,13 @@ bool parse_args(int argc, char **argv, Options &o) {
         else if (a == "--time") o.time = true;
         else if (a == "--drift") o.drift_hz_s = std::atof(val());     // Hz/s
         else if (a == "--gain") o.gain_db = std::atof(val());         // dB, the whole input
-        else if (a == "--text") {                                   // payload | random
+        else if (a == "--text") {                                   // payload | random | letters | qso
             const std::string t = val();
-            if (t != "payload" && t != "random") { std::fprintf(stderr, "bad --text\n"); return false; }
-            o.random_text = t == "random";
+            if (t != "payload" && t != "random" && t != "letters" && t != "qso") {
+                std::fprintf(stderr, "bad --text (payload, random, letters, qso)\n");
+                return false;
+            }
+            o.text = t;
         }
         else if (a == "--step") {                                   // <s>:<dB>:<sig|noise>
             char what[16] = "sig";
@@ -316,6 +319,68 @@ std::string random_payload(std::mt19937 &rng) {
         if (!s.empty()) s += ' ';
         const int n = 2 + static_cast<int>(rng() % 5);
         for (int i = 0; i < n; i++) s += A[rng() % 36];
+    }
+    return s;
+}
+
+// Random letter groups (--text letters): 12 groups of 2–6 letters A–Z.
+std::string letters_payload(std::mt19937 &rng) {
+    const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::string s;
+    for (int t = 0; t < 12; t++) {
+        if (!s.empty()) s += ' ';
+        const int n = 2 + static_cast<int>(rng() % 5);
+        for (int i = 0; i < n; i++) s += A[rng() % 26];
+    }
+    return s;
+}
+
+// A callsign with a real prefix shape and a 1–3 letter suffix.
+std::string qso_call(std::mt19937 &rng) {
+    static const char *P[] = { "OK1", "OK2", "OL5", "OM3", "DL1", "DK2", "DJ5", "G3", "G4", "M0", "F5", "F6", "I2",
+                               "IK4", "EA3", "EA5", "SP9", "SQ2", "HA5", "HA8", "ON4", "PA3", "LZ1", "YU1", "S5",
+                               "9A2", "UA3", "UR5", "LY2", "ES1", "OH2", "SM5", "LA9", "OZ1", "W1", "W6", "K3",
+                               "N2", "AA4", "KB9", "VE3", "VE7", "JA1", "JH8", "VK2", "VK3", "ZL1", "PY2", "LU1",
+                               "ZS6", "4X4", "UN7", "BV2" };
+    const char *L = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::string c = P[rng() % (sizeof P / sizeof *P)];
+    const int n = 1 + static_cast<int>(rng() % 3);
+    for (int i = 0; i < n; i++) c += L[rng() % 26];
+    return c;
+}
+
+// Usual amateur exchanges (--text qso): two different of a CQ call, a contest
+// exchange, a ragchew report, a sign-off and a QRZ, filled with callsigns,
+// reports, serials, names and towns. A–Z and 0–9 only (no "?" or "/").
+std::string qso_payload(std::mt19937 &rng) {
+    static const char *NAME[] = { "PETR", "JAN", "PAVEL", "JOHN", "BOB", "HANS", "MIKE", "TOM", "KARL", "IVAN",
+                                  "LUIS", "MARCO", "JOSE", "PIERRE", "KEN", "OLE", "ANDY", "STEVE" };
+    static const char *QTH[] = { "PRAGUE", "BRNO", "BERLIN", "LONDON", "PARIS", "ROMA", "WIEN", "MADRID", "OSLO",
+                                 "WARSAW", "TOKYO", "SYDNEY", "BOSTON", "OTTAWA", "LYON", "MUNICH", "ZAGREB" };
+    static const char *RST[] = { "599", "5NN", "579", "559", "589", "449", "339", "569" };
+    auto pick = [&](const char *const *a, size_t n) { return std::string(a[rng() % n]); };
+    auto serial = [&]() {
+        char b[8];
+        std::snprintf(b, sizeof b, "%03u", 1 + static_cast<unsigned>(rng() % 999));
+        return std::string(b);
+    };
+    const std::string me = qso_call(rng), dx = qso_call(rng);
+    const std::string rst = pick(RST, sizeof RST / sizeof *RST);
+    std::string s;
+    const unsigned first = static_cast<unsigned>(rng() % 5);
+    const unsigned kinds[2] = { first, static_cast<unsigned>((first + 1 + rng() % 4) % 5) };   // two different parts
+    for (unsigned kind : kinds) {
+        if (!s.empty()) s += ' ';
+        switch (kind) {
+        case 0: s += "CQ CQ DE " + me + " " + me + " K"; break;
+        case 1: s += dx + " TU 5NN " + serial() + " " + me; break;
+        case 2:
+            s += dx + " DE " + me + " GM TNX FER CALL UR RST " + rst + " " + rst + " NAME " +
+                 pick(NAME, sizeof NAME / sizeof *NAME) + " QTH " + pick(QTH, sizeof QTH / sizeof *QTH) + " BK";
+            break;
+        case 3: s += "R R TNX FER QSO 73 73 " + dx + " DE " + me + " SK"; break;
+        default: s += "QRZ DE " + me + " " + me + " TEST"; break;
+        }
     }
     return s;
 }
@@ -744,7 +809,10 @@ Result run_over(const Options &o, const SkimDecodeBackend &backend, double wpm, 
     if (o.noise_only_s > 0) {
         env.assign(static_cast<size_t>(o.noise_only_s * o.rate), 0.0f);
     } else {
-        r.ref = "VVV " + (o.random_text ? random_payload(rng) : payload(rng));
+        r.ref = "VVV " + (o.text == "random"  ? random_payload(rng)
+                        : o.text == "letters" ? letters_payload(rng)
+                        : o.text == "qso"     ? qso_payload(rng)
+                                              : payload(rng));
         if (o.wpm_step > 0) {
             // --wpm-step: the words after the middle at the other speed,
             // after the first half's 2 s of silence

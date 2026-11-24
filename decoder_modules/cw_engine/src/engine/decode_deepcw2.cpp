@@ -46,6 +46,7 @@
 #include <cinttypes>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <random>
 
 #include "deepcw_runtime.h"
@@ -93,7 +94,12 @@ DeepcwV2Config DeepcwV2Config::from_env(const DeepcwV2Config &base) {
         c.noise_mode = v;
     c.model_v1 = env_d("SKIM_DEEPCW2_V1", c.model_v1 ? 1 : 0) != 0;
     c.stitch.step_s        = env_d("SKIM_DEEPCW2_STEP", c.stitch.step_s);
+    c.stitch.left_context_s = env_d("SKIM_DEEPCW2_LEFT", c.stitch.left_context_s);
+    c.stitch.freeze_guard_s = env_d("SKIM_DEEPCW2_GUARD", c.stitch.freeze_guard_s);
+    c.stitch.left_ramp_s    = env_d("SKIM_DEEPCW2_LRAMP", c.stitch.left_ramp_s);
+    c.stitch.right_ramp_s   = env_d("SKIM_DEEPCW2_RRAMP", c.stitch.right_ramp_s);
     c.stitch.max_segment_s = env_d("SKIM_DEEPCW2_WIN", c.stitch.max_segment_s);
+    c.decim = std::clamp(static_cast<int>(env_d("SKIM_DEEPCW2_DECIM", c.decim)), 1, 3);
     c.win_ring_s = std::max(c.win_ring_s, c.stitch.max_segment_s + 2.0);
     return c;
 }
@@ -422,6 +428,19 @@ void DeepcwStitcher::restart(int64_t frame) {
 
 namespace {
 
+// The model's input hop at rate: 16 ms (4 samples at 250 Hz), times decim.
+unsigned input_hop(const DeepcwV2Config &c, double rate) {
+    return std::max(static_cast<unsigned>(std::llround(rate * 0.016)), 1u) * static_cast<unsigned>(std::max(c.decim, 1));
+}
+
+// The stitcher's configuration under decimation: its word gap is upstream's
+// 134 model hops, so it scales with the hop.
+DeepcwStitchConfig stitch_config(const DeepcwV2Config &c) {
+    DeepcwStitchConfig s = c.stitch;
+    s.word_boundary_s *= std::max(c.decim, 1);
+    return s;
+}
+
 const DeepcwModelSpec &spec_of(const DeepcwV2Config &c) {
     if (c.model_v1)
         return kDeepcwModelV1;
@@ -539,13 +558,13 @@ private:
     bool     m_inflight = false;
     std::shared_ptr<DeepcwMailbox> m_box = std::make_shared<DeepcwMailbox>();
     bool     m_flush_want = false, m_flush_inflight = false, m_resync_due = false;
-    std::mt19937 m_fill_rng{ 12345 };      // noise_mode "fill"
+    std::unique_ptr<std::mt19937> m_fill_rng;   // noise_mode "fill"; made on first use (5 KB)
 };
 
 DeepcwV2Channel::DeepcwV2Channel(std::shared_ptr<DeepcwV2Context> ctx, double rate)
     : m_ctx(std::move(ctx)), m_cfg(m_ctx->cfg()), m_bins(m_ctx->runtime().spec().bins),
       m_stride(static_cast<unsigned>(m_ctx->runtime().spec().time_stride)),
-      m_stitcher(m_cfg.stitch, rate / std::max(std::llround(rate * 0.016), 1LL) / m_stride) {
+      m_stitcher(stitch_config(m_cfg), rate / input_hop(m_cfg, rate) / m_stride) {
     // ---- the v1 backend's front end (decode_deepcw.cpp, OK1BR/OK1HRA) ----
     m_rate = rate;
     const double nf = rate / DeepcwModel::kBinHz;
@@ -563,7 +582,7 @@ DeepcwV2Channel::DeepcwV2Channel(std::shared_ptr<DeepcwV2Context> ctx, double ra
     if (m_nomodel && m_ctx->first_model_warning())
         std::fprintf(stderr, "deepcw2: %s — channels track but decode nothing\n", err.c_str());
     m_N   = N;
-    m_hop = std::max(static_cast<unsigned>(std::llround(rate * 0.016)), 1u);   // 16 ms: 4 at 250 Hz
+    m_hop = input_hop(m_cfg, rate);   // 16 ms (4 at 250 Hz) × decim
     m_win.resize(N);
     m_tw_re.resize(static_cast<size_t>(kKeep) * N);
     m_tw_im.resize(static_cast<size_t>(kKeep) * N);
@@ -579,7 +598,9 @@ DeepcwV2Channel::DeepcwV2Channel(std::shared_ptr<DeepcwV2Context> ctx, double ra
     const double fps = rate / m_hop;                             // input frames/s
     m_ring_frames = std::max(static_cast<unsigned>(std::llround(m_cfg.win_ring_s * fps)), 64u);
     m_ring.assign(static_cast<size_t>(m_ring_frames) * kKeep, 0.0f);
-    m_tile.assign(static_cast<size_t>(m_ring_frames) * DeepcwModel::kBins, 0.0f);
+    // a window's tile, at most the ring: T × 3 for the narrow model (10 KB at
+    // 62.5 fps and 14 s), T × 65 for the wide one
+    m_tile.assign(static_cast<size_t>(m_ring_frames) * static_cast<size_t>(m_bins), 0.0f);
     // ---- SDRIAK: the stitcher's cadence and the gate hangover ----
     m_tick_frames   = std::max(static_cast<unsigned>(std::llround(m_cfg.stitch.step_s * fps)), 1u);
     m_tick_phase    = (m_ctx->next_registration() * 7u) % m_tick_frames;
@@ -850,12 +871,14 @@ void DeepcwV2Channel::tile(uint64_t w0, uint64_t w1) {
         // The empty bins as the band would be: Rayleigh(σ) magnitudes, then
         // the reference's normalisation over the whole tile.
         std::uniform_real_distribution<double> u(1e-12, 1.0);
+        if (!m_fill_rng)
+            m_fill_rng = std::make_unique<std::mt19937>(12345);
         for (unsigned t = 0; t < T; t++) {
             float *row = m_tile.data() + static_cast<size_t>(t) * DeepcwModel::kBins;
             for (int b = 0; b < DeepcwModel::kBins; b++) {
                 if (b >= DeepcwModel::kCentre - kHalf && b <= DeepcwModel::kCentre + kHalf)
                     continue;
-                row[b] = static_cast<float>(sigma * std::sqrt(-2.0 * std::log(u(m_fill_rng))));
+                row[b] = static_cast<float>(sigma * std::sqrt(-2.0 * std::log(u(*m_fill_rng))));
             }
         }
         deepcw2_normalize(m_tile.data(), n, m_tile.data(), n);
