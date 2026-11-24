@@ -3,10 +3,17 @@
 // relative redirect (effectiveUrl and the origin a client derives from it),
 // a non-200 status returned rather than thrown, the body cap, and
 // shouldCancel ending a stalled response. Plus urlOrigin / urlPath.
-// `curl_http_tests --directory` fetches the real KiwiSDR directory once.
+// Proxy: settings parsing, GET/POST through an authenticating test proxy, a
+// wrong password (407), noProxy, http_proxy honoured by system mode and
+// ignored by none.
+// `curl_http_tests --directory [--via-test-proxy]` fetches the real KiwiSDR
+// directory once, optionally through the in-process authenticating proxy.
 #include <gui/brown/kiwisdr_directory.h>
 #include <utils/networking.h>
 #include <utils/proto/curl_http.h>
+#include <utils/proxy.h>
+
+#include "test_http_proxy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -250,6 +257,121 @@ namespace {
 }
 
 namespace {
+    // Sets net::proxy for a scope and restores the previous setting.
+    struct ProxyScope {
+        net::proxy::Config saved;
+        explicit ProxyScope(const net::proxy::Config& c) : saved(net::proxy::config()) { net::proxy::setConfig(c); }
+        ~ProxyScope() { net::proxy::setConfig(saved); }
+    };
+
+    net::proxy::Config manual(const std::string& url, const std::string& user = "",
+                              const std::string& password = "", const std::string& noProxy = "") {
+        net::proxy::Config c;
+        c.mode = net::proxy::Mode::Manual;
+        c.url = url;
+        c.user = user;
+        c.password = password;
+        c.noProxy = noProxy;
+        return c;
+    }
+
+    void setEnv(const char* name, const char* value) {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value) { setenv(name, value, 1); }
+        else { unsetenv(name); }
+#endif
+    }
+
+    void proxyParsing() {
+        using namespace net::proxy;
+        require(normalizeUrl("proxy:3128") == "http://proxy:3128", "bare host:port");
+        require(normalizeUrl("user:pw@h.example:8080") == "http://h.example:8080", "credentials stripped");
+        require(normalizeUrl("socks5://[::1]:1080/") == "socks5://[::1]:1080", "IPv6 socks: " + normalizeUrl("socks5://[::1]:1080/"));
+        require(normalizeUrl("h.example").empty() && normalizeUrl("h:0").empty() && normalizeUrl("[::1]").empty(),
+                "no valid port must not parse");
+        require(winInetProxyUrl("c.example:3") == "http://c.example:3", "WinINET plain");
+        require(winInetProxyUrl("http=a.example:1;https=b.example:2") == "http://a.example:1", "WinINET http= first");
+        require(winInetProxyUrl("https=b.example:2;socks=c.example:3") == "http://b.example:2", "WinINET https=");
+        require(winInetProxyUrl("socks=c.example:3") == "socks4a://c.example:3", "WinINET socks=");
+        const std::string np = winInetBypassToNoProxy("*.local; 192.168.*;<local>;10.1.*;host.lan;*foo*;*");
+        require(np == ".local,192.168.0.0/16,localhost,127.0.0.1,::1,10.1.0.0/16,host.lan,*", "ProxyOverride: " + np);
+        require(modeFromName(modeName(Mode::Manual)) == Mode::Manual && modeFromName("bogus") == Mode::System, "mode names");
+
+        ProxyScope scope(manual("proxy.example:3128", "alice", "secret", "localhost"));
+        const Effective e = effective();
+        require(e.kind == Effective::Kind::Proxy && e.url == "http://proxy.example:3128" && e.user == "alice",
+                "manual effective");
+        require(e.description.find("secret") == std::string::npos, "description leaks the password");
+        net::proxy::Config none;
+        none.mode = Mode::None;
+        net::proxy::setConfig(none);
+        require(effective().kind == Effective::Kind::Direct, "none is direct");
+    }
+
+    void getAndPostThroughProxy() {
+        Server srv(echo);
+        test_proxy::HttpProxy proxy("alice", "secret", 24520);
+        ProxyScope scope(manual(proxy.url(), "alice", "secret"));
+        auto get = net::http::curlGet(srv.url("/VER"));
+        require(get.status == 200 && get.body == "GET /VER||", "GET via proxy: " + std::to_string(get.status) + " " + get.body);
+        net::http::CurlRequest post;
+        post.method = "POST";
+        post.url = srv.url("/connection");
+        post.body = "{}";
+        post.contentType = "application/json";
+        auto pr = net::http::curlRequest(post);
+        require(pr.body == "POST /connection|application/json|{}", "POST via proxy: " + pr.body);
+        require(proxy.forwarded() >= 2, "requests did not go through the proxy: " + std::to_string(proxy.forwarded()));
+    }
+
+    void wrongProxyPassword() {
+        Server srv(echo);
+        test_proxy::HttpProxy proxy("alice", "secret", 24520);
+        ProxyScope scope(manual(proxy.url(), "alice", "wrong"));
+        auto res = net::http::curlGet(srv.url("/VER"));
+        require(res.status == 407, "expected 407, got " + std::to_string(res.status));
+        require(proxy.forwarded() == 0 && proxy.rejected() >= 1, "a rejected request reached the target");
+    }
+
+    void noProxyBypass() {
+        Server srv(echo);
+        test_proxy::HttpProxy proxy("", "", 24520);
+        ProxyScope scope(manual(proxy.url(), "", "", "127.0.0.1"));
+        auto res = net::http::curlGet(srv.url("/VER"));
+        require(res.status == 200 && proxy.forwarded() == 0 && proxy.tunnels() == 0, "noProxy host went through the proxy");
+    }
+
+    void environmentAndNone() {
+        Server srv(echo);
+        test_proxy::HttpProxy proxy("", "", 24520);
+        setEnv("http_proxy", proxy.url().c_str());
+        setEnv("no_proxy", nullptr);
+        setEnv("NO_PROXY", nullptr);
+        net::proxy::Config none;
+        none.mode = net::proxy::Mode::None;
+        {
+            ProxyScope scope(none);
+            auto res = net::http::curlGet(srv.url("/VER"));
+            require(res.status == 200 && proxy.forwarded() == 0, "mode none still used http_proxy");
+        }
+        net::proxy::Config system;
+        system.mode = net::proxy::Mode::System;
+        {
+            ProxyScope scope(system);
+            if (net::proxy::effective().kind == net::proxy::Effective::Kind::Environment) {
+                auto res = net::http::curlGet(srv.url("/VER"));
+                require(res.status == 200 && proxy.forwarded() == 1, "mode system ignored http_proxy");
+            }
+            else {
+                std::printf("  system mode resolves to '%s'; environment case skipped\n",
+                            net::proxy::effective().description.c_str());
+            }
+        }
+        setEnv("http_proxy", nullptr);
+    }
+
     // One real fetch of the KiwiSDR directory into an empty cache folder.
     int liveDirectory() {
         const auto dir = std::filesystem::temp_directory_path() /
@@ -278,8 +400,21 @@ namespace {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::string(argv[1]) == "--directory") {
+        if (argc >= 3 && std::string(argv[2]) == "--via-test-proxy") {
+            test_proxy::HttpProxy proxy("alice", "secret", 24540);
+            ProxyScope scope(manual(proxy.url(), "alice", "secret"));
+            const int rc = liveDirectory();
+            std::printf("test proxy: %d forwarded, %d tunnels, %d answered 407\n",
+                        proxy.forwarded(), proxy.tunnels(), proxy.rejected());
+            return (rc == 0 && proxy.forwarded() + proxy.tunnels() > 0) ? 0 : 1;
+        }
         return liveDirectory();
     }
+    // Offline cases talk to loopback only: start without any proxy, whatever
+    // this machine's settings are.
+    net::proxy::Config direct;
+    direct.mode = net::proxy::Mode::None;
+    net::proxy::setConfig(direct);
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::seconds(60));
         std::printf("FAIL (hang): whole test run exceeded 60 s\n");
@@ -292,6 +427,11 @@ int main(int argc, char** argv) {
         { "redirect, non-200 status", redirectAndStatus },
         { "body cap", bodyCap },
         { "cancel a stalled response", cancelStalled },
+        { "proxy settings parsing", proxyParsing },
+        { "GET and POST through an authenticating proxy", getAndPostThroughProxy },
+        { "wrong proxy password", wrongProxyPassword },
+        { "noProxy bypass", noProxyBypass },
+        { "environment proxy and mode none", environmentAndNone },
     };
     int failures = 0;
     for (const auto& [name, fn] : tests) {

@@ -10,12 +10,16 @@
 // `websock_tests --live <url> [--kiwi]` instead opens one real connection
 // (for wss:// checks); "{ts}" in the url is replaced by the time in ms.
 // `websock_tests --kiwi-client host:port` runs KiwiSDRClient's whole connect
-// path once: the /VER scheme probe, then the websocket, until IQ arrives.
+// path once: the /VER scheme probe, then the websocket, until IQ arrives;
+// with --via-test-proxy after it, through the in-process authenticating proxy.
 #include <utils/base64.h>
 #include <utils/networking.h>
 #include <utils/proto/picohash.h>
 #include <utils/proto/kiwisdr.h>
 #include <utils/proto/websock.h>
+#include <utils/proxy.h>
+
+#include "test_http_proxy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -678,6 +682,47 @@ namespace {
         require(!outOfOrder, "stream: texts arrived out of order or corrupted");
     }
 
+    struct ProxyScope {
+        net::proxy::Config saved;
+        explicit ProxyScope(const net::proxy::Config& c) : saved(net::proxy::config()) { net::proxy::setConfig(c); }
+        ~ProxyScope() { net::proxy::setConfig(saved); }
+    };
+
+    net::proxy::Config manualProxy(const std::string& url, const std::string& user, const std::string& password) {
+        net::proxy::Config c;
+        c.mode = net::proxy::Mode::Manual;
+        c.url = url;
+        c.user = user;
+        c.password = password;
+        return c;
+    }
+
+    // ws:// through an authenticating HTTP proxy goes as a CONNECT tunnel.
+    void throughProxy() {
+        Server* self = nullptr;
+        Server srv(echoHandler(self));
+        self = &srv;
+        test_proxy::HttpProxy proxy("alice", "secret", 24520);
+        ProxyScope scope(manualProxy(proxy.url(), "alice", "secret"));
+        WSClient ws;
+        Collector c;
+        c.attach(ws);
+        ws.onConnected = [&] {
+            ws.sendString("via proxy");
+            c.markConnected();
+        };
+        ClientRun run;
+        run.start(ws, srv.url("/echo"));
+        require(c.waitFor([&] { return !c.msgs.empty(); }, 5000), "proxy: no echo; error '" + run.errorText() + "'");
+        ws.stopSocket();
+        run.join(2000, "proxy: loop did not stop");
+        requireNoError(run, "proxy");
+        require(c.msgs[0] == Message{ false, "via proxy" }, "proxy: echo differs");
+        require(proxy.tunnels() == 1 && proxy.forwarded() == 0,
+                "proxy: expected one CONNECT, got " + std::to_string(proxy.tunnels()) + " tunnels, " +
+                std::to_string(proxy.forwarded()) + " forwarded");
+    }
+
     void peerDropsTcp() {
         Server srv([](Peer& p, const Request& r, int) {
             accept101(p, r);
@@ -770,11 +815,26 @@ int main(int argc, char** argv) {
     // Unbuffered, so the log up to a crash survives.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 3 && std::string(argv[1]) == "--kiwi-client") {
+        if (argc >= 4 && std::string(argv[3]) == "--via-test-proxy") {
+            test_proxy::HttpProxy proxy("alice", "secret", 24540);
+            ProxyScope scope(manualProxy(proxy.url(), "alice", "secret"));
+            const int rc = kiwiClient(argv[2]);
+            std::printf("test proxy: %d tunnels, %d forwarded, %d answered 407\n",
+                        proxy.tunnels(), proxy.forwarded(), proxy.rejected());
+            for (const auto& t : proxy.targets()) { std::printf("  %s\n", t.c_str()); }
+            return (rc == 0 && proxy.tunnels() > 0) ? 0 : 1;
+        }
         return kiwiClient(argv[2]);
     }
     if (argc >= 3 && std::string(argv[1]) == "--live") {
         return live(argv[2], argc >= 4 && std::string(argv[3]) == "--kiwi");
     }
+
+    // Offline cases talk to loopback only: start without any proxy, whatever
+    // this machine's settings are.
+    net::proxy::Config direct;
+    direct.mode = net::proxy::Mode::None;
+    net::proxy::setConfig(direct);
 
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::seconds(120));
@@ -794,6 +854,7 @@ int main(int argc, char** argv) {
         { "stop/start x10", stopStartTenTimes },
         { "send while streaming", sendWhileStreaming },
         { "peer drops TCP", peerDropsTcp },
+        { "through an authenticating proxy", throughProxy },
     };
     int failures = 0;
     for (const auto& [name, fn] : tests) {

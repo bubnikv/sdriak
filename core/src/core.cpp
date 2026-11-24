@@ -14,6 +14,7 @@
 #include <config.h>
 #include <core.h>
 #include <utils/curl_init.h>
+#include <utils/proxy.h>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -323,6 +324,13 @@ int sdrpp_main(int argc, char* argv[]) {
 
     defConfig["vfoColors"]["Radio"] = "#FFFFFF";
 
+    // Proxy for every libcurl handle (utils/proxy.h); the Network menu edits it.
+    defConfig["network"]["proxyMode"] = "system";
+    defConfig["network"]["proxyUrl"] = "";
+    defConfig["network"]["proxyUser"] = "";
+    defConfig["network"]["proxyPassword"] = "";
+    defConfig["network"]["noProxy"] = "";
+
 #ifdef __ANDROID__
     defConfig["lockMenuOrder"] = true;
 #else
@@ -350,6 +358,19 @@ int sdrpp_main(int argc, char* argv[]) {
     bool firstStart = !std::filesystem::exists(root + "/config.json");
     core::configManager.load(defConfig);
 
+    // Before any module or network work: every libcurl handle reads it.
+    {
+        auto configAccess = core::configManager.read();
+        auto network = configAccess.section("network");
+        net::proxy::Config proxy;
+        proxy.mode = net::proxy::modeFromName(network.value("proxyMode", std::string("system")));
+        proxy.url = network.value("proxyUrl", std::string());
+        proxy.user = network.value("proxyUser", std::string());
+        proxy.password = network.value("proxyPassword", std::string());
+        proxy.noProxy = network.value("noProxy", std::string());
+        net::proxy::setConfig(proxy);
+        flog::info("Network: proxy {}", net::proxy::effective().description);
+    }
 
     core::configManager.enableAutoSave();
 

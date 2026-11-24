@@ -75,6 +75,7 @@ SDRIAK is built on the work of many people. Thanks and due respect to all of the
 | [SDR++ fork by F5OEO](https://github.com/F5OEO/SDRPlusPlus) | Evariste Courjaud | PlutoSDR improvements |
 | [SDR++ fork for HydraSDR](https://github.com/hydrasdr/SDRPlusPlus) | Benjamin Vernoux | HydraSDR RFOne source |
 | [SDRPlusPlusBrownBrasil](https://github.com/leonam72/SDRPlusPlusBrownBrasil) | Leonam Ramos | Bug fixes |
+| [sdriak-zh](https://github.com/lzh173/sdriak-zh) | lzh173 | System proxy discovery (Windows Internet Settings) |
 | [logmmse](https://github.com/rajivpoddar/logmmse) | braindead, [wilsonchingg](https://github.com/wilsonchingg/logmmse), rajivpoddar | LogMMSE noise reduction, ported to C++ by Sanny Sanoff |
 | [OMLSA-MCRA](https://github.com/xiaochunxin/OMLSA-MCRA), [OMLSA-IMCRA](https://github.com/yuzhouhe2000/OMLSA-IMCRA) | xiaochunxin, yuzhouhe2000 | OMLSA noise reduction |
 | [KiwiSDR](https://github.com/jks-prv/KiwiSDR) | John Seamons (ZL4VO) | Tuning defaults in the band plans |
@@ -106,6 +107,7 @@ SDRIAK is built on the work of many people. Thanks and due respect to all of the
 * [jprincl](https://github.com/jprincl)
 * [konung-yaropolk](https://github.com/konung-yaropolk)
 * [Leonam Ramos](https://github.com/leonam72)
+* [lzh173](https://github.com/lzh173)
 * [M0OPK](https://github.com/M0OPK)
 * [Manawyrm](https://github.com/Manawyrm)
 * Marcelo Gadotti

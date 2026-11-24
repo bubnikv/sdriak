@@ -21,6 +21,7 @@
 #include <gui/menus/vfo_color.h>
 #include <gui/menus/module_manager.h>
 #include <gui/menus/android.h>
+#include <gui/menus/network.h>
 #include <gui/dialogs/credits.h>
 #ifdef __ANDROID__
 #include <android_backend.h>
@@ -96,6 +97,13 @@ void MainWindow::init() {
     gui::menu.registerEntry("Display", displaymenu::draw, NULL);
     gui::menu.registerEntry("VFO Color", vfo_color_menu::draw, NULL);
     gui::menu.registerEntry("Module Manager", module_manager_menu::draw, NULL);
+    // New for existing configs: append it collapsed rather than open.
+    {
+        bool known = false;
+        for (const auto& opt : gui::menu.order) { known = known || opt.name == "Network"; }
+        if (!known) { gui::menu.order.push_back({ "Network", false }); }
+    }
+    gui::menu.registerEntry("Network", networkmenu::draw, NULL);
 #ifdef __ANDROID__
     gui::menu.registerEntry("System", androidmenu::draw, NULL);
 #endif
@@ -201,6 +209,7 @@ void MainWindow::init() {
     displaymenu::init();
     vfo_color_menu::init();
     module_manager_menu::init();
+    networkmenu::init();
 #ifdef __ANDROID__
     androidmenu::init();
 #endif

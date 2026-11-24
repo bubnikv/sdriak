@@ -1,6 +1,7 @@
 #include "curl_init.h"
 
 #include <utils/flog.h>
+#include <utils/proxy.h>
 #include <version.h>
 
 namespace curl {
@@ -40,6 +41,26 @@ CURL* make_easy() {
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 15L);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+
+    // Proxy: net::proxy resolves the user's mode (core config "network").
+    const net::proxy::Effective proxy = net::proxy::effective();
+    switch (proxy.kind) {
+    case net::proxy::Effective::Kind::Direct:
+        // "" also stops libcurl from reading http_proxy & co.
+        curl_easy_setopt(h, CURLOPT_PROXY, "");
+        break;
+    case net::proxy::Effective::Kind::Proxy:
+        curl_easy_setopt(h, CURLOPT_PROXY, proxy.url.c_str());
+        curl_easy_setopt(h, CURLOPT_NOPROXY, proxy.noProxy.c_str());
+        if (!proxy.user.empty()) {
+            curl_easy_setopt(h, CURLOPT_PROXYUSERNAME, proxy.user.c_str());
+            curl_easy_setopt(h, CURLOPT_PROXYPASSWORD, proxy.password.c_str());
+            curl_easy_setopt(h, CURLOPT_PROXYAUTH, (long)CURLAUTH_ANY);
+        }
+        break;
+    case net::proxy::Effective::Kind::Environment:
+        break; // libcurl reads http_proxy / https_proxy / all_proxy / no_proxy
+    }
 
 #ifdef _WIN32
     // Schannel fails the whole handshake when the certificate's revocation

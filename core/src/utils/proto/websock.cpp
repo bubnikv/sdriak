@@ -238,6 +238,9 @@ namespace net::websock {
             // libcurl does not follow a redirect on the upgrade; the loop
             // below does, mapping the scheme and keeping the path's case.
             curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 0L);
+            // Through an HTTP proxy, a ws:// upgrade forwarded as a plain
+            // request rarely survives; tunnel with CONNECT as for wss://.
+            curl_easy_setopt(h, CURLOPT_HTTPPROXYTUNNEL, 1L);
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, (long)kHandshakeTimeoutMs);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_HTTPHEADER, conn->headers);
