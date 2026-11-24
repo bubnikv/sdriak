@@ -253,6 +253,21 @@
             }
         },
         {
+            "name": "msvc-x64-asan",
+            "displayName": "MSVC x64 RelWithDebInfo + AddressSanitizer (Ninja, /MD)",
+            "description": "RelWithDebInfo with /fsanitize=address on SDRIAK's own code, tests on. Shares the uninstrumented deps tree deps/build-default-RelWithDebInfo; the STL container annotations are off so instrumented and uninstrumented C++ code link together. Run with the MSVC bin directory on PATH (clang_rt.asan_dynamic-x86_64.dll).",
+            "inherits": "msvc-x64-relwithdebinfo",
+            "binaryDir": "${sourceDir}/build-msvc-x64-asan",
+            "cacheVariables": {
+                "OPT_BUILD_TESTS": "ON",
+                "CMAKE_C_FLAGS_RELWITHDEBINFO": "/Zi /O2 /Ob1 /DNDEBUG /fsanitize=address",
+                "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "/Zi /O2 /Ob1 /DNDEBUG /fsanitize=address /D_DISABLE_VECTOR_ANNOTATION /D_DISABLE_STRING_ANNOTATION",
+                "CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO": "/debug /INCREMENTAL:NO",
+                "CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO": "/debug /INCREMENTAL:NO",
+                "CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO": "/debug /INCREMENTAL:NO"
+            }
+        },
+        {
             "name": "msvc-arm64-release",
             "displayName": "MSVC ARM64 Release (Ninja, /MD)",
             "description": "Single-config ARM64 Release build: /MD, fully optimized, no debug info. Requires an ARM64-targeted MSVC developer shell. Uses a dedicated deps preset (default-arm64) so the deps tree does not collide with the x64 Ninja builds.",
