@@ -231,6 +231,17 @@ namespace net::http {
             response.effectiveUrl = effectiveUrl;
         }
 
+        // Request -1: the headers of the last request, after any redirects.
+        auto headerValue = [&easy](const char* name) {
+            curl_header* header = nullptr;
+            if (curl_easy_header(easy.handle, name, 0, CURLH_HEADER, -1, &header) == CURLHE_OK && header && header->value) {
+                return std::string(header->value);
+            }
+            return std::string();
+        };
+        response.etag = headerValue("ETag");
+        response.lastModified = headerValue("Last-Modified");
+
         return response;
     }
 

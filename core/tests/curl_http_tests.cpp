@@ -11,7 +11,7 @@
 // evaluated through WinHTTP.
 // `curl_http_tests --directory [--via-test-proxy]` fetches the real KiwiSDR
 // directory once, optionally through the in-process authenticating proxy.
-#include <gui/brown/kiwisdr_directory.h>
+#include <gui/remote/providers.h>
 #include <utils/networking.h>
 #include <utils/proto/curl_http.h>
 #include <utils/proxy.h>
@@ -524,28 +524,19 @@ namespace {
         require(ms < 2000, "CONNECT timeout took " + std::to_string(ms) + " ms");
     }
 
-    // One real fetch of the KiwiSDR directory into an empty cache folder.
+    // One real fetch of the KiwiSDR directory through its provider.
     int liveDirectory() {
-        const auto dir = std::filesystem::temp_directory_path() /
-            ("curl_http_tests_dir_" + std::to_string(Clock::now().time_since_epoch().count()));
-        std::filesystem::create_directories(dir);
-        int rc = 1;
-        {
-            KiwiSDRDirectoryClient client(dir.string());
-            const auto t0 = Clock::now();
-            client.requestRefresh();
-            while (client.isLoading() && msSince(t0) < 90000) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            auto list = client.takeIfReady();
-            std::printf("directory: %s after %lld ms, error '%s'\n",
-                        list ? (std::to_string(list->size()) + " servers").c_str() : "no list",
-                        msSince(t0), client.errorMessage().c_str());
-            rc = (list && !list->empty()) ? 0 : 1;
+        const auto t0 = Clock::now();
+        try {
+            auto provider = remote::makeKiwiSDRProvider();
+            const auto result = provider->fetch(remote::FetchRequest());
+            std::printf("directory: %zu servers after %lld ms\n", result.entries.size(), msSince(t0));
+            return result.entries.empty() ? 1 : 0;
         }
-        std::error_code ec;
-        std::filesystem::remove_all(dir, ec);
-        return rc;
+        catch (const std::exception& e) {
+            std::printf("directory: failed after %lld ms: %s\n", msSince(t0), e.what());
+            return 1;
+        }
     }
 }
 

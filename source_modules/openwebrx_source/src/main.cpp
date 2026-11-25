@@ -24,6 +24,8 @@
 #include <signal_path/spectrum_provider.h>
 #include <signal_path/iq_window_policy.h>
 #include <utils/flog.h>
+#include <gui/remote/browser.h>
+#include <gui/remote/recent.h>
 
 #include "owrx_client.h"
 
@@ -36,6 +38,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 SDRPP_MOD_INFO{
@@ -128,10 +131,18 @@ public:
         handler.uiTickHandler = uiTick;
         handler.stream = &stream;
         sigpath::sourceManager.registerSource("OpenWebRX+", &handler);
+
+        remote::RemoteHandler remoteHandler;
+        remoteHandler.kind = remote::RemoteKind::OpenWebRX;
+        remoteHandler.sourceName = "OpenWebRX+";
+        remoteHandler.probe = probe;
+        remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+        sigpath::remoteRegistry.registerHandler(remoteHandler);
     }
 
     ~OpenWebRxSourceModule() {
         if (core::args["server"].b()) { return; }
+        sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::OpenWebRX);
         stop(this);
         sigpath::sourceManager.unregisterSource("OpenWebRX+");
     }
@@ -142,6 +153,68 @@ public:
     bool isEnabled() { return enabled; }
 
 private:
+    // The remote browser's Test: the websocket handshake until the first
+    // complete config, then close. Worker thread.
+    static remote::ProbeResult probe(const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+        using Clock = std::chrono::steady_clock;
+        remote::ProbeResult result;
+        owrx::OpenWebRxClient client;
+        std::atomic<bool> handshake{ false };
+        std::atomic<bool> configured{ false };
+        std::atomic<bool> closed{ false };
+        std::atomic<int> handshakeMs{ -1 };
+        std::mutex errMtx;
+        std::string error;
+        const auto t0 = Clock::now();
+        client.onHandshake = [&] {
+            handshake = true;
+            handshakeMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        };
+        client.onConfig = [&](const owrx::OpenWebRxClient::Config& c, bool) {
+            if (c.complete()) { configured = true; }
+        };
+        client.onError = [&](const std::string& e) {
+            std::lock_guard lck(errMtx);
+            if (error.empty()) { error = e; }
+        };
+        client.onDisconnected = [&] { closed = true; };
+        client.start(entry.target.url());
+        while (!cancel && !configured && !closed && Clock::now() - t0 < std::chrono::seconds(6)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const std::string version = client.serverVersion();
+        const bool iq = client.hasIqMode();
+        const auto cfg = client.config();
+        const size_t profiles = client.profiles().size();
+        const int clients = client.clients();
+        client.stop();
+
+        if (handshakeMs >= 0) { result.rttMs = handshakeMs.load(); }
+        if (!version.empty()) { result.negotiated.emplace_back("Version", version); }
+        if (cfg.complete()) {
+            result.negotiated.emplace_back("Profile", remote::formatRangeMHz((uint64_t)std::max(0.0, cfg.centerFreq - cfg.sampRate / 2.0),
+                                                                             (uint64_t)(cfg.centerFreq + cfg.sampRate / 2.0)));
+        }
+        if (profiles) { result.negotiated.emplace_back("Profiles", std::to_string(profiles)); }
+        if (clients > 0) { result.negotiated.emplace_back("Clients", std::to_string(clients)); }
+        if (cancel) { result.reason = "cancelled"; }
+        else if (configured && iq) { result.ok = true; }
+        else if (configured) { result.reason = "no iq mode: needs OpenWebRX+ 1.2.129 or later"; }
+        else {
+            std::lock_guard lck(errMtx);
+            result.reason = !error.empty() ? error : (handshake ? "handshake, but no config within 6 s" : "could not connect");
+        }
+        return result;
+    }
+
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        const std::string url = entry.target.url();
+        std::snprintf(urlBuf, sizeof urlBuf, "%s", url.c_str());
+        config.edit().set("url", url);
+        gui::mainWindow.setPlayState(true);
+    }
+
     void setStatus(const std::string& s) {
         std::lock_guard lck(statusMtx);
         status = s;
@@ -660,6 +733,11 @@ private:
         auto configAccess = config.edit();
         configAccess.set("url", url);
         configAccess.set("recent", recent);
+        if (auto target = remote::parseTarget(url)) {
+            auto entry = remote::manualEntry(remote::RemoteKind::OpenWebRX, *target);
+            entry.tlsRequired = target->scheme == "https";
+            remote::recordRecent(entry);
+        }
     }
 
     static void menuHandler(void* ctx) {
@@ -667,6 +745,11 @@ private:
         const bool playing = _this->running.load();
         const ImVec4 warn(1.0f, 0.75f, 0.2f, 1.0f);
 
+        // The shared remote browser, OpenWebRX+ only. Its Connect stops the
+        // radio first, so it stays enabled while playing.
+        if (ImGui::Button(("Browse...##_owrx_browse_" + _this->name).c_str())) {
+            remote::openBrowser(remote::RemoteKind::OpenWebRX);
+        }
         ImGui::BeginDisabled(playing);
         ImGui::LeftLabel("Receiver");
         ImGui::FillWidth();

@@ -193,7 +193,7 @@ default Nuttall window (changelogged).
 ## Not worth it / already covered
 
 - **KiwiSDR map browser** (~1,000 lines: geomap + earcut) — we already have an
-  equivalent from the SDRPPBrown port (`gui/brown/kiwisdr_map.h`, used by our
+  equivalent from the SDRPPBrown port (now the remote-receiver browser in `gui/remote/`, used by our
   `websdr_view` module). Skip.
 - **SDL2 / OpenGL ES headless backend** (RPi KMS-DRM/Wayland) — significant platform
   work, irrelevant to our Windows/Android focus.

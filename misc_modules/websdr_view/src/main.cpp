@@ -6,7 +6,7 @@
 #endif
 #endif
 
-#include "gui/brown/kiwisdr_map.h"
+#include "gui/remote/browser.h"
 #include "gui/brown/small_waterfall.h"
 
 #include <imgui.h>
@@ -40,7 +40,7 @@ class ReportsMonitorModule : public ModuleManager::Instance {
     bool intlSupport;
     bool mouseWheel;
     bool zoomSave;
-    KiwiSDRMapSelector selector;
+    remote::RemoteBrowser selector;
 
 public:
     struct SingleReceiver {
@@ -263,8 +263,10 @@ public:
         }
     };
 
-    ReportsMonitorModule(std::string name, std::string root) : selector(root, &config, "WebSDR View") {
+    ReportsMonitorModule(std::string name, std::string root) : selector(&config, "WebSDR View", "KiwiSDR receivers") {
         this->name = name;
+        (void)root;
+        selector.setPickAction("Add", [this](const remote::RemoteEntry& entry) { addReceiver(entry.target.hostPort(), entry.location); });
         gui::menu.registerEntry(name, _menuHandler, this, NULL);
         frameDrawHandler.ctx = this;
         frameDrawHandler.handler = _frameDrawHandler;
@@ -318,6 +320,20 @@ public:
     bool visible = true;
 
 private:
+    void addReceiver(const std::string& hostPort, const std::string& loc) {
+        if (std::find_if(receivers.begin(), receivers.end(), [&](const std::shared_ptr<SingleReceiver> &r) {
+            return r->url == hostPort;
+        }) != receivers.end()) { return; }
+        using namespace std::chrono;
+        auto epochMs = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        auto recvr = std::make_shared<SingleReceiver>(std::to_string(epochMs), hostPort, loc, this);
+        receivers.push_back(recvr);
+        auto configAccess = config.edit();
+        ConfigManager::EditSection entry = configAccess.section("receivers", recvr->id);
+        entry.set("url", recvr->url);
+        entry.set("loc", recvr->loc);
+    }
+
     void menuHandler() {
         auto removeIndex = -1;
         ImGui::LeftLabel("Seconds to receive:");
@@ -331,7 +347,7 @@ private:
             config.edit().set("visible", visible);
         }
         if (ImGui::Button("Add new...")) {
-            selector.openPopup();
+            selector.open(remote::RemoteKind::KiwiSDR);
         }
         for (int ri=0; ri< receivers.size(); ri++) {
             std::shared_ptr<SingleReceiver> recvr = receivers[ri];
@@ -348,20 +364,7 @@ private:
             config.edit().section("receivers").erase(recvr->id);
             receivers.erase(receivers.begin() + removeIndex);
         }
-        selector.drawPopup([=](const std::string &hostPort, const std::string &loc, const std::optional<ServerEntry::FrequencyBand> &) {
-            if (std::find_if(receivers.begin(), receivers.end(), [&](const std::shared_ptr<SingleReceiver> &r) {
-                return r->url == hostPort;
-            }) == receivers.end()) {
-                using namespace std::chrono;
-                auto epochMs = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-                auto recvr = std::make_shared<SingleReceiver>(std::to_string(epochMs), hostPort, loc, this);
-                receivers.push_back(recvr);
-                auto configAccess = config.edit();
-                ConfigManager::EditSection entry = configAccess.section("receivers", recvr->id);
-                entry.set("url", recvr->url);
-                entry.set("loc", recvr->loc);
-            }
-        });
+        selector.draw();
     }
 
     void drawReceiverWindows() {

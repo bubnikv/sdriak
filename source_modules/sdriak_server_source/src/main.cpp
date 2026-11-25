@@ -11,6 +11,9 @@
 #include <utils/optionlist.h>
 #include <utils/async_connector.h>
 #include <gui/dialogs/dialog_box.h>
+#include <gui/remote/recent.h>
+#include <gui/remote/tcp_probe.h>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -76,6 +79,19 @@ public:
         frameDrawHandler.handler = frameDraw;
 
         sigpath::sourceManager.registerSource("SDRIAK Server", &handler);
+
+        // The remote browser runs in the GUI only.
+        if (!core::args["server"].b()) {
+            remote::RemoteHandler remoteHandler;
+            remoteHandler.kind = remote::RemoteKind::SDRIAKServer;
+            remoteHandler.sourceName = "SDRIAK Server";
+            remoteHandler.supportsTls = false;
+            remoteHandler.probe = [](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+                return remote::probeTcp(entry, cancel);
+            };
+            remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+            sigpath::remoteRegistry.registerHandler(remoteHandler);
+        }
     }
 
     ~SDRIAKServerSourceModule() {
@@ -86,6 +102,7 @@ public:
         stop(this);
         // Stop the connect worker before members it uses are destroyed.
         connector.shutdown();
+        if (!core::args["server"].b()) { sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::SDRIAKServer); }
         sigpath::sourceManager.unregisterSource("SDRIAK Server");
     }
 
@@ -313,6 +330,20 @@ private:
         return client && client->isOpen();
     }
 
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        if (client && client->isOpen()) { client->close(); }
+        std::snprintf(hostname, sizeof hostname, "%s", entry.target.host.c_str());
+        port = entry.target.port;
+        {
+            auto configAccess = config.edit();
+            configAccess.set("hostname", std::string(hostname));
+            configAccess.set("port", port);
+        }
+        loadPasswordForServer();
+        tryConnect();
+    }
+
     void tryConnect() {
         if (connector.connecting()) { return; }
 
@@ -368,6 +399,9 @@ private:
         try {
             client = std::move(newClient);
             deviceInit();
+            if (!core::args["server"].b()) {
+                remote::recordRecent(remote::manualEntry(remote::RemoteKind::SDRIAKServer, remote::RemoteTarget{ "tcp", hostname, port, "" }));
+            }
         }
         catch (const std::exception& e) {
             flog::error("Could not initialize SDR connection: {}", e.what());

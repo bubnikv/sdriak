@@ -13,7 +13,10 @@
 #include <dsp/buffer/prebuffer.h>
 #include <signal_path/spectrum_provider.h>
 #include <signal_path/iq_window_policy.h>
+#include <gui/remote/browser.h>
+#include <gui/remote/recent.h>
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <mutex>
 #include <algorithm>
@@ -99,9 +102,22 @@ public:
         strcpy(hostname, host.c_str());
 
         sigpath::sourceManager.registerSource("SpyServer", &handler);
+
+        // The remote browser runs in the GUI only.
+        if (!core::args["server"].b()) {
+            remote::RemoteHandler remoteHandler;
+            remoteHandler.kind = remote::RemoteKind::SpyServer;
+            remoteHandler.sourceName = "SpyServer";
+            remoteHandler.probe = [this](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+                return probe(entry, cancel, viaProxy);
+            };
+            remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+            sigpath::remoteRegistry.registerHandler(remoteHandler);
+        }
     }
 
     ~SpyServerSourceModule() {
+        if (!core::args["server"].b()) { sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::SpyServer); }
         stop(this);
         // Stop the connect worker before members it uses are destroyed.
         connector.shutdown();
@@ -123,6 +139,55 @@ public:
     }
 
 private:
+    // The remote browser's Test: handshake until DEVICE_INFO and the first
+    // CLIENT_SYNC, then close. canControl depends on who else is connected,
+    // so it comes from here, not from the directory. Worker thread.
+    static remote::ProbeResult probe(const remote::RemoteEntry& entry, const std::atomic<bool>& cancel, bool throughProxy) {
+        using Clock = std::chrono::steady_clock;
+        remote::ProbeResult result;
+        dsp::stream<dsp::complex_t> sink;
+        const auto t0 = Clock::now();
+        auto client = spyserver::connect(entry.target.host, (uint16_t)entry.target.port, &sink, 3000, throughProxy);
+        if (!client) {
+            result.reason = "could not connect";
+            return result;
+        }
+        if (cancel || !client->waitForDevInfo(3000)) {
+            client->close();
+            result.reason = cancel ? "cancelled" : "no device information";
+            return result;
+        }
+        result.rttMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        const auto syncStart = Clock::now();
+        while (!cancel && client->syncCount() == 0 && Clock::now() - syncStart < std::chrono::seconds(2)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const auto& info = client->devInfo;
+        constexpr uint32_t DEVICE_TYPE_COUNT = sizeof(deviceTypesStr) / sizeof(deviceTypesStr[0]);
+        result.negotiated.emplace_back("Device", info.DeviceType < DEVICE_TYPE_COUNT ? deviceTypesStr[info.DeviceType] : "unknown");
+        result.negotiated.emplace_back("Max sample rate", std::to_string(info.MaximumSampleRate) + " S/s");
+        if (client->syncCount() > 0) {
+            result.negotiated.emplace_back("Control", client->canControl() ? "yes (you can tune the device)" : "no (another client controls it)");
+        }
+        client->close();
+        result.ok = !cancel;
+        if (cancel) { result.reason = "cancelled"; }
+        return result;
+    }
+
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        if (client && client->isOpen()) { client->close(); }
+        std::snprintf(hostname, sizeof hostname, "%s", entry.target.host.c_str());
+        port = entry.target.port;
+        {
+            auto configAccess = config.edit();
+            configAccess.set("hostname", std::string(hostname));
+            configAccess.set("port", port);
+        }
+        tryConnect();
+    }
+
     std::string getBandwdithScaled(double bw) {
         char buf[1024];
         if (bw >= 1000000.0) {
@@ -259,6 +324,10 @@ private:
         }
         if (connecting) { SmGui::EndDisabled(); }
         if (_this->running) { SmGui::EndDisabled(); }
+        // The browser is local UI; a headless server never draws it.
+        if (!core::args["server"].b() && ImGui::Button("Browse...##_spyserver_browse")) {
+            remote::openBrowser(remote::RemoteKind::SpyServer);
+        }
 
 
         if (connected) {
@@ -412,6 +481,11 @@ private:
             char buf[1024];
             snprintf(buf, sizeof(buf), "%s [%08X]", deviceTypesStr[client->devInfo.DeviceType], client->devInfo.DeviceSerial);
             devRef = std::string(buf);
+            if (!core::args["server"].b()) {
+                remote::recordRecent(remote::manualEntry(remote::RemoteKind::SpyServer,
+                                                         remote::RemoteTarget{ "tcp", hostname, port, "" },
+                                                         deviceTypesStr[client->devInfo.DeviceType]));
+            }
 
             {
                 // The edit access unlocks on the way out of the scope, including

@@ -8,6 +8,10 @@
 #include <gui/smgui.h>
 #include <gui/style.h>
 #include <utils/optionlist.h>
+#include <gui/remote/recent.h>
+#include <gui/remote/tcp_probe.h>
+#include <atomic>
+#include <cstdio>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -76,9 +80,23 @@ public:
         handler.tuneHandler = tune;
         handler.stream = &stream;
         sigpath::sourceManager.registerSource("RTL-TCP", &handler);
+
+        // The remote browser runs in the GUI only.
+        if (!core::args["server"].b()) {
+            remote::RemoteHandler remoteHandler;
+            remoteHandler.kind = remote::RemoteKind::RtlTcp;
+            remoteHandler.sourceName = "RTL-TCP";
+            remoteHandler.supportsTls = false;
+            remoteHandler.probe = [](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+                return remote::probeTcp(entry, cancel, 12);
+            };
+            remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+            sigpath::remoteRegistry.registerHandler(remoteHandler);
+        }
     }
 
     ~RTLTCPSourceModule() {
+        if (!core::args["server"].b()) { sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::RtlTcp); }
         stop(this);
         sigpath::sourceManager.unregisterSource("RTL-TCP");
     }
@@ -98,6 +116,18 @@ public:
     }
 
 private:
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        std::snprintf(ip, sizeof ip, "%s", entry.target.host.c_str());
+        port = entry.target.port;
+        {
+            auto configAccess = config.edit();
+            configAccess.set("host", std::string(ip));
+            configAccess.set("port", port);
+        }
+        gui::mainWindow.setPlayState(true);
+    }
+
     static void menuSelected(void* ctx) {
         RTLTCPSourceModule* _this = (RTLTCPSourceModule*)ctx;
         core::setInputSampleRate(_this->sampleRate);
@@ -116,6 +146,9 @@ private:
         // Connect to the server
         try {
             _this->client = rtltcp::connect(&_this->stream, _this->ip, _this->port);
+            if (!core::args["server"].b()) {
+                remote::recordRecent(remote::manualEntry(remote::RemoteKind::RtlTcp, remote::RemoteTarget{ "tcp", _this->ip, _this->port, "" }));
+            }
         }
         catch (const std::exception& e) {
             flog::error("Could connect to RTL-TCP server: {}", e.what());

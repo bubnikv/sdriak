@@ -56,7 +56,9 @@
 #include <fstream>
 #include <atomic>
 #include <mutex>
-#include <gui/brown/kiwisdr_map.h>
+#include <gui/remote/browser.h>
+#include <gui/remote/recent.h>
+#include "kiwisdr_probe.h"
 
 
 SDRPP_MOD_INFO{
@@ -91,12 +93,18 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     static constexpr uint64_t DEFAULT_MIN_FREQ = 10000ull;     // 10 kHz
     static constexpr uint64_t DEFAULT_MAX_FREQ = 30000000ull;  // 30 MHz
 
+    // A served frequency range, Hz.
+    struct FrequencyBand {
+        uint64_t startHz = 0;
+        uint64_t endHz = 0;
+    };
+
     char kiwisdrHost[1024] = "";
     int kiwisdrPort = 8073;
     std::string kiwisdrLoc = "";
     // Served frequency range of the selected server, if known (from the
     // directory 'bands' field). Used to constrain the tuning UI.
-    std::optional<ServerEntry::FrequencyBand> selectedBand;
+    std::optional<FrequencyBand> selectedBand;
     // Last native [lo, hi] pushed to sourceManager from the live-refine path,
     // so menuHandler only re-applies the limit when the served range changes.
     std::optional<std::pair<uint64_t, uint64_t>> appliedServedRange;
@@ -104,7 +112,6 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     KiwiWaterfallClient wfClient;
     KiwiSDRClient kiwiSdrClient;
     std::string root;
-    KiwiSDRMapSelector selector;
 
     static constexpr size_t RECENT_MAX = 8;
 
@@ -115,7 +122,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         std::string host;
         int port = 8073;
         std::string loc;
-        std::optional<ServerEntry::FrequencyBand> band;
+        std::optional<FrequencyBand> band;
     };
     std::vector<RecentServer> recentServers; // front = most recent
 
@@ -123,7 +130,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         return std::string(kiwisdrHost) + ":" + std::to_string(kiwisdrPort);
     }
 
-    KiwiSDRSourceModule(std::string name, const std::string &root) : kiwiSdrClient(), selector(root, &config, "KiwiSDR Source") {
+    KiwiSDRSourceModule(std::string name, const std::string &root) : kiwiSdrClient() {
         this->name = name;
         this->root = root;
 
@@ -131,7 +138,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // a pointless hop (a client should connect to the KiwiSDR directly),
         // and the disconnect handling relies on gui::mainWindow, which is
         // never driven on a server. Skip registration so the source doesn't
-        // appear in the server's list. Also the map selector is a custom canvas widget
+        // appear in the server's list. Also the remote browser is a custom canvas widget
         // that can't be serialized over the server protocol, so it has no counterpart
         // in the streamed (remote client) UI.
         if (core::args["server"].b()) { return; }
@@ -146,7 +153,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             }
             configAccess.tryGet("kiwisdr_port", kiwisdrPort);
             configAccess.tryGet("kiwisdr_loc", kiwisdrLoc);
-            ServerEntry::FrequencyBand b;
+            FrequencyBand b;
             if (configAccess.tryGet("kiwisdr_band_start", b.startHz) &&
                 configAccess.tryGet("kiwisdr_band_end", b.endHz) &&
                 b.startHz <= b.endHz) {
@@ -211,11 +218,20 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // Load config
 
         sigpath::sourceManager.registerSource("KiwiSDR", &handler);
+
+        remote::RemoteHandler remoteHandler;
+        remoteHandler.kind = remote::RemoteKind::KiwiSDR;
+        remoteHandler.sourceName = "KiwiSDR";
+        remoteHandler.supportsTls = false; // the SND client speaks plain http
+        remoteHandler.probe = probeKiwiSDR;
+        remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+        sigpath::remoteRegistry.registerHandler(remoteHandler);
     }
 
     ~KiwiSDRSourceModule() {
         // Server mode: the constructor returned before registering.
         if (core::args["server"].b()) { return; }
+        sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::KiwiSDR);
         stop(this);
         wfClient.stop();
         sigpath::sourceManager.unregisterSource("KiwiSDR");
@@ -312,7 +328,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             r.port = j.value("port", 8073);
             r.loc = j.value("loc", std::string());
             if (j.contains("band_start") && j.contains("band_end")) {
-                ServerEntry::FrequencyBand b;
+                FrequencyBand b;
                 b.startHz = j["band_start"];
                 b.endHz = j["band_end"];
                 if (b.startHz <= b.endHz) { r.band = b; }
@@ -328,7 +344,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     // the MRU list, persist everything in one config write, re-derive the
     // tuning limits and re-point the client.
     void commitServer(const std::string& host, int port, const std::string& loc,
-                      const std::optional<ServerEntry::FrequencyBand>& band) {
+                      const std::optional<FrequencyBand>& band) {
         std::strncpy(kiwisdrHost, host.c_str(), sizeof(kiwisdrHost) - 1);
         kiwisdrHost[sizeof(kiwisdrHost) - 1] = '\0';
         kiwisdrPort = port;
@@ -354,18 +370,31 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         kiwiSdrClient.init(kiwisdrHostPort());
     }
 
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        std::optional<FrequencyBand> band;
+        if (!entry.ranges.empty()) { band = FrequencyBand{ entry.ranges.front().first, entry.ranges.front().second }; }
+        commitServer(entry.target.host, entry.target.port, entry.location, band);
+        gui::mainWindow.setPlayState(true);
+    }
+
     // Apply a hand-typed host/port (from the text boxes on commit). A typed
     // server has no directory entry, but if it matches a remembered recent
     // server, re-adopt that entry's location/band; otherwise fall back to
     // the default tuning range.
     void applyTypedServer() {
         std::string loc;
-        std::optional<ServerEntry::FrequencyBand> band;
+        std::optional<FrequencyBand> band;
         if (const RecentServer* r = findRecent(kiwisdrHost, kiwisdrPort)) {
             loc = r->loc;
             band = r->band;
         }
         commitServer(kiwisdrHost, kiwisdrPort, loc, band);
+        remote::RemoteTarget target{ "http", kiwisdrHost, kiwisdrPort, "" };
+        auto entry = remote::manualEntry(remote::RemoteKind::KiwiSDR, target, loc);
+        if (band) { entry.ranges.emplace_back(band->startHz, band->endHz); }
+        entry.location = loc;
+        remote::recordRecent(entry);
     }
 
     void applyRecent(int idx) {
@@ -780,21 +809,11 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // constructor), so this menu only ever renders locally.
         const bool playing = gui::mainWindow.isPlaying();
 
-        ImGui::BeginDisabled(playing);
-        if (ImGui::Button("Choose on map...")) {
-            _this->selector.openPopup();
+        // The shared remote browser, KiwiSDR only. Its Connect stops the
+        // radio first, so it stays enabled while playing.
+        if (ImGui::Button("Browse...##_kiwisdr_browse")) {
+            remote::openBrowser(remote::RemoteKind::KiwiSDR);
         }
-        ImGui::EndDisabled();
-
-        _this->selector.drawPopup([=](const std::string &hostPort, const std::string &loc, const std::optional<ServerEntry::FrequencyBand> &band) {
-            auto parsed = url::splitHostPort(hostPort);
-            std::string host = parsed ? parsed->host : hostPort;
-            int port = parsed ? parsed->port : 8073;
-            // The KiwiSDR source is the active source while this popup is
-            // open, so commitServer's applyFreqLimits() retunes the digit
-            // limits to the newly chosen server.
-            _this->commitServer(host, port, loc, band);
-        });
 
         ImGui::BeginDisabled(playing);
         if (SmGui::InputText(("##_kiwisdr_host_" + _this->name).c_str(),

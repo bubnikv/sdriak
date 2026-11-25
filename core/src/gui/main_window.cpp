@@ -23,6 +23,7 @@
 #include <gui/menus/android.h>
 #include <gui/menus/network.h>
 #include <gui/dialogs/credits.h>
+#include <gui/remote/browser.h>
 #ifdef __ANDROID__
 #include <android_backend.h>
 #endif
@@ -1068,6 +1069,11 @@ void MainWindow::draw() {
         ImGui::EndPopup();
     }
 #endif
+
+    // The shared remote-receiver browser, opened from the Source menu or a
+    // network source's Browse button. Drawn here so it stays open whatever
+    // the menu column does.
+    remote::drawBrowser();
 
     ImGui::End();
 

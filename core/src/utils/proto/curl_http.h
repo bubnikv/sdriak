@@ -26,6 +26,11 @@ namespace net::http {
         long status = 0;
         std::string body;
         std::string effectiveUrl;
+        // Cache validators of the final response, empty when absent. A
+        // caller sends them back as If-None-Match / If-Modified-Since and
+        // gets status 304 when nothing changed.
+        std::string etag;
+        std::string lastModified;
     };
 
     struct CurlRequest {

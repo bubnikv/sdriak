@@ -25,6 +25,7 @@
 #include <stb_image_resize.h>
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
+#include <gui/remote/browser.h>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -605,6 +606,10 @@ int sdrpp_main(int argc, char* argv[]) {
     // while (!core::moduleManager.instances.empty()) {
     //     core::moduleManager.deleteInstance(core::moduleManager.instances.begin()->first);
     // }
+
+    // Directory fetches and receiver probes stop before modules end: a probe
+    // runs module code on its own thread.
+    remote::shutdown();
 
     // Shut down all modules
     for (auto& [name, mod] : core::moduleManager.modules) {

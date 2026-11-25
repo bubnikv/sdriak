@@ -127,6 +127,10 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     target_link_libraries(curl_http_tests PRIVATE sdrpp_core)
     add_test(NAME curl_http_tests COMMAND curl_http_tests)
 
+    add_executable(remote_directory_tests tests/remote_directory_tests.cpp)
+    target_link_libraries(remote_directory_tests PRIVATE sdrpp_core)
+    add_test(NAME remote_directory_tests COMMAND remote_directory_tests)
+
     add_executable(proxy_socket_tests tests/proxy_socket_tests.cpp tests/proxy_socket_tests_proxy.cpp)
     target_link_libraries(proxy_socket_tests PRIVATE sdrpp_core)
     add_test(NAME proxy_socket_tests COMMAND proxy_socket_tests)

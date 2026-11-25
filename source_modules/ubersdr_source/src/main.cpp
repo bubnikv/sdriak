@@ -13,6 +13,8 @@
 #include <signal_path/spectrum_provider.h>
 #include <signal_path/iq_window_policy.h>
 #include <utils/flog.h>
+#include <gui/remote/browser.h>
+#include <gui/remote/recent.h>
 
 #include "ubersdr_client.h"
 
@@ -154,6 +156,13 @@ public:
         handler.stream = &stream;
         sigpath::sourceManager.registerSource("UberSDR", &handler);
 
+        remote::RemoteHandler remoteHandler;
+        remoteHandler.kind = remote::RemoteKind::UberSDR;
+        remoteHandler.sourceName = "UberSDR";
+        remoteHandler.probe = probe;
+        remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+        sigpath::remoteRegistry.registerHandler(remoteHandler);
+
         vfoDeleteHandler.handler = onVfoDelete;
         vfoDeleteHandler.ctx = this;
         sigpath::vfoManager.onVfoDelete.bindHandler(&vfoDeleteHandler);
@@ -161,6 +170,7 @@ public:
 
     ~UberSDRSourceModule() {
         if (core::args["server"].b()) { return; }
+        sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::UberSDR);
         stop(this);
         sigpath::vfoManager.onVfoDelete.unbindHandler(&vfoDeleteHandler);
         sigpath::sourceManager.unregisterSource("UberSDR");
@@ -172,6 +182,60 @@ public:
     bool isEnabled() { return enabled; }
 
 private:
+    // The remote browser's Test: POST /connection, then the first iq48
+    // packet on /ws, then close. Worker thread.
+    static remote::ProbeResult probe(const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+        using Clock = std::chrono::steady_clock;
+        remote::ProbeResult result;
+        const std::string base = normaliseBaseUrl(entry.target.url());
+        ubersdr::UberSDRClient client(ubersdr::UberSDRClient::newSessionId());
+        const auto t0 = Clock::now();
+        const auto admission = client.admit(base, std::string(), [&cancel] { return cancel.load(); });
+        if (cancel) {
+            result.reason = "cancelled";
+            return result;
+        }
+        if (!admission.allowed) {
+            result.reason = admission.reason.empty() ? "not admitted (HTTP " + std::to_string(admission.httpStatus) + ")" : admission.reason;
+            return result;
+        }
+        result.rttMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        std::string modes;
+        for (const auto& m : admission.iqModes) { modes += (modes.empty() ? "" : ", ") + m; }
+        result.negotiated.emplace_back("IQ modes", modes.empty() ? "none" : modes);
+        if (admission.maxSessionS > 0) { result.negotiated.emplace_back("Session limit", std::to_string(admission.maxSessionS / 60) + " min"); }
+        result.negotiated.emplace_back("VFOs", std::to_string(admission.vfos));
+
+        std::atomic<int> rate{ 0 };
+        std::atomic<bool> closed{ false };
+        client.onIQ = [&rate](const ubersdr::UberSDRClient::PacketInfo& info, const dsp::complex_t*, int count) {
+            if (count > 0 && rate.load() == 0) { rate = info.sampleRate > 0 ? info.sampleRate : 1; }
+        };
+        client.onDisconnected = [&closed] { closed = true; };
+        const double freq = entry.ranges.empty() ? 14074000.0 : (double)(entry.ranges.front().first + entry.ranges.front().second) / 2.0;
+        client.start(base, "iq48", freq);
+        const auto wsStart = Clock::now();
+        while (!cancel && rate.load() == 0 && !closed && Clock::now() - wsStart < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        client.stop();
+        if (cancel) { result.reason = "cancelled"; }
+        else if (rate.load() > 0) {
+            result.ok = true;
+            result.negotiated.emplace_back("IQ rate", std::to_string(rate.load()) + " S/s");
+        }
+        else { result.reason = closed ? "admitted, but the IQ stream closed" : "admitted, but no IQ within 5 s"; }
+        return result;
+    }
+
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        const std::string url = normaliseBaseUrl(entry.target.url());
+        std::snprintf(urlBuf, sizeof urlBuf, "%s", url.c_str());
+        config.edit().set("url", url);
+        gui::mainWindow.setPlayState(true);
+    }
+
     void setStatus(const std::string& s) {
         std::lock_guard lck(statusMtx);
         status = s;
@@ -991,6 +1055,12 @@ private:
         auto configAccess = config.edit();
         configAccess.set("url", url);
         configAccess.set("recent", recent);
+        if (auto target = remote::parseTarget(normaliseBaseUrl(url), "https")) {
+            target->path.clear();
+            auto entry = remote::manualEntry(remote::RemoteKind::UberSDR, *target);
+            entry.tlsRequired = target->scheme == "https";
+            remote::recordRecent(entry);
+        }
     }
 
     // Reconnect the primary at another width: the server replaces the old
@@ -1023,6 +1093,11 @@ private:
         UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
         const bool playing = _this->running.load();
 
+        // The shared remote browser, UberSDR only. Its Connect stops the
+        // radio first, so it stays enabled while playing.
+        if (ImGui::Button(("Browse...##_ubersdr_browse_" + _this->name).c_str())) {
+            remote::openBrowser(remote::RemoteKind::UberSDR);
+        }
         ImGui::BeginDisabled(playing);
         ImGui::LeftLabel("Server");
         ImGui::FillWidth();

@@ -1,10 +1,12 @@
 # Plan: a remote-receiver browser for all networked sources
 
-Date: 2026-11-24. Status: current. Nothing implemented.
+Date: 2026-11-25. Status: current. Steps 1–7 implemented, not committed:
+built on Windows (bench tree), `remote_directory_tests` passes and the
+parsers read the real documents of 2026-11-25; the GUI, live probes and
+Connect are untested. Step 8 is open.
 
-**Idea.** Turn the KiwiSDR map selector (`core/src/gui/brown/kiwisdr_map.*`,
-`kiwisdr_directory.*`, on `geomap.*`) into one browser for every networked
-source:
+**Idea.** One browser for every networked source, grown out of the
+KiwiSDR map selector of the SDRPPBrown port:
 
 * **Directory providers** supply receivers;
 * **each source module** supplies a prober and a connect handler;
@@ -13,51 +15,77 @@ source:
 
 ## Why now
 
-* **Three public directories exist for sources we have or plan:**
+* **Four public directories exist, one per source we have:**
 
-  | directory | endpoint | entries (2026-11-24) | position | capacity | other fields |
-  |-----------|----------|----------------------|----------|----------|--------------|
-  | KiwiSDR | `rx.linkfanel.net/kiwisdr_com.js` (mirror of kiwisdr.com/public) | 842 | GPS | `users` / `users_max` | `bands`, `snr`, `sdr_hw`, `ext_api`, `mode` |
-  | UberSDR | `instances.ubersdr.org/api/instances` (JSON) | 77 | lat/lon, Maidenhead | `available_clients` / `max_clients` | `tls`, `public_iq_modes`, `tuning_range`, SNR, features, `load_status` |
-  | SpyServer | `airspy.com/directory/status.json` (JSON) | 218 | `antennaLocation` lat/long | `currentClientCount` / `maxClients` | `deviceType`, min/max frequency, `maximumIQSampleRate`, `fullControlAllowed`, `streamingHost` / `streamingPort`, `online`, `lastSeen` |
+  | directory | source | endpoint | entries | position | capacity | other fields |
+  |-----------|--------|----------|---------|----------|----------|--------------|
+  | KiwiSDR | `kiwisdr_source` | `http://rx.linkfanel.net/kiwisdr_com.js` (mirror of kiwisdr.com/public; no TLS) | 842 | `gps` "(lat, lon)" | `users` / `users_max` | `bands`, `snr`, `sdr_hw`, `ext_api`, `antenna`, `sw_version`, `offline` |
+  | UberSDR | `ubersdr_source` | `https://instances.ubersdr.org/api/instances`, `{count, instances[]}`, ~780 kB | 77 | `latitude`/`longitude`, `maidenhead` | `available_clients` / `max_clients` | `host`, `port`, `tls` (74 of 77), `public_url`, `public_iq_modes`, `tuning_range.{min,max}_frequency` (Hz), `snr_0_30_mhz`, `is_online`, `last_report_age_seconds`, `load_status`, `cw_skimmer`, `version` |
+  | SpyServer | `spyserver_source` | `https://airspy.com/directory/status.json`, `{servers[]}` | 220 | `antennaLocation.{lat,long}` | `currentClientCount` / `maxClients` | `deviceType`, `minimumFrequency`/`maximumFrequency`, `maximumIQSampleRate`, `fullControlAllowed`, `streamingHost`/`streamingPort`, `online`, `lastSeen`, `generalDescription`, `antennaType`, `maxSessionDuration` |
+  | Receiverbook | `openwebrx_source` | `https://www.receiverbook.de/map`, HTML with a `var receivers = [...];` JSON literal, ~380 kB | 1234 sites: 430 OpenWebRX, 721 KiwiSDR, 99 WebSDR | GeoJSON `location.coordinates` [lon, lat] per site | none | per receiver `{label, url, type, version}`; 205 OpenWebRX on 1.2.129 or later, 159 over https |
 
-* **The map exists but is KiwiSDR-only.** It is
-  `KiwiSDRMapSelector` + `KiwiSDRDirectoryClient` + `KiwiSDRTester`, with
-  `ServerEntry` holding Kiwi fields. `GeoMap` (pan, zoom, hit-test,
-  tooltips) is already generic.
-* **Two users already share it:** `kiwisdr_source` and `websdr_view`.
-* **The SpyServer directory works today:** plain TCP, no TLS, and
-  `spyserver_source` exists. KiwiSDR TLS hosts and UberSDR wait on the TLS
-  work ([kiwisdr-streams.md](../research/kiwisdr-streams.md) §7,
-  [ubersdr.md](../research/ubersdr.md)).
+  Counts from 2026-11-25 (KiwiSDR from 2026-11-24).
+
+* **The KiwiSDR map selector was KiwiSDR-only,** while its `GeoMap` (pan,
+  zoom, hit-test, tooltips) was generic. Two users shared it:
+  `kiwisdr_source` (pick a server) and `websdr_view` (add a receiver to
+  its list).
+* **Every source with a directory exists and has a client usable from a
+  worker thread:** `KiwiSDRClient` (core, http only), `UberSDRClient`
+  (`admit()` is the blocking `POST /connection`, then IQ over wss),
+  `spyserver::connect` + `waitForDevInfo` + `canControl()`, and
+  `OpenWebRxClient` (handshake, `versionSupportsIq`). libcurl gives every
+  HTTP fetch TLS and the proxy setting.
+* **KiwiSDR TLS hosts** are still out of reach: the Kiwi client takes
+  `host:port` over plain http
+  ([kiwisdr-streams.md](../research/kiwisdr-streams.md) §7).
 
 ## Design
 
-### Model (core, `core/src/gui/remote/`)
+### Files (`core/src/gui/remote/`)
+
+| file | content |
+|------|---------|
+| `remote_entry.{h,cpp}` | model, target parsing, JSON, Maidenhead, distance |
+| `directory.{h,cpp}` | provider interface, `fetchDocument`, `DirectoryService` |
+| `providers.{h,cpp}` | KiwiSDR, UberSDR, SpyServer, Receiverbook parsers and providers |
+| `registry.{h,cpp}` | `RemoteHandler`, `ProbeResult`, the probe runner, `sigpath::remoteRegistry` |
+| `recent.{h,cpp}` | recent and favourites in core config |
+| `tcp_probe.{h,cpp}` | `probeTcp` for plain TCP servers |
+| `browser.{h,cpp}` | `RemoteBrowser`, the shared browser, `connectEntry`, `shutdown` |
+| `geomap.{h,cpp}`, `earcut.hpp` | the map widget |
+
+Tests: `core/tests/remote_directory_tests.cpp`.
+
+### Model
 
 ```cpp
-enum class RemoteKind { KiwiSDR, UberSDR, SpyServer, SDRIAKServer, RtlTcp, NetSDR, Hermes, Other };
+enum class RemoteKind { KiwiSDR, UberSDR, SpyServer, OpenWebRX, SDRIAKServer, RtlTcp, NetSDR, Hermes, Other };
 
 struct RemoteTarget {          // what a source needs to connect
     std::string scheme;        // "http", "https", "tcp"
     std::string host;
     int         port = 0;
     std::string path;          // optional
+    std::string url() const;   // scheme://host:port/path
 };
 
 struct RemoteEntry {
     std::string id;            // stable: provider + host:port (or directory id)
     RemoteKind  kind;
-    std::string provider;      // "kiwisdr.com", "ubersdr.org", "airspy.com", "recent", "lan"
+    std::string provider;      // "kiwisdr.com", "ubersdr.org", "airspy.com", "receiverbook.de", "recent", "lan"
     std::string name, location;
-    std::optional<ImVec2> latLon;          // absent: list view only
+    std::optional<std::pair<double, double>> latLon;  // degrees; absent: list view only
     RemoteTarget target;
     std::optional<int> users, usersMax;
     std::vector<std::pair<uint64_t, uint64_t>> ranges;   // served frequency ranges, Hz
     std::optional<float> snrDb;
+    std::optional<int64_t> lastSeenUnix;
+    std::string version;       // server software version, when listed
     bool tlsRequired = false;
+    bool favourite = false;
     std::vector<std::pair<std::string, std::string>> details;  // shown in the panel, already formatted
-    std::vector<std::string> flags;        // "full", "no-control", "wide-iq", "ext-api", "waterfall"...
+    std::vector<std::string> flags;        // "full-control", "wide-iq", "ext-api", "waterfall", "audio-only"...
 };
 ```
 
@@ -65,46 +93,74 @@ struct RemoteEntry {
   e-mail addresses. Providers **drop e-mail fields at parse time**; they
   are never shown or cached.
 * **One host, two protocols.** When one host appears in two directories
-  (3 UberSDRs are also in the KiwiSDR list), the browser shows one marker
-  with both connect options, the native one first.
+  (3 UberSDRs are also in the KiwiSDR list; Receiverbook repeats most
+  KiwiSDRs), the browser shows one marker with every connect option,
+  the native one first.
 
 ### Providers
 
 * **The interface:**
 
   ```cpp
+  struct FetchRequest {
+      std::string etag, lastModified;      // from the cache, for a conditional GET
+      std::function<bool()> shouldCancel;
+  };
+  struct FetchResult {
+      bool notModified = false;            // 304: keep the cached entries
+      std::vector<RemoteEntry> entries;
+      std::string etag, lastModified;
+  };
   struct DirectoryProvider {
+      virtual std::string id() const = 0;  // cache file name, e.g. "kiwisdr.com"
       virtual std::string name() const = 0;
-      virtual RemoteKind kind() const = 0;
       // Worker thread. Gentle: one request, a timeout, honours the proxy setting.
-      virtual std::vector<RemoteEntry> fetch() = 0;
+      virtual FetchResult fetch(const FetchRequest& request) = 0;
   };
   ```
 
-* **The browser around it:**
+  `CurlResponse` gains `etag` and `lastModified`, read with
+  `curl_easy_header` as `websock.cpp` reads `Location`.
+
+* **The directory service** (one per process, shared by every browser
+  view):
+  * It starts when a browser first opens, never at startup.
   * It runs fetches on one background thread, one provider at a time.
-  * It caches each result on disk with its fetch time, so the map opens
-    instantly and offline.
-  * It refetches only when the cache is older than about 15 min or the
-    user asks.
-  * It uses `If-Modified-Since`/ETag where the server supports them.
-* **Built-in providers:** KiwiSDR (the current parser, moved), UberSDR and
-  SpyServer, all plain HTTP + JSON.
-* **Receiverbook** (for `openwebrx_source`, plan
-  [network-sources/openwebrx/](network-sources/openwebrx/README.md)):
-  * it has no API, but `https://www.receiverbook.de/map` embeds every
-    receiver as a JSON literal, `var receivers = [...]` (one request of
-    about 380 kB);
-  * each site has a GeoJSON position and receivers with
-    `{label, url, type, version}`, `type` being `OpenWebRX`, `KiwiSDR` or
-    `WebSDR` (openwebrx.md §1);
-  * the provider offers OpenWebRX entries of version 1.2.129 or later,
-    and shows older ones greyed as audio-only;
-  * its KiwiSDR entries can be merged into the KiwiSDR provider by URL.
-* **Recent and favourites.** A provider backed by core config, holding
-  every target the user connected to or saved, for any kind. It covers
-  `sdriak_server_source`, `rtl_tcp_source`, `rfspace_source` and
-  `hermes_source`, which have no public directory.
+  * It caches each provider's parsed entries on disk, with the fetch
+    time and validators, in `core::args["root"]/remote_cache/<id>.json`,
+    so the map opens instantly and offline. The cache holds parsed
+    entries, so it never holds the dropped e-mail fields.
+  * It refetches only when the cache is older than 15 min or the user
+    presses Refresh. A failed fetch keeps the stale entries and shows the
+    error next to the provider.
+  * `remote::shutdown()` stops it, cancelling any transfer through
+    `shouldCancel`, before the module manager unloads modules.
+* **Built-in providers:**
+  * **KiwiSDR:** the current parser, moved. `offline != "no"` entries are
+    dropped, as now.
+  * **UberSDR:** `is_online` entries only; target from `host`, `port`,
+    `tls`, falling back to `public_url`.
+  * **SpyServer:** `online` entries only; target
+    `tcp://streamingHost:streamingPort`. `fullControlAllowed` is shown as
+    "allowed by the owner", not as a promise (see Open questions).
+  * **Receiverbook:**
+    * no API: the provider cuts the `var receivers = [...];` literal out
+      of `/map` and parses it as JSON;
+    * each site has a GeoJSON position and receivers with
+      `{label, url, type, version}`, `type` being `OpenWebRX`, `KiwiSDR`
+      or `WebSDR` ([openwebrx.md](../research/openwebrx.md) §1);
+    * it offers OpenWebRX entries; those older than 1.2.129 (no `iq`
+      mode) are kept, flagged `audio-only` and greyed, with the reason;
+    * its KiwiSDR entries are emitted as KiwiSDR kind and merge with the
+      KiwiSDR provider's entries by host:port (step 6);
+    * WebSDR entries are skipped: we have no WebSDR source.
+* **Recent and favourites.** A store backed by core config
+  (`remoteReceivers.recent`, `remoteReceivers.favourites`), holding
+  every target the user connected to or saved, for any kind. It needs no
+  fetch. A source module reports a connection made outside the browser
+  with `remote::recordRecent(entry)`. It covers `sdriak_server_source`,
+  `rtl_tcp_source`, `rfspace_source` and `hermes_source`, which have no
+  public directory. The per-module "Recent..." combos stay.
 * **LAN discovery (optional, later).** HPSDR discovery broadcast, NetSDR
   UDP discovery, mDNS for SDRIAK servers. List-only; there are no
   coordinates.
@@ -114,94 +170,142 @@ struct RemoteEntry {
 A source module registers what only it can do:
 
 ```cpp
+struct ProbeResult {
+    bool ok = false;
+    std::string reason;          // "too_busy", "badp", "TLS required", "refused", ...
+    std::optional<int> rttMs;
+    std::vector<std::pair<std::string, std::string>> negotiated;   // rates, modes, control
+};
+
 struct RemoteHandler {
     RemoteKind kind;
     std::string sourceName;                                  // as registered with SourceManager
-    std::function<ProbeResult(const RemoteEntry&, std::atomic<bool>& cancel)> probe;   // worker thread
+    bool supportsTls = true;                                 // false: TLS entries are greyed
+    std::function<ProbeResult(const RemoteEntry&, const std::atomic<bool>& cancel)> probe;   // worker thread
     std::function<void(const RemoteEntry&)> connect;         // UI thread
 };
 sigpath::remoteRegistry.registerHandler(handler);            // in the module constructor
+sigpath::remoteRegistry.unregisterHandler(kind);             // in the destructor
 ```
 
 * **What a probe does,** per protocol:
-  * **KiwiSDR:** `/VER`, then SND until the first packet (the current
-    tester).
-  * **UberSDR:** `POST /connection`, then the first `iq48` packet.
-  * **SpyServer:** handshake until `DEVICE_INFO` and `CLIENT_SYNC`; report
-    `canControl`.
-  * **Others:** connect plus first data.
-* **Probe policy.** Probes run one at a time and can be cancelled.
-* **Probe result:** OK or failed, the reason (`too_busy`, `badp`, TLS
-  required, refused), measured round-trip time, and what was negotiated
-  (rates, modes).
-* **What Connect does:**
-  `sigpath::sourceManager.selectSource(handler.sourceName)`, then
-  `handler.connect(entry)`, which fills the module's host/port/options and
-  connects as if typed.
+  * **KiwiSDR:** SND until the first IQ packet, tuned to the middle of the
+    served range (the current tester, moved into `kiwisdr_source`).
+  * **UberSDR:** `POST /connection`, then the first `iq48` packet; report
+    `allowed_iq_modes` and the session limits.
+  * **SpyServer:** handshake until `DEVICE_INFO` and the first
+    `CLIENT_SYNC`; report `canControl`, the device and its maximum rate.
+  * **OpenWebRX+:** the websocket handshake until the first `config`;
+    report the version, whether it has the `iq` mode, the profile and
+    the client count.
+  * **Others** (`sdriak_server`, `rtl_tcp`, `rfspace`): TCP connect plus
+    the first bytes the server sends; report the round trip.
+* **Probe policy.** One probe runner in core (`Registry::startProbe`,
+  state in `probeState()`), so probes run one at a time across every
+  browser view and can be cancelled. `unregisterHandler`
+  cancels and waits for a probe of that kind, so a module is never
+  unloaded under a running probe.
+* **What Connect does,** on the UI thread:
+  1. stop the radio if it is playing;
+  2. select the handler's source through the Source menu
+     (`sourcemenu::selectSource`, exported), so its combo and the
+     `source` config key follow;
+  3. `handler.connect(entry)`: the module fills its host/port or URL,
+     saves its config and its recent list, and connects as its own
+     Connect or Play button would. KiwiSDR, UberSDR and OpenWebRX+ start
+     playing; SpyServer and SDRIAK Server open the connection and leave
+     Play to the user, as their menus do;
+  4. record the entry in Recent.
 * **Kinds with no handler** (module not loaded or not built) stay listed
   but greyed, with the reason.
 
 ### UI (`RemoteBrowser`, replacing `KiwiSDRMapSelector`)
 
-* **Map view.** `GeoMap` with one marker shape per kind (Kiwi ●,
-  UberSDR ◆, SpyServer ▲), fill by state: free, nearly full, full, needs
-  TLS (not yet supported), not connectable. Keep the current behaviour:
-  cluster picker, phone-landscape footer, hide-full toggle.
-* **List view.** A sortable table: name, kind, location, distance from the
-  user's QTH (the band-stack/spots QTH setting), users, ranges, SNR, last
-  seen; with search. On phones, the list is often the better view.
+* **Views.** A `RemoteBrowser` is a view over the shared directory
+  service with its own map position, filters and selection, saved under
+  its config prefix. Its action is Connect by default; a user can
+  replace it (`websdr_view` uses "Add").
+* **Map view.** `GeoMap` with one marker shape per kind (KiwiSDR ●,
+  UberSDR ◆, SpyServer ▲, OpenWebRX+ ■, others ⬢), fill by state: free,
+  nearly full (≥ 75 %), full, needs TLS the source lacks, not
+  connectable (no handler, audio-only). Keep the current behaviour:
+  cluster picker, phone-landscape footer, hide-full toggle, EXT API
+  filter for KiwiSDR.
+* **List view.** A sortable table: name, kind, location, distance from
+  the user's QTH, users, ranges, SNR, last seen; with search. On phones
+  the list is often the better view. Entries without a position (Recent,
+  LAN) appear only here.
+* **QTH.** No QTH setting exists yet. The browser keeps a Maidenhead
+  locator field of its own in core config (`remoteBrowser.qth`); a later
+  station-settings page can take it over.
 * **Filters:**
   * kind;
-  * "covers the current frequency" (uses `ranges`);
+  * "covers the current frequency" (uses `ranges` and
+    `gui::freqSelect.frequency`);
   * free slots;
-  * TLS-capable only while TLS is missing;
+  * hide TLS entries a source cannot connect to;
   * full control (SpyServer);
-  * waterfall available.
-* **Panel.** The selected entry's `details`, plus **Test**, **Connect** and
-  **Favourite**.
+  * IQ capable (hides audio-only OpenWebRX);
+  * waterfall available;
+  * favourites only.
+* **Panel.** The selected entry's `details`, plus **Test**, **Connect**
+  and **Favourite**, one Connect per protocol when a host has several.
 * **Entry points:**
-  * **Source menu:** a "Browse remote receivers…" button opens the browser
-    with every kind.
-  * **Per source:** each network source's own "Browse…" opens it filtered
-    to its kind; that replaces the current Kiwi map button.
-  * **`websdr_view`:** opens it filtered to KiwiSDR.
+  * **Source menu:** a "Browse remote receivers..." button opens the
+    shared browser with every kind. It is drawn from the main window, so
+    it stays open when the menu column scrolls or collapses.
+  * **Per source:** the "Browse..." button of `kiwisdr_source`,
+    `ubersdr_source`, `spyserver_source` and `openwebrx_source` opens the
+    shared browser filtered to its kind; that replaces the Kiwi map
+    button.
+  * **`websdr_view`:** its own view, filtered to KiwiSDR, with "Add".
 
 ### Gentleness
 
 * **Directory fetches:** one request per provider per refresh, sequential,
-  cached.
+  cached, conditional where the server sends validators.
 * **Probes:** user-initiated, one at a time, short, closed cleanly.
 * **No background sweeps.** Nothing probes many receivers unattended. A
   "test all visible" action, if ever added, is sequential with pauses and
   capped.
-* **One network layer.** Everything honours the same proxy and TLS
-  settings (see [forks/zh.md](../research/forks/zh.md) §2 for the proxy
-  layer), so the browser and the sources behave the same behind a proxy.
+* **One network layer.** Everything goes through libcurl and the same
+  proxy setting, so the browser and the sources behave the same behind a
+  proxy.
 
 ## Steps
 
-1. **Extract, behaviour-neutral.** Move `GeoMap`, the marker, cluster and
-   panel code and the Kiwi parser into `core/src/gui/remote/`, behind
-   `RemoteEntry` and a `KiwiSDRProvider`. `kiwisdr_source` and
-   `websdr_view` keep working, filtered to KiwiSDR.
-2. **Registry and handoff.** Add `RemoteHandler` and the Connect flow.
-   Move `KiwiSDRTester` into `kiwisdr_source` as its probe.
-3. **SpyServer provider and handler.** Works today and gives 218
-   receivers. The probe shows `canControl`, because many servers are
-   shared.
-4. **List view, filters and favourites/recent** for every kind, including
-   the sources without a directory.
-5. **UberSDR provider,** together with `ubersdr_source`, after TLS.
-6. **De-duplication across directories** and native-first connect options.
-7. **Optional:** LAN discovery providers.
+Steps 1–7 are implemented as described; step 8 is open.
+
+1. **Extract, behaviour-neutral.** Move `GeoMap` and `earcut.hpp` to
+   `core/src/gui/remote/`; add the model, the directory service with its
+   cache, and a `KiwiSDRProvider` with the moved parser; build
+   `RemoteBrowser` from the map selector's markers, cluster picker and
+   panel. `kiwisdr_source` and `websdr_view` keep working, filtered to
+   KiwiSDR.
+2. **Registry and handoff.** Add `RemoteHandler`, the probe runner and the
+   Connect flow; the Source-menu entry point. Move `KiwiSDRTester` into
+   `kiwisdr_source` as its probe; register its connect.
+3. **SpyServer provider and handler.** 220 receivers. The probe shows
+   `canControl`, because many servers are shared.
+4. **UberSDR provider and handler.** 77 receivers, nearly all over TLS,
+   which `UberSDRClient` handles.
+5. **Receiverbook provider and OpenWebRX+ handler.** 430 receivers, 205
+   with IQ; older ones greyed as audio-only.
+6. **List view, filters and favourites/recent** for every kind, including
+   handlers for `sdriak_server_source`, `rtl_tcp_source` (probe: the
+   12-byte `RTL0` header) and `rfspace_source`, which have no directory.
+   These three register only in the GUI, not on a headless server.
+7. **De-duplication across directories** and native-first connect
+   options.
+8. **Optional:** LAN discovery providers, and `hermes_source` through
+   them.
 
 ## Open questions
 
-* **The "covers the current frequency" filter.** It needs a defined
-  current frequency when no source is running: the last tuned one, from
-  the band stack.
-* **SpyServer `fullControlAllowed`.** It is true on 217 of 218 servers,
+* **The "covers the current frequency" filter.** With no source running
+  it uses the last tuned frequency the frequency selector still holds.
+* **SpyServer `fullControlAllowed`.** It is true on nearly every server,
   yet `canControl` depends on who else is connected. Show it from the
   probe, not from the directory.
-* **Directory refresh cadence and cache location:** `core::args["root"]`
-  plus `remote_cache/`.
+* **Receiverbook's terms.** It publishes no API; one fetch per 15 min of
+  a public page is the gentle use. Ask the operator if usage grows.

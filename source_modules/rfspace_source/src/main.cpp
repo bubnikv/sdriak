@@ -10,6 +10,10 @@
 #include <gui/widgets/stepped_slider.h>
 #include <utils/optionlist.h>
 #include <gui/smgui.h>
+#include <gui/remote/recent.h>
+#include <gui/remote/tcp_probe.h>
+#include <atomic>
+#include <cstdio>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -46,10 +50,24 @@ public:
         }
 
         sigpath::sourceManager.registerSource("RFspace", &handler);
+
+        // The remote browser runs in the GUI only.
+        if (!core::args["server"].b()) {
+            remote::RemoteHandler remoteHandler;
+            remoteHandler.kind = remote::RemoteKind::NetSDR;
+            remoteHandler.sourceName = "RFspace";
+            remoteHandler.supportsTls = false;
+            remoteHandler.probe = [](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+                return remote::probeTcp(entry, cancel);
+            };
+            remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+            sigpath::remoteRegistry.registerHandler(remoteHandler);
+        }
     }
 
     ~RFSpaceSourceModule() {
         stop(this);
+        if (!core::args["server"].b()) { sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::NetSDR); }
         sigpath::sourceManager.unregisterSource("RFspace");
     }
 
@@ -68,6 +86,34 @@ public:
     }
 
 private:
+    // Connect with the host/port the menu holds, as its Connect button.
+    void connectNow() {
+        try {
+            if (client) { client.reset(); }
+            client = rfspace::connect(hostname, port, &stream);
+            deviceInit();
+            if (!core::args["server"].b()) {
+                remote::recordRecent(remote::manualEntry(remote::RemoteKind::NetSDR, remote::RemoteTarget{ "tcp", hostname, port, "" }));
+            }
+        }
+        catch (const std::exception& e) {
+            flog::error("Could not connect to SDR: {}", e.what());
+        }
+    }
+
+    // The remote browser's Connect: the browser has selected this source.
+    void connectRemote(const remote::RemoteEntry& entry) {
+        if (client && client->isOpen()) { client->close(); }
+        std::snprintf(hostname, sizeof hostname, "%s", entry.target.host.c_str());
+        port = entry.target.port;
+        {
+            auto configAccess = config.edit();
+            configAccess.set("hostname", std::string(hostname));
+            configAccess.set("port", port);
+        }
+        connectNow();
+    }
+
     std::string getBandwdithScaled(double bw) {
         char buf[1024];
         if (bw >= 1000000.0) {
@@ -146,14 +192,7 @@ private:
         SmGui::FillWidth();
         SmGui::ForceSync();
         if (!connected && SmGui::Button("Connect##rfspace_source")) {
-            try {
-                if (_this->client) { _this->client.reset(); }
-                _this->client = rfspace::connect(_this->hostname, _this->port, &_this->stream);
-                _this->deviceInit();
-            }
-            catch (const std::exception& e) {
-                flog::error("Could not connect to SDR: {}", e.what());
-            }
+            _this->connectNow();
         }
         else if (connected && SmGui::Button("Disconnect##rfspace_source")) {
             _this->client->close();

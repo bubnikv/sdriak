@@ -8,6 +8,7 @@
 #include <utils/optionlist.h>
 #include <gui/dialogs/dialog_box.h>
 #include <gui/widgets/popup_dialog.h>
+#include <gui/remote/browser.h>
 
 namespace sourcemenu {
     int sourceId = 0;
@@ -112,6 +113,10 @@ namespace sourcemenu {
 
         // Select the source module
         sigpath::sourceManager.selectSource(name);
+    }
+
+    const std::string& selectedSourceName() {
+        return selectedSource;
     }
 
     void onSourcesChanged(std::string name, void* ctx) {
@@ -274,6 +279,12 @@ namespace sourcemenu {
         }
 
         if (running) { style::endDisabled(); }
+
+        // Every networked source's receivers on one map; Connect stops the
+        // radio itself, so this stays enabled while playing.
+        if (ImGui::Button("Browse remote receivers...##_sdrpp_remote_browser", ImVec2(itemWidth, 0))) {
+            remote::openBrowser();
+        }
 
         sigpath::sourceManager.showSelectedMenu();
 

@@ -4,8 +4,8 @@ Usability review of the KiwiSDR map selector on desktop and Android (touch),
 covering touch handling, tooltips, and scaling on small screens.
 
 Relevant files:
-- `core/src/gui/brown/kiwisdr_map.cpp` / `.h` — selector, markers, selection panel
-- `core/src/gui/brown/geomap.cpp` / `.h` — map widget: pan, zoom, tooltips, hit-test
+- `core/src/gui/remote/browser.cpp` / `.h` — remote-receiver browser: markers, cluster picker, panel (was the KiwiSDR map selector)
+- `core/src/gui/remote/geomap.cpp` / `.h` — map widget: pan, zoom, tooltips, hit-test
 - `core/src/gui/widgets/simple_widgets.h` — `doFingerButton`, `doOverlayText`, overlay styles
 
 ---

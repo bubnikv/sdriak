@@ -19,8 +19,8 @@
  */
 
 #define IMGUI_DEFINE_MATH_OPERATORS
-#include <gui/brown/geomap.h>
-#include <gui/brown/earcut.hpp>
+#include <gui/remote/geomap.h>
+#include <gui/remote/earcut.hpp>
 #include <cmath>
 #include <ctime>
 #include <fstream>
