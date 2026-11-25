@@ -257,6 +257,10 @@ namespace {
         require(c.details().sessionTimeoutS == 3600 && c.details().name == "X", "receiver_details parsed");
         c.handleText(R"({"type":"clients","value":4})");
         require(c.clients() == 4, "clients parsed");
+        std::string err;
+        c.onError = [&err](const std::string& e) { err = e; };
+        c.handleText(R"({"type":"backoff","reason":"Too many clients"})");
+        require(err.find("Too many clients") != std::string::npos, "backoff: the reason is reported");
     }
 
     void testVersionAndUrl() {

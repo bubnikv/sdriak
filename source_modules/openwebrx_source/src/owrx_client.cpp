@@ -234,6 +234,12 @@ namespace owrx {
         auto j = nlohmann::json::parse(msg, nullptr, false);
         if (j.is_discarded() || !j.is_object()) { return; }
         const std::string type = j.value("type", std::string());
+        // The one message without a "value": sent before the server closes
+        // ("Too many clients", "Client address banned").
+        if (type == "backoff") {
+            onError("the receiver refused the connection: " + str(j, "reason"));
+            return;
+        }
         auto valueIt = j.find("value");
         if (valueIt == j.end()) { return; }
         const nlohmann::json& v = *valueIt;
@@ -301,9 +307,6 @@ namespace owrx {
             const std::string text = v.is_string() ? v.get<std::string>() : v.dump();
             flog::warn("OpenWebRxClient: {}: {}", type, text);
             onError(text);
-        }
-        else if (type == "backoff") {
-            onError("the server asks to back off: " + (v.is_string() ? v.get<std::string>() : v.dump()));
         }
         else if (type == "log_message" && v.is_string()) {
             flog::info("OpenWebRxClient: server: {}", v.get<std::string>());
