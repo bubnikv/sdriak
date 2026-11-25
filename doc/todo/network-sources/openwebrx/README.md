@@ -1,8 +1,8 @@
 # OpenWebRX+: IQ source with the server's waterfall
 
-Date: 2026-11-25. Status: steps 1–3 implemented and committed. The client
-passed its live check on two receivers; the module has not been run in
-the GUI. Part of [../README.md](../README.md).
+Date: 2026-11-25. Status: steps 1–3 implemented and committed, step 4
+planned. The client passed its live check on two receivers; the module
+has not been run in the GUI. Part of [../README.md](../README.md).
 
 A new `source_modules/openwebrx_source` for OpenWebRX+ receivers of
 version 1.2.129 or later, the versions with the `iq` mode. It gives:
@@ -43,6 +43,24 @@ framing described in the research doc.
 | [1-client.md](1-client.md) | transport/1–2 | `/ws/` handshake, `connectionproperties`, `dspcontrol`, config and profile messages, binary frame types, both ADPCM decoders, reading without stalls |
 | [2-source-module.md](2-source-module.md) | 1 | module, UI, version and `iq`-mode check, fixed centre from the profile, profile change behind a warning and a rate limit, prebuffer, config, Android |
 | [3-waterfall-and-window.md](3-waterfall-and-window.md) | 2, core 1–5 | the profile FFT as a `SpectrumProvider`, the IQ window as `offset_freq` with an arrival-timed commit |
+| [4-receiver-bookmarks.md](4-receiver-bookmarks.md) | 2 | the server's `bookmarks` and `dial_frequencies` as read-only frequency-manager lists, through a new core holder of source bookmarks |
+
+Not planned, from the same source:
+
+* **The map socket** (`type=map` in the handshake). It does not take a
+  listener slot. Its updates give callsign, position, mode and band name,
+  but no frequency, so they cannot become waterfall spots. They would only
+  feed a map view, and there is none.
+* **The server's decoders** (FT8, the CW skimmer and the others) run as a
+  secondary demodulator on SSB audio, and send their decodes only to the
+  client that runs them. Using them would take a second connection, which
+  counts as another listener. Receivers that report to PSKReporter can be
+  read there instead, by the receiver's callsign; that is a general spots
+  provider, not part of this source.
+* **The S-meter** (`smeter`). It is the power of our 48 kHz window, taken
+  before the iq mode's AGC, 4 readings per second: the only absolute level
+  the IQ path has. It is a candidate for a level readout once a session
+  shows how it lines up with the IQ in time.
 
 Directory: Receiverbook's `/map` JSON belongs to
 [../../remote-receiver-browser.md](../../remote-receiver-browser.md), not
