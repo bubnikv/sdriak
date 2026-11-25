@@ -292,6 +292,8 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["Spectran HTTP Source"]["enabled"] = true;
     defConfig["moduleInstances"]["SpyServer Source"]["module"] = "spyserver_source";
     defConfig["moduleInstances"]["SpyServer Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["UberSDR Source"]["module"] = "ubersdr_source";
+    defConfig["moduleInstances"]["UberSDR Source"]["enabled"] = true;
     defConfig["moduleInstances"]["USRP Source"]["module"] = "usrp_source";
     defConfig["moduleInstances"]["USRP Source"]["enabled"] = true;
 
@@ -422,6 +424,7 @@ int sdrpp_main(int argc, char* argv[]) {
             "sdriak_server_source.so",
             "spyserver_source.so",
             "kiwisdr_source.so",
+            "ubersdr_source.so",
 
             "network_sink.so",
             "audio_sink.so",

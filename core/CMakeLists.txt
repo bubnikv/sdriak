@@ -253,6 +253,14 @@ sdrpp_link_dep(sdrpp_core libogg PRIVATE
     PC_NAME      ogg
     TARGETS      Ogg::ogg)
 
+# zlib backs utils/gzip (gzip-compressed control messages, e.g. UberSDR's
+# spectrum socket). libcurl already depends on it; linked PRIVATE, headers
+# kept out of gzip.h.
+sdrpp_link_dep(sdrpp_core ZLIB PRIVATE
+    PACKAGE_NAME ZLIB
+    PC_NAME      zlib
+    TARGETS      ZLIB::ZLIB)
+
 if (NOT ANDROID)
     find_package(OpenGL REQUIRED)
     target_link_libraries(sdrpp_core PUBLIC OpenGL::GL)
