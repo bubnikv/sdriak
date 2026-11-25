@@ -90,6 +90,17 @@ struct RemoteEntry {
   * It uses `If-Modified-Since`/ETag where the server supports them.
 * **Built-in providers:** KiwiSDR (the current parser, moved), UberSDR and
   SpyServer, all plain HTTP + JSON.
+* **Receiverbook** (for `openwebrx_source`, plan
+  [network-sources/openwebrx/](network-sources/openwebrx/README.md)):
+  * it has no API, but `https://www.receiverbook.de/map` embeds every
+    receiver as a JSON literal, `var receivers = [...]` (one request of
+    about 380 kB);
+  * each site has a GeoJSON position and receivers with
+    `{label, url, type, version}`, `type` being `OpenWebRX`, `KiwiSDR` or
+    `WebSDR` (openwebrx.md §1);
+  * the provider offers OpenWebRX entries of version 1.2.129 or later,
+    and shows older ones greyed as audio-only;
+  * its KiwiSDR entries can be merged into the KiwiSDR provider by URL.
 * **Recent and favourites.** A provider backed by core config, holding
   every target the user connected to or saved, for any kind. It covers
   `sdriak_server_source`, `rtl_tcp_source`, `rfspace_source` and

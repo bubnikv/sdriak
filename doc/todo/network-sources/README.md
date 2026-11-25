@@ -3,8 +3,8 @@
 Date: 2026-11-24. Status: transport/1–3 implemented and committed;
 kiwisdr/1–3 and core-spectrum/1–5 implemented, not committed; spyserver/0
 measured (doc/research/spyserver-streams.md); spyserver/1–4 and ubersdr/1–4 implemented, not
-committed. Every step is implemented; none of the uncommitted ones has
-been through the GUI review gates yet.
+committed; openwebrx/1–3 implemented and committed (2026-11-25). None of the
+implemented steps has been through its GUI review gate yet.
 
 This folder holds independent, self-contained implementation plans for an
 implementation agent. Each sub-plan lists its own prerequisites, files,
@@ -13,7 +13,7 @@ vocabulary and the order.
 
 ## Goal
 
-Three networked sources deliver a **server-side waterfall**: the spectrum
+Four networked sources deliver a **server-side waterfall**: the spectrum
 computed by the remote receiver over a span much wider than the IQ the link
 carries. Each source keeps an option to fall back to the local FFT.
 
@@ -22,6 +22,7 @@ carries. Each source keeps an option to fall back to the local FFT.
 | KiwiSDR (`kiwisdr_source`) | 12 kS/s (or 20.25 kS/s) | W/F websocket, 1 024 bins, zoom 0…`zoom_cap` | [kiwisdr/](kiwisdr/README.md) |
 | UberSDR (new `ubersdr_source`) | 48–384 kS/s, plus 12 kS/s secondaries | `/ws/user-spectrum` v2, 1 024 bins, continuous zoom | [ubersdr/](ubersdr/README.md) |
 | SpyServer (`spyserver_source`) | full IQ, or narrow IQ in VFO+FFT mode | FFT stream in `FFT_IQ` mode, 2 048 bins, decimation stages | [spyserver/](spyserver/README.md) |
+| OpenWebRX+ ≥ 1.2.129 (new `openwebrx_source`) | 48 kS/s `iq` mode, AGC'd, int16 or ADPCM | the profile's shared FFT, one fixed span | [openwebrx/](openwebrx/README.md) |
 
 Two shared foundations come first:
 
@@ -63,6 +64,7 @@ Recommended sequence. Each step is a reviewable unit:
 6. **spyserver/1–4.** No TLS needed.
 7. **ubersdr/1–4.** Needs transport and core-spectrum.
 8. **transport/3** (proxy) can go in any time after transport/1–2.
+9. **openwebrx/1–3.** Needs transport and core-spectrum.
 
 ## Shared rules for every sub-plan
 
@@ -87,7 +89,9 @@ Recommended sequence. Each step is a reviewable unit:
   * jp's SpyServer VFO+FFT findings;
   * lzh173's proxy layer (sdriak-zh);
   * UberSDR's `pcm_v4.hpp` (GPL-3.0, madpsy/ka9q_ubersdr);
-  * KiwiSDR protocol facts from `jks-prv/Beagle_SDR_GPS` and kiwiclient.
+  * KiwiSDR protocol facts from `jks-prv/Beagle_SDR_GPS` and kiwiclient;
+  * OpenWebRX+ protocol facts from `luarvique/openwebrx` (AGPL-3.0; facts
+    only, no code copied).
 
   Our tree is GPL-3.0; all of these are compatible.
 - **Public servers are third-party property.** Any live test is one
@@ -122,6 +126,8 @@ Recommended sequence. Each step is a reviewable unit:
   receivers.
 - [../../research/ubersdr.md](../../research/ubersdr.md): the UberSDR
   directory, native API, measurements on 8 instances.
+- [../../research/openwebrx.md](../../research/openwebrx.md): OpenWebRX+
+  protocol, the `iq` mode, Receiverbook's list, three live sessions.
 - [../../research/forks/jp.md](../../research/forks/jp.md) §4 and
   [../../research/forks/zh.md](../../research/forks/zh.md) §2: borrowed
   code.

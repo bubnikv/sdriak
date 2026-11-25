@@ -59,6 +59,7 @@ itself belongs in `design/` or `todo/`. Fork surveys live in
 - [ubersdr.md](research/ubersdr.md) — UberSDR directory API, its Kiwi emulation (opt-in), native IQ, HPSDR/Soapy bridges
 - [kiwisdr-streams.md](research/kiwisdr-streams.md) — KiwiSDR SND/W/F wire format, channel pairing, server zoom and audio–waterfall sync, read from the server source
 - [spyserver-streams.md](research/spyserver-streams.md) — SpyServer measured on public servers: PONG as the retune marker, FFT dB mapping and span, IQ slide limits, shared mode
+- [openwebrx.md](research/openwebrx.md) — OpenWebRX/OpenWebRX+ protocol read from source, the 48 kHz IQ mode of OpenWebRX+ 1.2.129+, Receiverbook's embedded JSON list (1 242 receivers)
 - [forks/](research/forks/README.md) — fork landscape and per-fork merge reviews
 
 **Todo**

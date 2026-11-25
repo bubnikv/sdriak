@@ -71,3 +71,17 @@ TLS, plenty of `available_clients`, `load_status` `ok`.
 Pick servers from `https://airspy.com/directory/status.json`: online,
 `fullControlAllowed`, at least three free slots. Many listed servers are not
 reachable from outside; check with a plain TCP connect first, one at a time.
+
+## OpenWebRX+ (`openwebrx/`)
+
+| script | purpose |
+|--------|---------|
+| `owrxsession.py` | one receiver session over `/ws/`: `python owrxsession.py https://host/ out.pkl`. Handshake, `connectionproperties`, `mod=iq` at the strongest steady carrier of the server FFT (or offset 0), ±24 kHz cuts, four `offset_freq` retunes. Never changes the profile, which would move the band for other listeners and adds to the server's bot-ban score |
+| `owrxanalyze.py` | offline analysis: FFT size, rate and dB range; IQ rate by arrival, level, both spectrum halves, passband shape; the retune switch, by template match and by tracking the carrier |
+| `owrxcommon.py` | OpenWebRX's IMA ADPCM (the FFT rows' per-frame coding) |
+
+Pick receivers from the JSON literal `var receivers = [...]` embedded in
+`https://www.receiverbook.de/map`: `type` `OpenWebRX`, `version` 1.2.129 or
+later (the `iq` mode). Check the websocket upgrade first; receivers behind
+Cloudflare may answer 403. The analyser needs numpy, so run it without
+`python -I`.
