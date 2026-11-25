@@ -60,6 +60,11 @@ source stream to `server::setInput()` (compressor, handler sink, network), and
     fixed-size producers at low sample rates,
   * the input ring adds 0 to about 155 ms, depending on its backlog,
   * network sources add 100–250 ms of prebuffer.
+* **The waterfall is computed locally from the IQ** unless the source
+  supplies the server's spectrum. Without one, a network source cannot show
+  a wider spectrum than the IQ its link carries: 12 kHz for KiwiSDR.
+  `kiwisdr_source`, `spyserver_source` (VFO+FFT mode) and `ubersdr_source`
+  supply one (§10).
 
 ---
 
@@ -222,6 +227,11 @@ That is usually one thread; network sources can have more.
 
   A target of 0 bypasses it, leaving only the `StreamLink`. This is the only
   place where a local clock paces the IQ stream.
+* **Network sources deliver one IQ stream** at the rate they report to
+  `core::setInputSampleRate()`. The FFT branch (§2.2) computes the waterfall
+  from that stream, unless the source registers a `SpectrumProvider` (§10).
+  `ubersdr_source` can also feed single VFOs from secondary streams of their
+  own.
 * **`file_source` has no pacing.** Its worker reads `sampleRate / 200` blocks
   and calls `swap()` as fast as they are accepted, so the playback rate comes
   from back-pressure alone, and in the end from the audio device clock. That is
@@ -333,6 +343,10 @@ stalls all the others and pushes back upstream.
 
 `updateFFTPath()` briefly stops `fftSink` and starts the next frame from
 scratch. It does not touch the VFOs.
+
+The waterfall's span (`WaterFall::setBandwidth()`) is always the effective
+input rate: `core::setInputSampleRate()` sets it and resets the zoom. No
+path lets a source supply the spectrum or a span wider than its IQ (§10).
 
 **5. `RxVFO` (`core/src/dsp/channel/rx_vfo.h`): 1 thread per VFO.**
 
@@ -1092,6 +1106,9 @@ Ordered by payoff for the effort.
   `af_nr.h`, `logmmse.h`, `omlsa_mcra/Datablock_Read.cpp`)
 * `source_modules/audio_source`, `file_source`, `kiwisdr_source`,
   `sdriak_server_source`
+* §10: `source_modules/spyserver_source/src/spyserver_protocol.h`,
+  `core/src/utils/proto/kiwisdr.{h,cpp}`, `core/src/server_protocol.h`,
+  `source_modules/hermes_source/src/hermes.h`, `core/src/gui/tuner.cpp`
 
 ---
 
@@ -1120,3 +1137,231 @@ Ordered by payoff for the effort.
 
 Items 1, 2 and 4 cost almost nothing and would confirm or refute §6.4
 directly.
+
+---
+
+## 10. Server-side spectrum for network sources
+
+Implemented in core and in `kiwisdr_source`, `spyserver_source` (VFO+FFT
+mode) and `ubersdr_source`, following
+[todo/network-sources/](../todo/network-sources/README.md); none of it has
+been through GUI testing yet. This section records how jp's fork does it for
+SpyServer, what each of our network protocols can supply, and the design
+that covers all of them. jp's code is read from
+[`jprincl/SDRPlusPlus-jp`](https://github.com/jprincl/SDRPlusPlus-jp) at
+`c48ba994` (v1.7.0-beta, 2026-11-04). The core hooks sit on our tree of
+2026-07-21, from before the reshaper removal. Across jp's branches and tags,
+`source_modules/spyserver_vfo_source` is the only user of this path; no other
+jp source, F4JTV's SwissKnifeEdition, upstream, or any other fork we track has
+one.
+
+### 10.1 Why it matters
+
+Without a server spectrum, the waterfall is as wide as the IQ the link
+carries (§2.1, §2.2):
+
+* **KiwiSDR.** The IQ stream is 12 kS/s, so the waterfall is 12 kHz wide.
+  The Kiwi's own waterfall covers 0–30 MHz.
+* **SpyServer.** A wide waterfall needs full-rate IQ. For example, 10 MS/s of
+  Int16 IQ from an Airspy R2 is 40 MB/s. In VFO+FFT mode the same view
+  costs one narrow IQ channel plus one spectrum line per frame. 39 kS/s of
+  Int16 is 156 kB/s, and 2 048 one-byte bins at 15 frames/s is 30 kB/s.
+* **SDRIAK server.** The server ships its whole input band to every client,
+  compressed.
+
+### 10.2 jp's SpyServer VFO+FFT source
+
+`spyserver_vfo_source` is a separate module from `spyserver_source`, with
+its own copy of the protocol header and client. It runs the server in
+`SPYSERVER_STREAM_MODE_FFT_IQ`: a narrow IQ channel for demodulation and an
+independently tuned and decimated FFT stream for the waterfall.
+
+**Session setup, in this order** (`start()`):
+
+1. IQ: `IQ_FORMAT`, `IQ_DECIMATION`, `IQ_FREQUENCY`.
+2. FFT: `FFT_FORMAT` = UInt8, `FFT_DB_OFFSET`, `FFT_DB_RANGE`,
+   `FFT_DISPLAY_PIXELS` = 2 048, `FFT_FREQUENCY`, `FFT_DECIMATION`.
+3. `STREAMING_MODE` = FFT_IQ, and only then `GAIN` and `IQ_DIGITAL_GAIN`.
+   jp found that a digital gain sent before the mode change over-drives
+   the IQ; the comment's explanation is that the server re-stages gain when
+   the mode changes.
+4. `STREAMING_ENABLED`.
+
+**Spans.** IQ stages start at `MinimumIQDecimation`, which is how the server
+enforces its `maximum_bandwidth` cap. FFT stages start at 0, because that cap
+limits only the IQ width. The displayed FFT span is taken as
+`MaximumBandwidth / 2^stage`, the alias-free width (0.8 × the sample rate on
+an R2, 0.859 on an HF+). The combo box labels it as
+`MaximumSampleRate / 2^stage`. Both the cap reading and the span rule were
+found by experiment, because the server is closed source.
+
+**Core hooks** (five, all small):
+
+| hook | what it does |
+|------|--------------|
+| `IQFrontEnd::setExternalFFTMode(bool)` | the FFT handler returns at once, so the local FFT of the narrow IQ is skipped (the IQ still flows through the FFT branch) |
+| `IQFrontEnd::pushExternalFFT(data, count)` | takes the waterfall buffer (`buf_mtx`), resamples `count` bins to the local FFT size by nearest neighbour, then `pushFFT()` |
+| `core::setDisplayBandwidth(bw)` | after `setInputSampleRate(iqRate)`, widens the waterfall to the FFT span and resets the zoom |
+| `VFOManager::setDspOffset()` / `getCenterOffset()` | sets the `RxVFO` mixer apart from the waterfall VFO's offset; `updateFromWaterfall()` stops pushing `centerOffset` to the DSP whenever external mode is on |
+| `SourceHandler::supportsPostDecimation` | hides the Source menu's decimation control, which would collapse the widened span by calling `setInputSampleRate()` again |
+
+**Tuning.** There are two frequencies:
+
+* **FFT centre.** `tune()` records the hardware-domain centre in
+  `pendingFftFreq`. The poll thread below sends it as `FFT_FREQUENCY` whenever
+  it differs from the last value sent.
+* **IQ centre.** A poll thread runs every 40 ms. It reads the offset of
+  `gui::waterfall.selectedVFO` and computes the wanted IQ centre, centre ±
+  offset (the sign flips with Invert IQ). It clamps that to
+  ±(`MaximumSampleRate` − IQ rate)/2 around the centre and sends
+  `IQ_FREQUENCY`, at most 8 times a second.
+* **Local mixer.** The same thread sets the mixer to the remainder,
+  `getCenterOffset() + (centre − sentIq)`. That is ±bw/2 for SSB and 0 for
+  symmetric modes when the server reaches the wanted frequency. When it
+  cannot, the remainder covers the shortfall.
+* **Result.** Normal tuning behaves like SDR#: the FFT stays put and the IQ
+  follows the VFO. Center tuning moves both together.
+
+**Data path.**
+
+* **Spectrum.** UInt8 bins become dB as `offset − range·(1 − b/255)`, where
+  `offset` and `range` are the values the client requested. The server does
+  not document this mapping; it was reconstructed. Measured, the offset's
+  sign is the other way round ([spyserver-streams.md](../research/spyserver-streams.md) §2.3). DINT4 FFT frames are
+  ignored. Invert IQ reverses the bin order.
+* **Waterfall timing.** The waterfall gets one line per server frame. The
+  Display menu's FFT rate and window have no effect, and its FFT size only
+  sets the bin count the server bins are resampled to.
+* **Thread.** `pushExternalFFT()` runs on the client's network read thread,
+  which also decodes the IQ and calls `iqStream.swap()`.
+
+The same module also adds a raw-IQ peak/rail meter and an automatic
+digital-gain servo (fast attack, slow release, rail-fraction step on hard
+clip, ceiling from the per-device formula). See
+[jp.md](../research/forks/jp.md) §4.
+
+### 10.3 Weaknesses of jp's version
+
+1. **One VFO.** Only the selected VFO steers the IQ window and gets a
+   remainder offset. In external mode `updateFromWaterfall()` no longer
+   updates any VFO's DSP offset. So a second radio, or a decoder's helper
+   VFO, keeps a stale mixer offset, and its passband may lie outside the
+   narrow IQ altogether: wrong audio or silence, with nothing in the UI to
+   say so. Wideband consumers on `split` (baseband recorder, `iq_exporter`,
+   the CW skimmer, the scanner) get only the narrow IQ.
+2. **The flag means two things.** "External FFT" also means "the source owns
+   the DSP offset", so any future external-spectrum source inherits the
+   VFO-offset suppression.
+3. **The network thread waits on the UI.** `pushExternalFFT()` takes
+   `buf_mtx` on the thread that also receives IQ. A long UI critical section
+   stalls IQ reception. Going the other way, back-pressure on
+   `iqStream.swap()` delays spectrum lines. This is the coupling of §2.2,
+   moved into the network client.
+4. **Threads race.** The poll thread reads `gui::waterfall.selectedVFO` (a
+   `std::string`) and the `VFOManager` map, which the UI thread mutates, with
+   no lock.
+5. **A transient on each retune.** The remainder is computed from the IQ
+   centre the thread wants to send (`sentIq`), even when the rate limiter
+   holds the send back. It also takes effect at once, while samples at the
+   old centre are still in flight. Each retune is therefore mistuned for up
+   to 125 ms plus one round trip. FFT frames carry no centre frequency
+   either, so the first lines after a retune are drawn at the new centre.
+   `CLIENT_SYNC` reports `IQCenterFrequency` and `FFTCenterFrequency`;
+   whether the server sends it on every change is untested.
+6. **Wasted copying.** The 2 048 server bins are upsampled to the local FFT
+   size, 65 536 by default, then zoomed back down to pixels.
+7. **Zoom is not passed to the server.** The span is a menu combo. Waterfall
+   zoom just magnifies the 2 048 bins instead of asking for a narrower
+   `FFT_DECIMATION`.
+8. **The span depends on call order.** A later `setInputSampleRate()` from
+   any path collapses the span to the IQ rate. Re-selecting the source and
+   `setDecimation()` are patched by ordering and by hiding the control.
+9. **Levels don't match.** Server dB has no relation to our dBFS
+   normalisation (§2.2), so the waterfall's min/max and the VFO SNR readout
+   change meaning when the source is switched.
+10. **No body-size check.** The forked client reads `BodySize` straight off
+    the wire into a 1 MB buffer. Our `spyserver_client.cpp` checks this
+    bound; jp's copy does not.
+
+### 10.4 What our network sources can supply
+
+| source | server-side spectrum | notes |
+|--------|----------------------|-------|
+| `kiwisdr_source` | a second websocket `/<ts>/W/F`, paired to the SND channel by `<ts>`: 1 024 bins per line, absolute dBm (`byte − 255 + wf_cal`), zoom 0…`zoom_max` spanning `ui_srate / 2^zoom` and clamped inside the band, 1 / 5 / 13 / 23 frames/s, each frame echoing its own start, zoom and the SND `seq` | the biggest gain, because our IQ is 12 kS/s. The W/F socket must open **before** SND, and it can be refused while SND succeeds. Retunes are marked in-band by the SND `NEW_FREQ` flag. Full analysis: [kiwisdr-streams.md](../research/kiwisdr-streams.md). |
+| `spyserver_source` | FFT stream, as in §10.2; the constants are already in our `spyserver_protocol.h` | IQ only by default; the VFO+FFT mode of this module (not a second module) uses `STREAM_MODE_FFT_IQ`. Measurements: [spyserver-streams.md](../research/spyserver-streams.md). |
+| `ubersdr_source` | `/ws/user-spectrum` v2: 1 024 bins, continuous zoom, frames timestamped on the IQ's clock, front-end dBFS | plus up to `vfos` − 1 secondary 12 kHz IQ streams for VFOs outside the primary window. [ubersdr.md](../research/ubersdr.md). |
+| `sdriak_server_source` | none yet; `PACKET_TYPE_VFO` and `PACKET_TYPE_FFT` have been in `core/src/server_protocol.h` since upstream, and nothing uses them | we control both ends. The server can compute the FFT from full-rate IQ and run one narrow DDC per client VFO, which removes jp's one-VFO limit. |
+| `hermes_source` | HPSDR protocol 1 wideband ADC data (bandscope), enabled by `METIS_CTRL_WIDEBAND`, which `hermes.h` already defines | raw ADC blocks, not a spectrum: computed locally, but fed through the same interface as a full-band view next to the narrow DDC IQ. |
+| `qmxserver_source` | its protocol header copies SpyServer's FFT settings, unused | the QMX is a 48 kHz device; a local FFT covers its span. |
+| `spectran_http_source` | unknown | we use `/stream?format=float32`; whether the RTSA HTTP server can stream spectra is unverified. |
+| `rtl_tcp_source`, `rfspace_source`, `network_source` | none | the protocols carry IQ only. |
+
+### 10.5 A general design
+
+Fix the weaknesses of §10.3 once in core, then give each source a small
+adapter. The phased implementation plan for SpyServer, which also builds
+these core pieces, is
+[todo/network-sources/](../todo/network-sources/README.md) (core-spectrum, kiwisdr, ubersdr, spyserver).
+
+1. **An explicit capability.**
+   * A source declares that it supplies the display spectrum, and separately
+     whether it moves the IQ window to follow VFOs.
+   * Core keeps a display span and centre that belong to the source.
+     `setInputSampleRate()` leaves them alone while a source owns them.
+   * This replaces jp's `setDisplayBandwidth()` call-order dependence and
+     the `supportsPostDecimation` flag.
+2. **Spectrum ingest without stalls.**
+   * `IQFrontEnd` unbinds `fftIn` from `split` while external, so it costs
+     no thread work and no splitter copy.
+   * The source publishes frames as {dB bins, start, span, presentation
+     time} into a small queue under its own mutex.
+   * The waterfall takes frames from that queue. It sets `rawFFTSize` to
+     the producer's bin count, and it drops frames while the UI holds
+     `buf_mtx`. A network thread never waits for the UI.
+   * Each frame states the geometry it was really computed at, and may
+     cover only part of the display (a KiwiSDR frame clamped at a band
+     edge, or frames in flight during a zoom or pan). It is mapped onto the
+     display span, with uncovered bins set to the floor.
+   * A presentation time holds each frame back by the audio path's delay
+     (the KiwiSDR prebuffer), so the waterfall does not run ahead of what
+     is heard. KiwiSDR echoes the SND `seq` in every waterfall line for
+     exactly this purpose.
+3. **Server zoom as a core interface.**
+   * The provider declares discrete zoom spans.
+   * While it is active, zoom input (slider, wheel, pinch) steps through
+     them instead of the local view zoom, and panning becomes a centre
+     request.
+   * The display span follows the confirmed zoom. The waterfall clears or
+     resamples its history on a span change.
+   * KiwiSDR needs this from the start: 1 024 bins at zoom 0 are 29 kHz
+     each. For SpyServer it maps onto `FFT_DECIMATION` stages.
+   * Details are in [kiwisdr-streams.md](../research/kiwisdr-streams.md).
+4. **VFO ownership on the UI thread.**
+   * The source subscribes to `VFOManager` offset and bandwidth changes
+     instead of polling GUI state from its own thread.
+   * It places the IQ window, or windows, and sets each VFO's remainder.
+   * It switches a remainder only when its window's retune has taken
+     effect: at the server's acknowledgement where the protocol has one,
+     otherwise after the last value actually sent.
+   * A VFO whose passband falls outside every window is marked in the UI
+     and muted, not silently mistuned.
+   * SpyServer and KiwiSDR have one IQ window per connection. The SDRIAK
+     server can serve one per VFO.
+   * UberSDR adds 12 kHz secondary streams (`vfo=N`). A VFO outside the
+     primary window is fed from its own stream through
+     `VFOManager::routeVFOInput()` (on `IQFrontEnd::routeVFOInput()`), with
+     a window offset of its own.
+5. **Level calibration, per provider.** The waterfall min/max and
+   auto-range are stored per spectrum provider.
+   * Each adapter maps its bins to dBFS, or to dBm where the server reports
+     it (Kiwi), with a per-source offset.
+   * The Display menu shows that FFT size, rate and window are inactive.
+6. **Wideband consumers.** The baseband recorder, `iq_exporter`, the CW
+   skimmer and the scanner check the capability and refuse to start, or
+   warn, when the IQ is narrower than the displayed span.
+
+Done: KiwiSDR W/F; SpyServer VFO+FFT as a mode of `spyserver_source`, with
+jp's session order, span rules and gain servo; UberSDR. Open:
+
+1. SDRIAK server FFT plus per-VFO DDC on the reserved packet types.
+2. The Hermes bandscope.

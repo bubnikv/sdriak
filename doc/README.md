@@ -56,6 +56,9 @@ itself belongs in `design/` or `todo/`. Fork surveys live in
 - [band-stacking.md](research/band-stacking.md) — what a band-stack register contains, when it is written, what a band boundary is
 - [nn-cw-decoders-denoisers.md](research/nn-cw-decoders-denoisers.md) — neural CW decoders and denoisers
 - [keyboard-shortcuts.md](research/keyboard-shortcuts.md) — this fork's bindings read from source, compared against gqrx/HDSDR/SDRangel/CubicSDR/Quisk
+- [ubersdr.md](research/ubersdr.md) — UberSDR directory API, its Kiwi emulation (opt-in), native IQ, HPSDR/Soapy bridges
+- [kiwisdr-streams.md](research/kiwisdr-streams.md) — KiwiSDR SND/W/F wire format, channel pairing, server zoom and audio–waterfall sync, read from the server source
+- [spyserver-streams.md](research/spyserver-streams.md) — SpyServer measured on public servers: PONG as the retune marker, FFT dB mapping and span, IQ slide limits, shared mode
 - [forks/](research/forks/README.md) — fork landscape and per-fork merge reviews
 
 **Todo**
@@ -63,6 +66,8 @@ itself belongs in `design/` or `todo/`. Fork surveys live in
 - [kiwisdr-ui.md](todo/kiwisdr-ui.md) — KiwiSDR map selector UI/UX
 - [band-picker.md](todo/band-picker.md) — F-INP band grid; acceptance checklist still open
 - [eibi-schedules-module.md](todo/eibi-schedules-module.md) — EiBi station schedules overlay module
+- [remote-receiver-browser.md](todo/remote-receiver-browser.md) — KiwiSDR map generalised: directory providers (KiwiSDR, UberSDR, SpyServer, recent/LAN), per-source probe/connect handlers, one map + list UI
+- [network-sources/](todo/network-sources/README.md) — server-side waterfall for KiwiSDR, UberSDR (new source) and SpyServer; TLS/proxy transport; core spectrum architecture (hierarchical plans)
 - [localization.md](todo/localization.md) — UI translation: gettext-model catalog with own runtime, `###` label IDs, CJK font atlas cost on ImGui 1.87, SmGui client-side translation, Android IME; seeded from lzh173's zh-CN branch
 - [cleanup.md](todo/cleanup.md) — mechanical improvements worth doing in passing, with what they actually cost
 
