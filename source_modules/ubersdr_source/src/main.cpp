@@ -262,7 +262,12 @@ private:
     }
 
     static void menuDeselected(void* ctx) {
-        flog::info("UberSDRSourceModule '{0}': Menu Deselect!", ((UberSDRSourceModule*)ctx)->name);
+        UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
+        // The UI tick stops with the selection: withdraw the provider and
+        // close the secondaries here, also on the way to the destructor
+        // (unregisterSource deselects first).
+        _this->unregisterProvider();
+        flog::info("UberSDRSourceModule '{0}': Menu Deselect!", _this->name);
     }
 
     // UI thread, once per frame while selected: the network thread only
@@ -894,6 +899,9 @@ private:
         UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
         if (_this->running.exchange(true)) { return; }
         if (_this->worker.joinable()) { _this->worker.join(); }
+        // UI thread. A stop() on a network thread leaves the provider and
+        // the secondaries to the UI tick; one may not have run since.
+        _this->unregisterProvider();
         _this->appliedRate = kIqModes[_this->iqModeId].rate;
         core::setInputSampleRate(_this->appliedRate);
         _this->headerRate = 0;
@@ -971,11 +979,16 @@ private:
         UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
         const bool wasRunning = _this->running.exchange(false);
         if (!wasRunning && !_this->client.running() && !_this->worker.joinable()) { return; }
-        _this->closeAllSecondaries();
+        // May run on the primary's network thread (a server close) or on the
+        // admission worker (a refusal), both through setPlayState(false), so
+        // no GUI work here: the secondaries, routed VFOs and the provider are
+        // UI-thread state, released by unregisterProvider() from the UI tick
+        // (running is false now), from menuDeselected() or from start().
         // Release a writer blocked in rawStream.swap() before joining the
         // network thread that is that writer.
         _this->rawStream.stopWriter();
-        if (_this->worker.joinable()) { _this->worker.join(); }
+        // On the worker itself, start() joins it.
+        if (_this->worker.joinable() && _this->worker.get_id() != std::this_thread::get_id()) { _this->worker.join(); }
         _this->spectrum.stop();
         _this->client.stop();
         {
