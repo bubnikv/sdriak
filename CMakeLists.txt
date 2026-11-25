@@ -43,6 +43,7 @@ option(OPT_BUILD_KCSDR_SOURCE "Build KCSDR Source Module (Dependencies: libkcsdr
 option(OPT_BUILD_KIWISDR_SOURCE "Build KiwiSDR WebSDR Source Module (no dependencies required)" ON)
 option(OPT_BUILD_LIMESDR_SOURCE "Build LimeSDR Source Module (Dependencies: liblimesuite)" OFF)
 option(OPT_BUILD_NETWORK_SOURCE "Build Network Source Module (no dependencies required)" ON)
+option(OPT_BUILD_OPENWEBRX_SOURCE "Build OpenWebRX+ Source Module (no dependencies required)" ON)
 option(OPT_BUILD_PERSEUS_SOURCE "Build Perseus Source Module (Dependencies: libperseus-sdr)" OFF)
 option(OPT_BUILD_PLUTOSDR_SOURCE "Build PlutoSDR Source Module (Dependencies: libiio, libad9361)" ON)
 option(OPT_BUILD_QMX_SOURCE "Build direct QMX USB Source Module (Dependencies: rtaudio or aaudio)" ON)
@@ -264,6 +265,7 @@ sdrpp_add_optional_modules(
     KIWISDR_SOURCE:source_modules/kiwisdr_source
     LIMESDR_SOURCE:source_modules/limesdr_source
     NETWORK_SOURCE:source_modules/network_source
+    OPENWEBRX_SOURCE:source_modules/openwebrx_source
     PERSEUS_SOURCE:source_modules/perseus_source
     PLUTOSDR_SOURCE:source_modules/plutosdr_source
     QMX_SOURCE:source_modules/qmx_source

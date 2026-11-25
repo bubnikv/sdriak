@@ -268,6 +268,8 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["LimeSDR Source"]["enabled"] = true;
     defConfig["moduleInstances"]["Network Source"]["module"] = "network_source";
     defConfig["moduleInstances"]["Network Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["OpenWebRX+ Source"]["module"] = "openwebrx_source";
+    defConfig["moduleInstances"]["OpenWebRX+ Source"]["enabled"] = true;
     defConfig["moduleInstances"]["PerseusSDR Source"]["module"] = "perseus_source";
     defConfig["moduleInstances"]["PerseusSDR Source"]["enabled"] = true;
     defConfig["moduleInstances"]["PlutoSDR Source"]["module"] = "plutosdr_source";
@@ -425,6 +427,7 @@ int sdrpp_main(int argc, char* argv[]) {
             "spyserver_source.so",
             "kiwisdr_source.so",
             "ubersdr_source.so",
+            "openwebrx_source.so",
 
             "network_sink.so",
             "audio_sink.so",
