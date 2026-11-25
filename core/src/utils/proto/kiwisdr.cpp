@@ -239,8 +239,10 @@ void KiwiSDRClient::init(const std::string& hostport) {
 }
 
 void KiwiSDRClient::handlePacket(const SndPacket& packet) {
-    if (haveSeq && packet.seq != lastSeq + 1) {
-        seqGapCount += (uint32_t)(packet.seq - lastSeq - 1);
+    if (haveSeq) {
+        // Forward gaps only (mod 2^32); a repeated or older seq is no loss.
+        const uint32_t step = packet.seq - lastSeq;
+        if (step > 1 && step < 0x80000000u) { seqGapCount += step - 1; }
     }
     haveSeq = true;
     lastSeq = packet.seq;

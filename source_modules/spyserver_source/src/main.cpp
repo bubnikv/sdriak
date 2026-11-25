@@ -984,7 +984,8 @@ private:
 
     // Server waterfall, UI thread.
     Provider provider;
-    bool providerRegistered = false;
+    // Written on the UI thread; the tune path reads it on any thread.
+    std::atomic<bool> providerRegistered{false};
     std::vector<double> fftSpans;       // span per FFT stage, widest first
     int wantStage = 0;
     FftGeometry sent;                   // last view sent

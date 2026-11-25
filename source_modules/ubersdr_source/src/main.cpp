@@ -1249,7 +1249,8 @@ private:
 
     // Server waterfall, UI thread.
     Provider provider;
-    bool providerRegistered = false;
+    // Written on the UI thread; the tune path reads it on any thread.
+    std::atomic<bool> providerRegistered{false};
     bool fellBack = false;       // core fell back this session
     std::vector<double> zoomLadder;
     double sentBinBandwidth = 0.0;

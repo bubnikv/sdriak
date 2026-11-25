@@ -991,7 +991,8 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     int wfSpeed = KiwiWaterfallClient::kMaxSpeed;
     // UI thread.
     Provider provider;
-    bool providerRegistered = false;
+    // Written on the UI thread; the tune path reads it on any thread.
+    std::atomic<bool> providerRegistered{false};
     std::vector<double> wfSpans;   // span per zoom, 0 ... zoom_cap
     int wantZoom = 0;
     int sentZoom = -1;
