@@ -344,8 +344,12 @@ void KiwiSDRTester::testThreadFn(std::string url, std::string loc, std::optional
             };
             testClient.onDisconnected = [&, hostPort, loc, url]() {
                 disconnectedFlag = true;
+                const std::string refused = testClient.refusalReason();
                 std::lock_guard<std::mutex> lock(stateMutex);
-                if (plannedDisconnect.load()) {
+                if (!refused.empty()) {
+                    status = "Server refused: " + refused + ": " + url;
+                }
+                else if (plannedDisconnect.load()) {
                     status = "Got some data. Server OK: " + url;
                     lastOkServer = OkServer{hostPort, loc, band};
                 }
@@ -374,6 +378,9 @@ void KiwiSDRTester::testThreadFn(std::string url, std::string loc, std::optional
                     std::this_thread::sleep_for(100ms);
                 }
                 flog::info("Disconnected ok");
+            }
+            else if (!testClient.refusalReason().empty()) {
+                setStatus("Server refused: " + testClient.refusalReason() + ": " + url);
             }
             else {
                 setStatus("Could not connect to server: " + url);

@@ -37,9 +37,14 @@
 #include <config.h>
 #include <dsp/buffer/prebuffer.h>
 #include "utils/proto/kiwisdr.h"
+#include "utils/proto/kiwisdr_wf.h"
+#include <signal_path/spectrum_provider.h>
+#include <signal_path/iq_window_policy.h>
 #include "utils/url.h"
 #include "gui/smgui.h"
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <filesystem>
 #include <optional>
 #include <utility>
@@ -95,6 +100,8 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     // Last native [lo, hi] pushed to sourceManager from the live-refine path,
     // so menuHandler only re-applies the limit when the served range changes.
     std::optional<std::pair<uint64_t, uint64_t>> appliedServedRange;
+    // Declared before kiwiSdrClient, which stops it from its destructor.
+    KiwiWaterfallClient wfClient;
     KiwiSDRClient kiwiSdrClient;
     std::string root;
     KiwiSDRMapSelector selector;
@@ -149,6 +156,9 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             if (configAccess.tryGet("kiwisdr_buffer_ms", storedBufferMs)) {
                 bufferMs = std::clamp<int>(storedBufferMs, BUFFER_MS_MIN, BUFFER_MS_MAX);
             }
+            serverWaterfall = configAccess.value("kiwisdr_server_waterfall", true);
+            wfSpeed = std::clamp<int>(configAccess.value("kiwisdr_wf_speed", KiwiWaterfallClient::kMaxSpeed),
+                                      KiwiWaterfallClient::kMinSpeed, KiwiWaterfallClient::kMaxSpeed);
             recent = configAccess.value("kiwisdr_recent", json());
         }
         // Parsed outside the access: loadRecent() walks the whole list and
@@ -157,12 +167,21 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
 
         kiwiSdrClient.init(kiwisdrHostPort());
         chain.init(&rawStream, &stream);
-        chain.setSampleRate(kiwiSdrClient.IQDATA_FREQUENCY);
+        appliedRate = kiwiSdrClient.audioRate();
+        chain.setSampleRate(appliedRate);
         chain.setPrebufferMsec(bufferMs.load(), false, false);
         kiwiSdrClient.onSamples = [this](const dsp::complex_t* samples, int count) {
             memcpy(rawStream.writeBuf, samples, count * sizeof(dsp::complex_t));
-            rawStream.swap(count);
+            if (rawStream.swap(count)) { sndPushed += (uint64_t)count; }
         };
+        // Before onSamples: the packet's first sample is the next input.
+        kiwiSdrClient.onPacket = [this](const KiwiSDRClient::SndPacket& packet) {
+            const uint64_t first = sndInputBase + sndPushed;
+            seqClock.record(packet.seq, chain.playoutTime(first));
+            commitIQWindow(packet, first);
+        };
+        wfClient.onFrame = [this](const KiwiWaterfallClient::Frame& frame) { onWaterfallFrame(frame); };
+        provider.module = this;
 
         // Yeah no server-ception, sorry...
         // Initialize lists
@@ -173,6 +192,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.uiTickHandler = uiTick;
         handler.stream = &stream;
 
         kiwiSdrClient.onConnected = [&]() {
@@ -197,6 +217,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // Server mode: the constructor returned before registering.
         if (core::args["server"].b()) { return; }
         stop(this);
+        wfClient.stop();
         sigpath::sourceManager.unregisterSource("KiwiSDR");
     }
 
@@ -361,18 +382,296 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
 
     static void menuSelected(void* ctx) {
         KiwiSDRSourceModule* _this = (KiwiSDRSourceModule*)ctx;
-        core::setInputSampleRate(12000); // fixed for kiwisdr
+        // The server's audio_rate (12000, 20250 on rx3.wf3), the default
+        // until one has reported it; uiTick follows later changes.
+        _this->appliedRate = _this->kiwiSdrClient.audioRate();
+        core::setInputSampleRate(_this->appliedRate);
         _this->applyFreqLimits();
         flog::info("KiwiSDRSourceModule '{0}': Menu Select!", _this->name);
     }
 
     static void menuDeselected(void* ctx) {
         KiwiSDRSourceModule* _this = (KiwiSDRSourceModule*)ctx;
+        _this->unregisterProvider();
         // Release the range constraint so a stale KiwiSDR band doesn't leak
         // into whatever source is selected next.
         sigpath::sourceManager.clearTuningLimits();
         _this->appliedServedRange.reset();
         flog::info("KiwiSDRSourceModule '{0}': Menu Deselect!", _this->name);
+    }
+
+    // UI thread, once per frame while selected: the network threads only
+    // store what the server reported; the DSP rate, the waterfall and the
+    // server waterfall's view change here.
+    static void uiTick(void* ctx) {
+        KiwiSDRSourceModule* _this = (KiwiSDRSourceModule*)ctx;
+        const int rate = _this->kiwiSdrClient.audioRate();
+        if (rate != _this->appliedRate) {
+            flog::info("KiwiSDRSourceModule '{0}': server audio rate {1}", _this->name, rate);
+            _this->appliedRate = rate;
+            core::setInputSampleRate(rate);
+            _this->applyBufferMode(true);
+            if (_this->providerRegistered) { sigpath::vfoManager.setIQWindow(_this->intendedW.load(), _this->iqWindowWidth()); }
+        }
+        _this->serverWaterfallTick();
+        if (_this->providerRegistered) { _this->placeIQWindow(); }
+        if (_this->running.load() && _this->connected.load()) { _this->sendIQTune(true); }
+    }
+
+    // Server waterfall (W/F) -------------------------------------------------
+
+    // The SpectrumProvider core sees; all calls on the UI thread.
+    struct Provider : public SpectrumProvider {
+        KiwiSDRSourceModule* module = nullptr;
+        std::string name() const override { return "KiwiSDR"; }
+        int binCount() const override { return KiwiWaterfallClient::kBins; }
+        std::vector<double> zoomSpans() const override { return module->wfSpans; }
+        void requestSpan(double spanHz) override { module->requestSpan(spanHz); }
+        bool available() const override {
+            return module->running.load() && module->wfClient.available();
+        }
+        std::string unavailableReason() const override { return module->wfClient.unavailableReason(); }
+        std::pair<float, float> defaultLevels() const override { return { -120.0f, -50.0f }; }
+    };
+
+    // Playout time of each recent SND packet by its seq: a W/F line carries
+    // the seq of the audio leaving when it was computed.
+    class SeqClock {
+    public:
+        void record(uint32_t seq, std::chrono::steady_clock::time_point t) {
+            std::lock_guard lck(m_mtx);
+            m_slots[seq % kSlots] = Slot{ seq, t, true };
+        }
+        std::optional<std::chrono::steady_clock::time_point> find(uint32_t seq) {
+            std::lock_guard lck(m_mtx);
+            const Slot& s = m_slots[seq % kSlots];
+            if (!s.valid || s.seq != seq) { return std::nullopt; }
+            return s.t;
+        }
+        void clear() {
+            std::lock_guard lck(m_mtx);
+            m_slots.fill(Slot{});
+        }
+    private:
+        static constexpr size_t kSlots = 256;
+        struct Slot {
+            uint32_t seq = 0;
+            std::chrono::steady_clock::time_point t{};
+            bool valid = false;
+        };
+        std::mutex m_mtx;
+        std::array<Slot, kSlots> m_slots{};
+    };
+
+    // IQ window -----------------------------------------------------------
+    //
+    // With the server waterfall, the SND stream is a window at C + W inside
+    // the displayed span; the VFOs keep their place and the window follows
+    // them (iq_window_policy.h). W is display-domain Hz from C.
+
+    // Usable window: the passband +-(rate/2 - 100) less 300 Hz of margin
+    // and the filter's roll-off on each side.
+    double iqWindowWidth() const { return (double)appliedRate - 600.0; }
+
+    // W in hardware Hz: Invert IQ mirrors the display.
+    double hardwareOffset(double w) const { return uiInvertIQ.load() ? -w : w; }
+
+    // UI thread, while the provider is registered: place the window over
+    // the VFOs, inside the receiver range.
+    void placeIQWindow() {
+        IQWindowInput in;
+        const std::string& selected = gui::waterfall.selectedVFO;
+        auto sel = gui::waterfall.vfos.find(selected);
+        if (sel != gui::waterfall.vfos.end()) { in.passbands.emplace_back(sel->second->lowerOffset, sel->second->upperOffset); }
+        for (auto const& [name, vfo] : gui::waterfall.vfos) {
+            if (name != selected) { in.passbands.emplace_back(vfo->lowerOffset, vfo->upperOffset); }
+        }
+        in.currentOffset = intendedW.load();
+        in.width = iqWindowWidth();
+        in.margin = 0.1 * in.width;
+        // Hardware limits: the whole passband inside 0 ... bandwidth.
+        const double half = (double)appliedRate / 2.0;
+        const double centreBb = lastTuneFrequency - (double)kiwiSdrClient.frequencyOffsetHz();
+        const double lo = half - centreBb;
+        const double hi = wfClient.setup().bandwidthHz - half - centreBb;
+        in.minOffset = uiInvertIQ.load() ? -hi : lo;
+        in.maxOffset = uiInvertIQ.load() ? -lo : hi;
+        const double w = chooseIQWindow(in);
+        if (std::fabs(w - intendedW.load()) >= 1.0) {
+            intendedW = w;
+            sigpath::vfoManager.setIQWindow(w, in.width);
+        }
+    }
+
+    // Send the SND tune for C + W. From tune() at once, from the UI tick
+    // when the window moved (rate-limited to 8 per second). A send that
+    // moves the window arms the commit (commitIQWindow).
+    void sendIQTune(bool rateLimited) {
+        std::lock_guard lck(iqTuneMtx);
+        const double w = providerRegistered ? intendedW.load() : 0.0;
+        const double hw = hardwareOffset(w);
+        const double freq = lastTuneFrequency + hw;
+        const auto now = std::chrono::steady_clock::now();
+        if (sentIqValid && std::fabs(freq - sentIqFreq) < 0.5) { return; }
+        if (rateLimited && now - lastIqSend < std::chrono::milliseconds(125)) { return; }
+        if (!sentIqValid || std::fabs(hw - sentHwW) >= 0.5) {
+            pendingW = w;
+            pendingSinceTicks = now.time_since_epoch().count();
+            pendingActive = true;
+        }
+        kiwiSdrClient.tune(freq, KiwiSDRClient::TUNE_IQ);
+        sentIqFreq = freq;
+        sentHwW = hw;
+        sentIqValid = true;
+        lastIqSend = now;
+    }
+
+    // SND thread, every packet before its samples: once the server applies a
+    // window move, commit the VFOs' DSP offsets at the sample where the IQ
+    // switched, muting around it. KiwiSDR flags the first packet after a
+    // retune (NEW_FREQ); the switch falls about 24 ms into it (research
+    // 8.2, 8.6). Without the flag (Kiwi-compatible servers, or none within
+    // 400 ms), commit at the first packet 150 ms after the command.
+    void commitIQWindow(const KiwiSDRClient::SndPacket& packet, uint64_t firstSample) {
+        if (!pendingActive.load()) { return; }
+        const double sr = kiwiSdrClient.sampleRate();
+        const auto since = std::chrono::steady_clock::now()
+                           - std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(pendingSinceTicks.load()));
+        const bool compatible = kiwiSdrClient.flavour() == KiwiSDRClient::Flavour::KiwiCompatible;
+        if (packet.newFreq && !compatible) {
+            pendingActive = false;
+            scheduleCommit(firstSample + (uint64_t)std::llround(0.024 * sr), pendingW.load(), 0.006, packet.count);
+            return;
+        }
+        const bool noFlag = compatible || since > std::chrono::milliseconds(400);
+        if (noFlag && since >= std::chrono::milliseconds(150)) {
+            pendingActive = false;
+            scheduleCommit(firstSample, pendingW.load(), 0.020, packet.count);
+        }
+    }
+
+    // Mute every VFO from halfMute before index to halfMute after it, and
+    // commit W at index. A marker fires before the whole output block that
+    // holds its sample, so the mute also covers one block.
+    void scheduleCommit(uint64_t index, double w, double halfMute, int packetSamples) {
+        const double sr = kiwiSdrClient.sampleRate();
+        const uint64_t half = (uint64_t)std::llround(halfMute * sr);
+        const int block = std::max(packetSamples, (int)std::lround(0.010 * sr));
+        const int muteSamples = (int)(2 * half) + block;
+        chain.scheduleMarker(index > half ? index - half : 0, [muteSamples] { sigpath::vfoManager.muteAllFor(muteSamples); });
+        chain.scheduleMarker(index, [w] { sigpath::vfoManager.commitIQWindowOffset(w); });
+    }
+
+    // UI thread: the deepest zoom whose span still covers spanHz.
+    void requestSpan(double spanHz) {
+        int zoom = 0;
+        for (int z = 0; z < (int)wfSpans.size(); z++) {
+            if (wfSpans[(size_t)z] >= spanHz * (1.0 - 1e-9)) { zoom = z; }
+        }
+        wantZoom = zoom;
+    }
+
+    void serverWaterfallTick() {
+        // What the W/F thread needs to place a frame in the display domain.
+        uiTuningOffset = sigpath::sourceManager.getTuningOffset();
+        uiCentre = gui::waterfall.getCenterFrequency();
+        uiInvertIQ = sigpath::iqFrontEnd.getInvertIQ();
+
+        // Core takes the provider away when it reports unavailable.
+        if (providerRegistered && sigpath::iqFrontEnd.spectrumProvider() != &provider) {
+            providerRegistered = false;
+        }
+        // Stopped or switched off: this source withdraws the provider. A
+        // waterfall that fails mid-session is left to core, which falls back
+        // to the local FFT with a notice; it is not registered again until
+        // the next session.
+        if (!(serverWaterfall && running.load() && connected.load())) {
+            unregisterProvider();
+            return;
+        }
+
+        const KiwiWaterfallClient::Setup setup = wfClient.setup();
+        if (!providerRegistered) {
+            if (!wfClient.available() || sigpath::iqFrontEnd.spectrumProvider() != nullptr) { return; }
+            wfSpans.clear();
+            for (int z = 0; z <= setup.zoomCap; z++) { wfSpans.push_back(KiwiWaterfallClient::zoomSpanHz(setup, z)); }
+            sigpath::iqFrontEnd.setSpectrumProvider(&provider);
+            providerRegistered = true;
+            wantZoom = 0;
+            sentZoom = -1;
+            appliedZoom = -1;
+            intendedW = 0.0;
+            sigpath::vfoManager.setIQWindow(0.0, iqWindowWidth());
+        }
+
+        // The span the frames say the server computes.
+        int zoom = frameZoom.load();
+        if (zoom < 0) { zoom = wantZoom; }
+        if (zoom != appliedZoom && zoom >= 0 && zoom < (int)wfSpans.size()) {
+            appliedZoom = zoom;
+            core::setDisplaySpan(wfSpans[(size_t)zoom]);
+        }
+
+        // View: zoom and centre (baseband kHz), at most 8 sends per second;
+        // a held-back change goes out once the interval has passed.
+        const double cfKhz = (lastTuneFrequency - (double)kiwiSdrClient.frequencyOffsetHz()) / 1e3;
+        const auto now = std::chrono::steady_clock::now();
+        const bool changed = (wantZoom != sentZoom) || std::fabs(cfKhz - sentCfKhz) >= 0.001;
+        if (changed && now - lastViewSend >= std::chrono::milliseconds(125)) {
+            wfClient.setView(wantZoom, cfKhz);
+            sentZoom = wantZoom;
+            sentCfKhz = cfKhz;
+            lastViewSend = now;
+        }
+    }
+
+    // UI thread.
+    void unregisterProvider() {
+        if (!providerRegistered) { return; }
+        providerRegistered = false;
+        if (sigpath::iqFrontEnd.spectrumProvider() == &provider) {
+            sigpath::iqFrontEnd.setSpectrumProvider(nullptr);
+        }
+        core::clearDisplaySpan();
+        // W = 0 at once; the retune to C follows from the UI tick.
+        sigpath::vfoManager.clearIQWindow();
+        intendedW = 0.0;
+        appliedZoom = -1;
+    }
+
+    // W/F thread: one line to core, in the display domain.
+    void onWaterfallFrame(const KiwiWaterfallClient::Frame& frame) {
+        if (!connected.load() || frame.count <= 0) { return; }
+        const KiwiWaterfallClient::Setup setup = wfClient.setup();
+        wfFrame.bins.resize((size_t)frame.count);
+        for (int i = 0; i < frame.count; i++) {
+            wfFrame.bins[(size_t)i] = KiwiWaterfallClient::binDbm(setup, frame.bins[i]);
+        }
+        const double span = KiwiWaterfallClient::zoomSpanHz(setup, frame.zoom) * frame.count / KiwiWaterfallClient::kBins;
+        double start = KiwiWaterfallClient::frameStartHz(setup, frame.xBin)
+                       + (double)kiwiSdrClient.frequencyOffsetHz() + uiTuningOffset.load();
+        if (uiInvertIQ.load()) {
+            std::reverse(wfFrame.bins.begin(), wfFrame.bins.end());
+            start = 2.0 * uiCentre.load() - (start + span);
+        }
+        wfFrame.startHz = start;
+        wfFrame.spanHz = span;
+        wfFrame.presentAt = presentAt(frame.seq);
+        frameZoom.store(frame.zoom);
+        // The queue swaps in an older buffer, which the next frame reuses.
+        sigpath::iqFrontEnd.pushSpectrum(std::move(wfFrame));
+    }
+
+    // When the line should appear: with the audio of its seq on KiwiSDR
+    // firmware, else (no seq match, or a Kiwi-compatible server's unrelated
+    // seq) after the audio now in the prebuffer.
+    std::chrono::steady_clock::time_point presentAt(uint32_t seq) {
+        if (kiwiSdrClient.flavour() == KiwiSDRClient::Flavour::KiwiSDR) {
+            if (auto t = seqClock.find(seq)) { return *t; }
+        }
+        const double delay = (double)chain.bufferedSamples() / kiwiSdrClient.sampleRate();
+        return std::chrono::steady_clock::now()
+               + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(delay));
     }
 
     static void start(void* ctx) {
@@ -385,6 +684,20 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             _this->applyBufferModeLocked(true);
             _this->chain.start();
         }
+        _this->seqClock.clear();
+        _this->frameZoom = -1;
+        // The link has consumed everything pushed so far; this session's
+        // samples continue its input count.
+        _this->sndInputBase = _this->chain.samplesIn();
+        _this->sndPushed = 0;
+        {
+            std::lock_guard lck(_this->iqTuneMtx);
+            _this->sentIqValid = false;
+            _this->pendingActive = false;
+        }
+        _this->kiwiSdrClient.waterfall = _this->serverWaterfall ? &_this->wfClient : nullptr;
+        _this->kiwiSdrClient.waterfallSpeed = _this->wfSpeed;
+        _this->kiwiSdrClient.waterfallCfKhz = _this->lastTuneFrequency / 1e3;
         _this->kiwiSdrClient.start();
         flog::info("KiwiSDRSourceModule '{0}': Start!", _this->name);
     }
@@ -417,7 +730,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     }
 
     void applyBufferModeLocked(bool resetBuffer) {
-        chain.setSampleRate(kiwiSdrClient.IQDATA_FREQUENCY);
+        chain.setSampleRate(appliedRate);
         // A live mode switch re-plumbs the link while the KiwiSDR network
         // thread may sit blocked in rawStream.swap(); release it for the
         // duration of the switch (it tolerates the dropped block).
@@ -435,7 +748,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         KiwiSDRSourceModule* _this = (KiwiSDRSourceModule*)ctx;
         _this->lastTuneFrequency = freq;
         if (_this->running.load() && _this->connected.load()) {
-            _this->kiwiSdrClient.tune(freq, KiwiSDRClient::TUNE_IQ);
+            _this->sendIQTune(false);
         }
         flog::info("KiwiSDRSourceModule '{0}': Tune: {1}!", _this->name, freq);
     }
@@ -545,6 +858,15 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         if (!_this->kiwisdrLoc.empty())
             SmGui::TextF("Loc: %s", _this->kiwisdrLoc.c_str());
         SmGui::TextF("Status: %s", _this->kiwiSdrClient.getConnectionStatus().c_str());
+        if (_this->connected.load()) {
+            const KiwiSDRClient& c = _this->kiwiSdrClient;
+            const char* server = c.flavour() == KiwiSDRClient::Flavour::KiwiSDR          ? "KiwiSDR"
+                                 : c.flavour() == KiwiSDRClient::Flavour::KiwiCompatible ? "Kiwi-compatible"
+                                                                                         : "?";
+            SmGui::TextF("%s, %.3f S/s, RSSI %.0f dBm", server, c.sampleRate(), c.rssiDbm());
+            if (c.seqGaps() > 0) { SmGui::TextF("Lost packets: %llu", (unsigned long long)c.seqGaps()); }
+            if (c.adcOverloadRecent()) { SmGui::TextF("ADC overload"); }
+        }
 
         std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         auto tmm = safeLocalTime(t);
@@ -561,6 +883,35 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             _this->bufferMs.store(bufMs);
             _this->applyBufferMode(true);
             config.edit().set("kiwisdr_buffer_ms", bufMs);
+        }
+
+        // Server waterfall: opened with the session, so the switch applies
+        // on the next start; the speed applies live.
+        ImGui::BeginDisabled(playing);
+        if (ImGui::Checkbox(("Server waterfall##_kiwisdr_wf_" + _this->name).c_str(), &_this->serverWaterfall)) {
+            config.edit().set("kiwisdr_server_waterfall", _this->serverWaterfall);
+        }
+        ImGui::EndDisabled();
+        if (_this->serverWaterfall) {
+            static const char* kSpeeds = "1 fps\0" "5 fps\0" "13 fps\0" "23 fps\0";
+            int speedId = _this->wfSpeed - KiwiWaterfallClient::kMinSpeed;
+            ImGui::LeftLabel("Waterfall speed");
+            ImGui::FillWidth();
+            if (ImGui::Combo(("##_kiwisdr_wf_speed_" + _this->name).c_str(), &speedId, kSpeeds)) {
+                _this->wfSpeed = speedId + KiwiWaterfallClient::kMinSpeed;
+                _this->wfClient.setSpeed(_this->wfSpeed);
+                config.edit().set("kiwisdr_wf_speed", _this->wfSpeed);
+            }
+            if (playing && _this->connected.load()) {
+                if (_this->providerRegistered) {
+                    const auto setup = _this->wfClient.setup();
+                    SmGui::TextF("Waterfall: server, zoom %d of %d", std::max(_this->appliedZoom, 0), setup.zoomCap);
+                }
+                else {
+                    const std::string reason = _this->wfClient.unavailableReason();
+                    SmGui::TextF("Waterfall: local (%s)", reason.empty() ? "server waterfall unavailable" : reason.c_str());
+                }
+            }
         }
 
         KiwiSDRClient::AgcSettings agc = _this->kiwiSdrClient.getAgc();
@@ -610,6 +961,48 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     // client's network thread.
     std::mutex bufferModeMtx;
     SourceManager::SourceHandler handler;
+    // The rate the DSP and the prebuffer run at; GUI thread.
+    int appliedRate = KiwiSDRClient::kDefaultAudioRate;
+
+    // Server waterfall settings (config), UI thread.
+    bool serverWaterfall = true;
+    int wfSpeed = KiwiWaterfallClient::kMaxSpeed;
+    // UI thread.
+    Provider provider;
+    bool providerRegistered = false;
+    std::vector<double> wfSpans;   // span per zoom, 0 ... zoom_cap
+    int wantZoom = 0;
+    int sentZoom = -1;
+    double sentCfKhz = 0.0;
+    int appliedZoom = -1;          // zoom whose span core shows
+    std::chrono::steady_clock::time_point lastViewSend{};
+    // Written on the UI thread, read on the W/F thread.
+    std::atomic<double> uiTuningOffset{0.0};
+    std::atomic<double> uiCentre{0.0};
+    std::atomic<bool> uiInvertIQ{false};
+    // W/F thread.
+    SpectrumFrame wfFrame;
+    std::atomic<int> frameZoom{-1};  // zoom of the latest frame
+    SeqClock seqClock;
+
+    // IQ window. intendedW: UI thread writes, the tune path reads.
+    std::atomic<double> intendedW{0.0};
+    // Last SND tune sent; guarded by iqTuneMtx (tune() may come from any
+    // thread).
+    std::mutex iqTuneMtx;
+    bool sentIqValid = false;
+    double sentIqFreq = 0.0;
+    double sentHwW = 0.0;
+    std::chrono::steady_clock::time_point lastIqSend{};
+    // A window move the server has not applied yet: set by sendIQTune(),
+    // consumed on the SND thread.
+    std::atomic<bool> pendingActive{false};
+    std::atomic<double> pendingW{0.0};
+    std::atomic<int64_t> pendingSinceTicks{0};
+    // SND thread: the link's input index of the next pushed sample is
+    // sndInputBase + sndPushed.
+    uint64_t sndInputBase = 0;
+    uint64_t sndPushed = 0;
 
     std::shared_ptr<KiwiSDRClient> client;
 };

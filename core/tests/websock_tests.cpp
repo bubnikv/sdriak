@@ -6,16 +6,25 @@
 // refused upgrade and a refused connect; stop during the handshake; ten
 // stop/start cycles on one client; sends from a second thread while frames
 // stream in; a peer that drops TCP without a close frame.
+// KiwiSDRClient: SND packet parsing and refusal wording, then a fake Kiwi on
+// loopback (/VER, the krec path, the setup order, the server's 20250 rate in
+// SET AR OK and the passband, flagged and little-endian packets, a seq gap,
+// ADC overload) and a fake Kiwi that answers too_busy.
 //
 // `websock_tests --live <url> [--kiwi]` instead opens one real connection
 // (for wss:// checks); "{ts}" in the url is replaced by the time in ms.
 // `websock_tests --kiwi-client host:port` runs KiwiSDRClient's whole connect
 // path once: the /VER scheme probe, then the websocket, until IQ arrives;
 // with --via-test-proxy after it, through the in-process authenticating proxy.
+// `websock_tests --kiwi-waterfall host:port [kHz]` runs one session with the
+// server waterfall: W/F first, then SND; zoom 0, then zoom 8 around the
+// tuned frequency (default 10 000 kHz); prints the setup and each zoom's
+// frames.
 #include <utils/base64.h>
 #include <utils/networking.h>
 #include <utils/proto/picohash.h>
 #include <utils/proto/kiwisdr.h>
+#include <utils/proto/kiwisdr_wf.h>
 #include <utils/proto/websock.h>
 #include <utils/proxy.h>
 
@@ -25,11 +34,14 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -272,7 +284,8 @@ namespace {
                     catch (...) {}
                     index++;
                 }
-                peer.conn->close();
+                // A handler may take the connection to serve it on a thread.
+                if (peer.conn) { peer.conn->close(); }
                 if (req.ok) {
                     std::lock_guard<std::mutex> lock(m_mtx);
                     m_handled++;
@@ -781,6 +794,398 @@ namespace {
         return (!run.failed() && !c.msgs.empty()) ? 0 : 1;
     }
 
+    // ---- KiwiSDRClient ----
+
+    void putLE32(std::string& m, uint32_t v) {
+        for (int i = 0; i < 4; i++) { m.push_back((char)(v >> (8 * i))); }
+    }
+
+    // A SND message: IQ (flag 0x08) or real, samples I = k, Q = -k.
+    std::string sndPacket(uint8_t flags, uint32_t seq, uint16_t smeter, int count) {
+        std::string m = "SND";
+        m.push_back((char)flags);
+        putLE32(m, seq);
+        m.push_back((char)(smeter >> 8));
+        m.push_back((char)(smeter & 0xff));
+        const bool iq = (flags & KiwiSDRClient::kFlagIq) != 0;
+        const bool le = (flags & KiwiSDRClient::kFlagLittleEndian) != 0;
+        if (iq) {
+            m.push_back((char)7);
+            m.push_back((char)0);
+            putLE32(m, 1000 + seq);
+            putLE32(m, 500);
+        }
+        auto put16 = [&](int16_t v) {
+            const uint16_t u = (uint16_t)v;
+            if (le) { m.push_back((char)(u & 0xff)); m.push_back((char)(u >> 8)); }
+            else { m.push_back((char)(u >> 8)); m.push_back((char)(u & 0xff)); }
+        };
+        for (int k = 0; k < count; k++) {
+            put16((int16_t)k);
+            if (iq) { put16((int16_t)-k); }
+        }
+        return m;
+    }
+
+    bool approxEqual(float a, float b) { return std::fabs(a - b) < 1e-6f; }
+
+    void kiwiParseSnd() {
+        KiwiSDRClient::SndPacket p;
+        std::vector<dsp::complex_t> buf;
+        require(KiwiSDRClient::parseSndPacket(sndPacket(0x0d, 7, 700, 512), p, buf), "IQ packet not parsed");
+        require(p.iq && p.newFreq && !p.adcOverload && p.seq == 7 && p.count == 512, "IQ header: count " + std::to_string(p.count));
+        require(approxEqual(p.rssiDbm, -57.0f) && p.lastGpsSolution == 7 && p.gpsSec == 1007 && p.gpsNsec == 500, "IQ S-meter / GPS fields");
+        require(approxEqual(p.samples[5].re, 5 / 32767.0f) && approxEqual(p.samples[5].im, -5 / 32767.0f), "IQ big-endian samples");
+        require(KiwiSDRClient::parseSndPacket(sndPacket(0x8a, 8, 0, 240), p, buf), "little-endian packet not parsed");
+        require(p.count == 240 && p.adcOverload && !p.newFreq, "240-sample packet with overload");
+        require(approxEqual(p.samples[239].re, 239 / 32767.0f) && approxEqual(p.samples[239].im, -239 / 32767.0f), "IQ little-endian samples");
+        require(KiwiSDRClient::parseSndPacket(sndPacket(0x00, 9, 0, 512), p, buf), "real packet not parsed");
+        require(!p.iq && p.count == 512 && approxEqual(p.samples[3].re, 3 / 32767.0f) && p.samples[3].im == 0.0f, "real samples");
+        require(!KiwiSDRClient::parseSndPacket(sndPacket(0x18, 1, 0, 16), p, buf), "compressed packet accepted");
+        require(!KiwiSDRClient::parseSndPacket(std::string("SND\x08\x01", 5), p, buf), "short packet accepted");
+        require(!KiwiSDRClient::parseSndPacket(std::string("MSG audio_rate=12000"), p, buf), "MSG parsed as SND");
+    }
+
+    void kiwiRefusalText() {
+        require(KiwiSDRClient::refusalText("too_busy", "4") == "server busy: all 4 channels are in use", "too_busy");
+        require(KiwiSDRClient::refusalText("badp", "0").empty(), "badp=0 is not a refusal");
+        require(KiwiSDRClient::refusalText("badp", "1").rfind("password required", 0) == 0, "badp=1");
+        require(KiwiSDRClient::refusalText("badp", "9") == "server refused the connection (badp=9)", "unknown badp");
+        require(!KiwiSDRClient::refusalText("monitor", "").empty() && !KiwiSDRClient::refusalText("down", "").empty(), "monitor / down");
+        require(KiwiSDRClient::refusalText("audio_rate", "12000").empty(), "audio_rate is not a refusal");
+        require(KiwiSDRClient::refusalText("ip_limit", "120,10.0.0.1") == "time limit for this address reached (120 min)", "ip_limit");
+    }
+
+    // A fake Kiwi: connection 0 is GET /VER, connection 1 the SND websocket,
+    // handed to session(). Commands the client sends are collected.
+    struct FakeKiwi {
+        std::mutex mtx;
+        std::vector<std::string> commands;
+        std::function<void(Peer&, FakeKiwi&, const std::string& path)> session;
+        // The W/F websocket, served on a thread of its own: the server takes
+        // one connection at a time, and SND connects while W/F is open.
+        std::function<void(Peer&, FakeKiwi&)> wfSession;
+        std::vector<std::thread> wfThreads;
+
+        ~FakeKiwi() {
+            for (auto& t : wfThreads) { t.join(); }
+        }
+
+        // Reads client frames until one starts with prefix; false on close.
+        bool waitCommand(Peer& p, const std::string& prefix) {
+            for (;;) {
+                Frame f = readFrame(p);
+                if (f.opcode < 0) { return false; }
+                if (f.opcode != 1 && f.opcode != 2) { continue; }
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    commands.push_back(f.payload);
+                }
+                if (f.payload.rfind(prefix, 0) == 0) { return true; }
+            }
+        }
+        void drain(Peer& p) {
+            for (;;) {
+                Frame f = readFrame(p);
+                if (f.opcode < 0 || f.opcode == 8) { return; }
+                std::lock_guard<std::mutex> lock(mtx);
+                commands.push_back(f.payload);
+            }
+        }
+        bool sent(const std::string& command) {
+            std::lock_guard<std::mutex> lock(mtx);
+            return std::find(commands.begin(), commands.end(), command) != commands.end();
+        }
+        int indexOf(const std::string& prefix) {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (size_t i = 0; i < commands.size(); i++) {
+                if (commands[i].rfind(prefix, 0) == 0) { return (int)i; }
+            }
+            return -1;
+        }
+
+        Server::Handler handler() {
+            return [this](Peer& p, const Request& r, int index) {
+                if (index == 0) {
+                    const std::string body = "{\"maj\":1,\"min\":902,\"ts\":4611686213435808288}";
+                    p.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                           std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+                    return;
+                }
+                accept101(p, r);
+                const std::string wf = "/W/F";
+                if (wfSession && r.path.size() >= wf.size() && r.path.compare(r.path.size() - wf.size(), wf.size(), wf) == 0) {
+                    auto owned = std::make_shared<Peer>(std::move(p));
+                    wfThreads.emplace_back([this, owned] {
+                        wfSession(*owned, *this);
+                        owned->conn->close();
+                    });
+                    return;
+                }
+                session(p, *this, r.path);
+            };
+        }
+    };
+
+    void kiwiFakeSession() {
+        FakeKiwi kiwi;
+        kiwi.session = [](Peer& p, FakeKiwi& k, const std::string&) {
+            if (!k.waitCommand(p, "SET compression=0")) { return; }
+            p.send(frame(2, "MSG audio_init=0 audio_rate=20250"));
+            if (!k.waitCommand(p, "SET AR OK")) { return; }
+            p.send(frame(2, "MSG sample_rate=20250.880000 bandwidth=30000000"));
+            if (!k.waitCommand(p, "SET mod=iq")) { return; }
+            p.send(frame(2, sndPacket(0x0d, 0, 700, 512)));  // first packet: IQ + NEW_FREQ + LPF
+            p.send(frame(2, sndPacket(0x08, 1, 700, 512)));
+            p.send(frame(2, sndPacket(0x0a, 3, 700, 512)));  // seq 2 lost; ADC overload
+            k.drain(p);
+        };
+        Server srv(kiwi.handler());
+        KiwiSDRClient client;
+        std::atomic<int> samples{0};
+        std::atomic<int> packets{0};
+        std::atomic<int> newFreqPackets{0};
+        std::atomic<bool> failed{false};
+        client.init("127.0.0.1:" + std::to_string(srv.port()));
+        client.onConnected = [&] { client.tune(14074000.0, KiwiSDRClient::TUNE_IQ); };
+        client.onError = [&](const std::string&) { failed = true; };
+        client.onPacket = [&](const KiwiSDRClient::SndPacket& p) {
+            packets++;
+            if (p.newFreq) { newFreqPackets++; }
+        };
+        client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
+        client.start();
+        const auto t0 = Clock::now();
+        while (msSince(t0) < 5000 && samples.load() < 3 * 512 && !failed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const bool wasConnected = client.connected.load();
+        const int gaps = (int)client.seqGaps();
+        const bool overload = client.adcOverloadRecent();
+        const auto flavour = client.flavour();
+        const double rate = client.sampleRate();
+        const int audio = client.audioRate();
+        client.stop();
+
+        require(!failed, "fake kiwi: onError fired");
+        require(wasConnected, "fake kiwi: never connected");
+        const auto paths = srv.paths();
+        require(paths.size() >= 2 && paths[0] == "/VER" && paths[1] == "/4611686213435808288/SND",
+                "fake kiwi: paths " + (paths.size() >= 2 ? paths[0] + " " + paths[1] : std::string("missing")));
+        require(samples.load() == 3 * 512 && packets.load() == 3, "fake kiwi: samples " + std::to_string(samples.load()));
+        require(newFreqPackets.load() == 1, "fake kiwi: NEW_FREQ packets " + std::to_string(newFreqPackets.load()));
+        require(gaps == 1, "fake kiwi: seq gaps " + std::to_string(gaps));
+        require(overload, "fake kiwi: ADC overload not reported");
+        require(flavour == KiwiSDRClient::Flavour::KiwiSDR, "fake kiwi: flavour");
+        require(audio == 20250 && std::fabs(rate - 20250.88) < 1e-6, "fake kiwi: rates " + std::to_string(audio) + " " + std::to_string(rate));
+        require(kiwi.sent("SET AR OK in=20250 out=48000"), "fake kiwi: SET AR OK did not use the server's rate");
+        require(kiwi.sent("SET mod=iq low_cut=-10025 high_cut=10025 freq=14074.000"), "fake kiwi: passband not from the rate");
+        const int auth = kiwi.indexOf("SET auth"), ar = kiwi.indexOf("SET AR OK"), agc = kiwi.indexOf("SET agc="),
+                  mod = kiwi.indexOf("SET mod=iq");
+        require(auth >= 0 && auth < ar && ar < agc && agc < mod, "fake kiwi: setup order auth < AR OK < agc < mod");
+    }
+
+    void kiwiFakeTooBusy() {
+        FakeKiwi kiwi;
+        kiwi.session = [](Peer& p, FakeKiwi& k, const std::string&) {
+            if (!k.waitCommand(p, "SET compression=0")) { return; }
+            p.send(frame(2, "MSG too_busy=4"));
+            k.drain(p);
+        };
+        Server srv(kiwi.handler());
+        KiwiSDRClient client;
+        std::mutex mtx;
+        std::string error;
+        std::atomic<bool> disconnected{false};
+        client.init("127.0.0.1:" + std::to_string(srv.port()));
+        client.onError = [&](const std::string& e) {
+            std::lock_guard<std::mutex> lock(mtx);
+            error = e;
+        };
+        client.onDisconnected = [&] { disconnected = true; };
+        client.start();
+        const auto t0 = Clock::now();
+        while (msSince(t0) < 5000 && !disconnected) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const std::string status = client.getConnectionStatus();
+        client.stop();
+        require(disconnected, "too_busy: the client did not close");
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            require(error == "server busy: all 4 channels are in use", "too_busy: onError '" + error + "'");
+        }
+        require(client.getConnectionStatus() == "Refused: server busy: all 4 channels are in use",
+                "too_busy: status after stop '" + client.getConnectionStatus() + "' (before: '" + status + "')");
+        require(!client.connected, "too_busy: connected");
+    }
+
+    // A Kiwi that ignores the krec path: the client goes to /kiwi/ without
+    // reporting a disconnect in between.
+    void kiwiFakeSilentKrec() {
+        FakeKiwi kiwi;
+        kiwi.session = [](Peer& p, FakeKiwi& k, const std::string& path) {
+            if (path.rfind("/kiwi/", 0) != 0) {
+                k.drain(p);
+                return;
+            }
+            if (!k.waitCommand(p, "SET compression=0")) { return; }
+            p.send(frame(2, "MSG audio_init=0 audio_rate=12000"));
+            if (!k.waitCommand(p, "SET AR OK")) { return; }
+            p.send(frame(2, "MSG sample_rate=11998.902088"));
+            if (!k.waitCommand(p, "SET mod=iq")) { return; }
+            p.send(frame(2, sndPacket(0x0d, 0, 700, 512)));
+            k.drain(p);
+        };
+        Server srv(kiwi.handler());
+        KiwiSDRClient client;
+        std::atomic<int> samples{0};
+        std::atomic<int> disconnects{0};
+        client.init("127.0.0.1:" + std::to_string(srv.port()));
+        client.onConnected = [&] { client.tune(7074000.0, KiwiSDRClient::TUNE_IQ); };
+        client.onDisconnected = [&] { disconnects++; };
+        client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
+        client.start();
+        const auto t0 = Clock::now();
+        while (msSince(t0) < 8000 && samples.load() < 512) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const int disconnectsWhileUp = disconnects.load();
+        client.stop();
+        const auto paths = srv.paths();
+        require(paths.size() >= 3 && paths[1] == "/4611686213435808288/SND" && paths[2] == "/kiwi/4611686213435808288/SND",
+                "silent krec: paths " + std::to_string(paths.size()));
+        require(samples.load() == 512, "silent krec: samples " + std::to_string(samples.load()));
+        require(disconnectsWhileUp == 0, "silent krec: onDisconnected fired before the fallback streamed");
+        require(kiwi.sent("SET auth t=kiwi p=#"), "silent krec: web UI auth form on /kiwi/");
+    }
+
+    // ---- KiwiWaterfallClient ----
+
+    // A W/F message: x_bin, zoom, seq, then 1 024 bins of one value.
+    std::string wfPacket(uint32_t xBin, uint32_t zoom, uint32_t seq, uint8_t value) {
+        std::string m = "W/F";
+        m.push_back('\0');
+        putLE32(m, xBin);
+        putLE32(m, zoom);
+        putLE32(m, seq);
+        m.append((size_t)KiwiWaterfallClient::kBins, (char)value);
+        return m;
+    }
+
+    void kiwiParseWf() {
+        KiwiWaterfallClient::Frame f;
+        const std::string msg = wfPacket(82399, 10 | KiwiWaterfallClient::kFlagCompressed, 77, 200);
+        require(KiwiWaterfallClient::parseFrame(msg, f), "W/F frame not parsed");
+        require(f.xBin == 82399 && f.zoom == 10 && f.seq == 77 && f.count == 1024, "W/F header");
+        require((f.flags & KiwiWaterfallClient::kFlagCompressed) != 0, "W/F compressed flag");
+        require(!KiwiWaterfallClient::parseFrame(std::string("W/F\0\1\2", 6), f), "short W/F accepted");
+        require(!KiwiWaterfallClient::parseFrame(sndPacket(0x08, 1, 0, 16), f), "SND parsed as W/F");
+
+        KiwiWaterfallClient::Setup setup;  // 30 MHz, zoom_max 14, wf_cal -13
+        // research 8.3: zoom 10, x_bin 82 399 is 147.34 kHz.
+        require(std::fabs(KiwiWaterfallClient::frameStartHz(setup, 82399) - 147340.0) < 10.0, "W/F start");
+        require(KiwiWaterfallClient::zoomSpanHz(setup, 0) == 30e6 && KiwiWaterfallClient::zoomSpanHz(setup, 3) == 3.75e6, "W/F span");
+        require(approxEqual(KiwiWaterfallClient::binDbm(setup, 200), -68.0f), "W/F dBm");
+        setup.bandwidthHz = 32e6;
+        require(KiwiWaterfallClient::zoomSpanHz(setup, 1) == 16e6, "W/F span from the reported bandwidth");
+    }
+
+    // SND as on a real Kiwi, short: rates, then one IQ packet per tune.
+    void fakeSndSession(Peer& p, FakeKiwi& k) {
+        if (!k.waitCommand(p, "SET compression=0")) { return; }
+        p.send(frame(2, "MSG audio_init=0 audio_rate=12000"));
+        if (!k.waitCommand(p, "SET AR OK")) { return; }
+        p.send(frame(2, "MSG sample_rate=11998.902088 bandwidth=30000000"));
+        if (!k.waitCommand(p, "SET mod=iq")) { return; }
+        p.send(frame(2, sndPacket(0x0d, 0, 700, 512)));
+        k.drain(p);
+    }
+
+    // W/F opens first, gets its setup and the view commands, delivers
+    // frames; SND follows on the same ts.
+    void kiwiFakeWaterfall() {
+        FakeKiwi kiwi;
+        kiwi.wfSession = [](Peer& p, FakeKiwi& k) {
+            if (!k.waitCommand(p, "SERVER DE CLIENT sdriak W/F")) { return; }
+            p.send(frame(2, "MSG center_freq=15000000 bandwidth=30000000 adc_clk_nom=66666600"));
+            p.send(frame(2, "MSG wf_fft_size=1024 wf_fps=23 wf_fps_max=23 zoom_max=14 zoom_cap=11 rx_chans=4 wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup"));
+            if (!k.waitCommand(p, "SET zoom=")) { return; }
+            for (uint32_t i = 0; i < 3; i++) { p.send(frame(2, wfPacket(82399, 10, 5 + i, 200))); }
+            k.drain(p);
+        };
+        kiwi.session = [](Peer& p, FakeKiwi& k, const std::string&) { fakeSndSession(p, k); };
+        Server srv(kiwi.handler());
+
+        KiwiWaterfallClient wf;
+        std::atomic<int> frames{0};
+        std::atomic<bool> frameOk{true};
+        wf.onFrame = [&](const KiwiWaterfallClient::Frame& f) {
+            if (f.zoom != 10 || f.xBin != 82399 || f.count != 1024 || f.bins[0] != 200) { frameOk = false; }
+            frames++;
+        };
+        KiwiSDRClient client;
+        std::atomic<int> samples{0};
+        client.init("127.0.0.1:" + std::to_string(srv.port()));
+        client.waterfall = &wf;
+        client.waterfallSpeed = 3;
+        client.waterfallCfKhz = 14074.0;
+        client.onConnected = [&] { client.tune(14074000.0, KiwiSDRClient::TUNE_IQ); };
+        client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
+        client.start();
+        const auto t0 = Clock::now();
+        while (msSince(t0) < 8000 && (samples.load() < 512 || frames.load() < 3)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const bool available = wf.available();
+        const auto setup = wf.setup();
+        client.stop();
+
+        const auto paths = srv.paths();
+        require(paths.size() >= 3 && paths[1] == "/4611686213435808288/W/F" && paths[2] == "/4611686213435808288/SND",
+                "waterfall: paths " + (paths.size() >= 3 ? paths[1] + " " + paths[2] : std::string("missing")));
+        require(available, "waterfall: not available");
+        require(frames.load() == 3 && frameOk, "waterfall: frames " + std::to_string(frames.load()));
+        require(samples.load() == 512, "waterfall: SND samples " + std::to_string(samples.load()));
+        require(setup.zoomMax == 14 && setup.zoomCap == 11 && setup.wfChans == 4 && setup.wfCalDb == -13.0 && setup.bandwidthHz == 30e6,
+                "waterfall: setup fields");
+        require(kiwi.sent("SET auth t=kiwi p=") && kiwi.sent("SET wf_speed=3") && kiwi.sent("SET interp=13") &&
+                kiwi.sent("SET wf_comp=0") && kiwi.sent("SET zoom=0 cf=14074.000"), "waterfall: setup commands");
+        require(!wf.available(), "waterfall: still available after stop");
+    }
+
+    // No waterfall channel: the session goes on with SND alone.
+    void kiwiFakeWaterfallBusy() {
+        FakeKiwi kiwi;
+        kiwi.wfSession = [](Peer& p, FakeKiwi& k) {
+            if (!k.waitCommand(p, "SERVER DE CLIENT sdriak W/F")) { return; }
+            p.send(frame(2, "MSG too_busy=4"));
+            k.drain(p);
+        };
+        kiwi.session = [](Peer& p, FakeKiwi& k, const std::string&) { fakeSndSession(p, k); };
+        Server srv(kiwi.handler());
+
+        KiwiWaterfallClient wf;
+        KiwiSDRClient client;
+        std::atomic<int> samples{0};
+        std::atomic<bool> failed{false};
+        client.init("127.0.0.1:" + std::to_string(srv.port()));
+        client.waterfall = &wf;
+        client.onConnected = [&] { client.tune(14074000.0, KiwiSDRClient::TUNE_IQ); };
+        client.onError = [&](const std::string&) { failed = true; };
+        client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
+        client.start();
+        const auto t0 = Clock::now();
+        while (msSince(t0) < 8000 && samples.load() < 512) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const std::string reason = wf.unavailableReason();
+        client.stop();
+        require(samples.load() == 512 && !failed, "waterfall busy: SND did not carry on");
+        require(!wf.available(), "waterfall busy: available");
+        require(reason == "server busy: all 4 channels are in use", "waterfall busy: reason '" + reason + "'");
+    }
+
     int kiwiClient(const std::string& hostPort) {
         KiwiSDRClient client;
         std::atomic<int> samples{0};
@@ -804,10 +1209,86 @@ namespace {
         const long long elapsed = msSince(t0);
         const std::string status = client.getConnectionStatus();
         const std::string eff = client.wsClient.effectiveUrl();
+        const char* flavour = client.flavour() == KiwiSDRClient::Flavour::KiwiSDR          ? "KiwiSDR"
+                              : client.flavour() == KiwiSDRClient::Flavour::KiwiCompatible ? "Kiwi-compatible"
+                                                                                           : "unknown";
+        std::printf("host:      %s\neffective: %s\nconnected: %d  samples: %d  after %lld ms\nstatus:    %s\n"
+                    "server:    %s, audio_rate %d, sample_rate %.6f, seq gaps %llu, RSSI %.1f dBm\n",
+                    hostPort.c_str(), eff.c_str(), (int)connected.load(), samples.load(), elapsed, status.c_str(),
+                    flavour, client.audioRate(), client.sampleRate(), (unsigned long long)client.seqGaps(), client.rssiDbm());
         client.stop();
-        std::printf("host:      %s\neffective: %s\nconnected: %d  samples: %d  after %lld ms\nstatus:    %s\n",
-                    hostPort.c_str(), eff.c_str(), (int)connected.load(), samples.load(), elapsed, status.c_str());
         return (connected && samples.load() > 0) ? 0 : 1;
+    }
+}
+
+namespace {
+    int kiwiWaterfall(const std::string& hostPort, double tuneKhz) {
+        struct ZoomStats {
+            int frames = 0;
+            uint32_t xBin = 0;
+            int peakBin = 0;
+            float peakDbm = -999.0f;
+            double meanDbm = 0.0;
+        };
+        std::mutex mtx;
+        std::map<int, ZoomStats> stats;
+        KiwiWaterfallClient wf;
+        wf.onFrame = [&](const KiwiWaterfallClient::Frame& f) {
+            const auto setup = wf.setup();
+            std::lock_guard<std::mutex> lock(mtx);
+            ZoomStats& z = stats[f.zoom];
+            z.frames++;
+            z.xBin = f.xBin;
+            double sum = 0.0;
+            for (int i = 0; i < f.count; i++) {
+                const float dbm = KiwiWaterfallClient::binDbm(setup, f.bins[i]);
+                sum += dbm;
+                if (dbm > z.peakDbm) { z.peakDbm = dbm; z.peakBin = i; }
+            }
+            z.meanDbm = sum / f.count;
+        };
+        KiwiSDRClient client;
+        std::atomic<int> samples{0};
+        std::atomic<bool> connected{false};
+        client.init(hostPort);
+        client.waterfall = &wf;
+        client.waterfallCfKhz = tuneKhz;
+        client.onConnected = [&] { connected = true; };
+        client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
+        client.start();
+        const auto t0 = Clock::now();
+        bool tuned = false, zoomed = false;
+        while (msSince(t0) < 14000) {
+            if (connected && !tuned) {
+                client.tune(tuneKhz * 1e3, KiwiSDRClient::TUNE_IQ);
+                tuned = true;
+            }
+            if (tuned && !zoomed && msSince(t0) > 6000) {
+                wf.setView(8, tuneKhz - client.frequencyOffsetHz() / 1e3);
+                zoomed = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        const auto setup = wf.setup();
+        std::printf("host:      %s\nwaterfall: %s%s\n", hostPort.c_str(), wf.available() ? "available" : "unavailable ",
+                    wf.unavailableReason().c_str());
+        std::printf("setup:     zoom_max %d zoom_cap %d wf_chans %d wf_cal %.1f bandwidth %.0f\n",
+                    setup.zoomMax, setup.zoomCap, setup.wfChans, setup.wfCalDb, setup.bandwidthHz);
+        std::printf("snd:       connected %d, %d samples, RSSI %.1f dBm, freq_offset %lld Hz\n", (int)connected.load(),
+                    samples.load(), client.rssiDbm(), (long long)client.frequencyOffsetHz());
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (const auto& [zoom, z] : stats) {
+                const double start = KiwiWaterfallClient::frameStartHz(setup, z.xBin);
+                const double span = KiwiWaterfallClient::zoomSpanHz(setup, zoom);
+                std::printf("zoom %2d:   %d frames, start %.3f kHz span %.3f kHz, mean %.1f dBm, peak %.1f dBm at %.3f kHz\n",
+                            zoom, z.frames, start / 1e3, span / 1e3, z.meanDbm, z.peakDbm,
+                            (start + (z.peakBin + 0.5) * span / KiwiWaterfallClient::kBins) / 1e3);
+            }
+        }
+        const bool ok = connected && samples.load() > 0 && !stats.empty();
+        client.stop();
+        return ok ? 0 : 1;
     }
 }
 
@@ -825,6 +1306,9 @@ int main(int argc, char** argv) {
             return (rc == 0 && proxy.tunnels() > 0) ? 0 : 1;
         }
         return kiwiClient(argv[2]);
+    }
+    if (argc >= 3 && std::string(argv[1]) == "--kiwi-waterfall") {
+        return kiwiWaterfall(argv[2], argc >= 4 ? std::atof(argv[3]) : 10000.0);
     }
     if (argc >= 3 && std::string(argv[1]) == "--live") {
         return live(argv[2], argc >= 4 && std::string(argv[3]) == "--kiwi");
@@ -855,6 +1339,14 @@ int main(int argc, char** argv) {
         { "send while streaming", sendWhileStreaming },
         { "peer drops TCP", peerDropsTcp },
         { "through an authenticating proxy", throughProxy },
+        { "kiwi: SND packet parsing", kiwiParseSnd },
+        { "kiwi: refusal text", kiwiRefusalText },
+        { "kiwi: fake server session", kiwiFakeSession },
+        { "kiwi: fake server too_busy", kiwiFakeTooBusy },
+        { "kiwi: silent krec path falls back to /kiwi/", kiwiFakeSilentKrec },
+        { "kiwi: parse W/F frame", kiwiParseWf },
+        { "kiwi: fake server waterfall", kiwiFakeWaterfall },
+        { "kiwi: fake server waterfall busy", kiwiFakeWaterfallBusy },
     };
     int failures = 0;
     for (const auto& [name, fn] : tests) {

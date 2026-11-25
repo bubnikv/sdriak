@@ -11,7 +11,38 @@
 
 #include "utils/flog.h"
 #include "utils/proto/curl_http.h"
+#include "utils/proto/kiwisdr_wf.h"
 #include "utils/url.h"
+
+namespace {
+    double parseDouble(const std::string& value) {
+        std::istringstream iss(value);
+        iss.imbue(std::locale::classic());
+        double v = 0.0;
+        iss >> v;
+        return iss ? v : 0.0;
+    }
+
+    uint32_t readLE32(const uint8_t* b) {
+        return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    }
+
+    int16_t readS16(const uint8_t* b, bool littleEndian) {
+        const uint16_t v = littleEndian ? (uint16_t)(b[0] | (b[1] << 8)) : (uint16_t)((b[0] << 8) | b[1]);
+        return (int16_t)v;
+    }
+
+    // Retune with no NEW_FREQ packet after this long: the server does not
+    // set the flag (UberSDR).
+    constexpr auto kNewFreqTimeout = std::chrono::seconds(2);
+    // Without audio_rate / sample_rate after this long, go live on the
+    // defaults rather than wait forever on a server that never sends them.
+    constexpr auto kRateTimeout = std::chrono::seconds(5);
+    // Not a single message on the krec path after this long: the Kiwi
+    // ignores that path (seen on sdr-amradioantennas.com, KiwiSDR 1.902,
+    // even with every channel free); the web UI's path is tried instead.
+    constexpr auto kKrecSilenceTimeout = std::chrono::seconds(3);
+}
 
 int16_t KiwiSDRClient::readBE16(const char* data) {
     const auto* bytes = reinterpret_cast<const uint8_t*>(data);
@@ -22,6 +53,77 @@ int16_t KiwiSDRClient::readBE16(const char* data) {
     return static_cast<int16_t>(static_cast<int>(value) - 0x10000);
 }
 
+bool KiwiSDRClient::parseSndPacket(const std::string& msg, SndPacket& packet, std::vector<dsp::complex_t>& buffer) {
+    // "SND", flags, seq (LE32), S-meter (BE16); IQ adds the GPS fields.
+    constexpr size_t kRealHeader = 10;
+    constexpr size_t kIqHeader = 20;
+    if (msg.size() < kRealHeader || msg.compare(0, 3, "SND") != 0) { return false; }
+    const auto* b = reinterpret_cast<const uint8_t*>(msg.data());
+    packet = SndPacket();
+    packet.flags = b[3];
+    packet.seq = readLE32(b + 4);
+    packet.rssiDbm = 0.1f * (float)(((uint16_t)b[8] << 8) | b[9]) - 127.0f;
+    packet.iq = (packet.flags & kFlagIq) != 0;
+    packet.newFreq = (packet.flags & kFlagNewFreq) != 0;
+    packet.adcOverload = (packet.flags & kFlagAdcOverload) != 0;
+    if (packet.flags & kFlagCompressed) { return false; }
+    const bool le = (packet.flags & kFlagLittleEndian) != 0;
+
+    if (packet.iq) {
+        if (msg.size() < kIqHeader) { return false; }
+        packet.lastGpsSolution = b[10];
+        packet.gpsSec = readLE32(b + 12);
+        packet.gpsNsec = readLE32(b + 16);
+        const size_t count = (msg.size() - kIqHeader) / 4;
+        buffer.resize(count);
+        const uint8_t* s = b + kIqHeader;
+        for (size_t k = 0; k < count; k++, s += 4) {
+            buffer[k] = dsp::complex_t{ readS16(s, le) / 32767.0f, readS16(s + 2, le) / 32767.0f };
+        }
+    }
+    else {
+        const size_t count = (msg.size() - kRealHeader) / 2;
+        buffer.resize(count);
+        const uint8_t* s = b + kRealHeader;
+        for (size_t k = 0; k < count; k++, s += 2) {
+            buffer[k] = dsp::complex_t{ readS16(s, le) / 32767.0f, 0.0f };
+        }
+    }
+    packet.samples = buffer.data();
+    packet.count = (int)buffer.size();
+    return true;
+}
+
+std::string KiwiSDRClient::refusalText(const std::string& key, const std::string& value) {
+    if (key == "too_busy") {
+        return value.empty() ? "server busy: every channel is in use"
+                             : "server busy: all " + value + " channels are in use";
+    }
+    if (key == "badp") {
+        // Codes as the KiwiSDR web UI words them.
+        if (value.empty() || value == "0") { return {}; }
+        if (value == "1") { return "password required: every channel without a password is in use, or the password is wrong"; }
+        if (value == "2") { return "server still determining its local address; try again shortly"; }
+        if (value == "3") { return "admin connection not allowed from this address"; }
+        if (value == "4") { return "no admin password set; admin only from the local network"; }
+        if (value == "5") { return "multiple connections from the same address are not allowed"; }
+        if (value == "6") { return "database update in progress; try again in a minute"; }
+        if (value == "7") { return "another admin connection is already open"; }
+        return "server refused the connection (badp=" + value + ")";
+    }
+    if (key == "down") { return "server is down"; }
+    if (key == "redirect") { return value.empty() ? "server redirects elsewhere" : "server redirects to " + value; }
+    if (key == "monitor") { return "server busy: connection parked as a monitor"; }
+    if (key == "camp_disconnect") { return "server ended the camping session"; }
+    if (key == "ip_limit") {
+        // "<minutes>,<address>": the address used up its listening time.
+        const std::string minutes = value.substr(0, value.find(','));
+        return minutes.empty() ? "time limit for this address reached"
+                               : "time limit for this address reached (" + minutes + " min)";
+    }
+    return {};
+}
+
 void KiwiSDRClient::setConnectionStatus(const char* status) {
     std::lock_guard<std::mutex> lock(connectionStatusLock);
     snprintf(connectionStatus, sizeof connectionStatus, "%s", status);
@@ -29,7 +131,19 @@ void KiwiSDRClient::setConnectionStatus(const char* status) {
 
 std::string KiwiSDRClient::getConnectionStatus() const {
     std::lock_guard<std::mutex> lock(connectionStatusLock);
+    if (!refusal.empty()) { return "Refused: " + refusal; }
     return connectionStatus;
+}
+
+std::string KiwiSDRClient::refusalReason() const {
+    std::lock_guard<std::mutex> lock(connectionStatusLock);
+    return refusal;
+}
+
+bool KiwiSDRClient::adcOverloadRecent() const {
+    const int64_t at = lastOverloadTicks.load();
+    if (at == 0) { return false; }
+    return Clock::now() - Clock::time_point(Clock::duration(at)) < std::chrono::seconds(1);
 }
 
 KiwiSDRClient::~KiwiSDRClient() {
@@ -42,39 +156,37 @@ void KiwiSDRClient::init(const std::string& hostport) {
     setConnectionStatus("Not connected");
 
     wsClient.onDisconnected = [&]() {
+        // The krec attempt ends silently; the session goes on on /kiwi/.
+        if (retryOnWebUiPath) { return; }
         connected = false;
         this->onDisconnected();
         setConnectionStatus("Disconnected");
     };
 
+    // kiwiclient's order: authenticate and identify now; answer audio_rate
+    // with SET AR OK; go live (AGC, tune, onConnected) once sample_rate says
+    // what the stream really runs at. No password is "p=" on the krec path,
+    // as kiwiclient sends it, and "p=#" on the web UI's.
     wsClient.onConnected = [&]() {
-        // x.sendString("SET mod=usb low_cut=300 high_cut=2700 freq=14100.000");
-        wsClient.sendString("SET auth t=kiwi p=#");
-        wsClient.sendString("SET AR OK in=" + std::to_string(IQDATA_FREQUENCY) + " out=48000");
-        //            x.sendString("SET mod=am low_cut=-4900 high_cut=4900 freq=119604.33");
+        wsUpAt = Clock::now();
+        anyMessage = false;
+        wsClient.sendString(webUiPath ? "SET auth t=kiwi p=#" : "SET auth t=kiwi p=");
         wsClient.sendString("SERVER DE CLIENT sdriak SND");
+        wsClient.sendString("SET ident_user=sdriak");
         wsClient.sendString("SET compression=0");
-        sendAgcLine();
-        connected = true;
-        if (this->onConnected) {
-            onConnected();
-        }
-        setConnectionStatus("Connected, waiting data...");
-        //            wsClient.sendString("SET mod=iq low_cut=-5000 high_cut=5000 freq=14074.000");
+        setConnectionStatus("Connected, waiting for the server...");
     };
     wsClient.onTextMessage = [&](const std::string& msg) {
         flog::info("TEXT: {}", msg);
     };
 
     wsClient.onBinaryMessage = [&](const std::string& msg) {
-        std::string start = "???";
-        if (msg.size() > 3) {
-            start = msg.substr(0, 3);
-        }
-        if (start == "MSG") {
+        anyMessage = true;
+        if (msg.size() <= 3) { return; }
+        if (msg.compare(0, 3, "MSG") == 0) {
             parseMsgFrame(msg);
         }
-        else if (start == "SND") {
+        else if (msg.compare(0, 3, "SND") == 0) {
             using namespace std::chrono_literals;
             auto ctm = Clock::now();
             times.emplace_back(ctm);
@@ -91,47 +203,10 @@ void KiwiSDRClient::init(const std::string& hostport) {
             char status[100];
             snprintf(status, sizeof status, "Receiving. %d KB/sec (%d)", (lastSecondCount * ((int)msg.size())) / 1024, lastSecondCount);
             setConnectionStatus(status);
-            int IQ_HEADER_SIZE = 20;
-            int REAL_HEADER_SIZE = 10;
-            const Modulation modulation = currentModulation.load();
-            if (modulation == TUNE_REAL && msg.size() == 1024 + REAL_HEADER_SIZE) { // REAL data
-                const char* samples = msg.data() + REAL_HEADER_SIZE;
-                dsp::complex_t decoded[512];
-                for (int z = 0; z < 512; z++) {
-                    const int16_t sample = readBE16(samples + (z * 2));
-                    decoded[z] = dsp::complex_t{ sample / 32767.0f, 0.0f };
-                }
-                onSamples(decoded, 512);
-                snprintf(status, sizeof status, "Cont Recv. %d KB/sec (%d)", (lastSecondCount * ((int)msg.size())) / 1024, lastSecondCount);
-                setConnectionStatus(status);
+            SndPacket packet;
+            if (parseSndPacket(msg, packet, sndBuffer)) {
+                handlePacket(packet);
             }
-            if (modulation == TUNE_IQ && msg.size() == 2048 + IQ_HEADER_SIZE && msg[3] == 0x08) { // IQ data
-                const char* samples = msg.data() + IQ_HEADER_SIZE;
-                dsp::complex_t decoded[512];
-                for (int z = 0; z < 512; z++) {
-                    const char* iqsample = samples + (z * 4);
-                    const int16_t i = readBE16(iqsample);
-                    const int16_t q = readBE16(iqsample + 2);
-                    decoded[z] = dsp::complex_t{ i / 32767.0f, q / 32767.0f };
-                }
-                onSamples(decoded, 512);
-                //                    flog::info("{} Got sound: bytes={} , {} samples, buflen now = {} (erased {})", (int64_t)currentTimeMillis(), msg.size(), (msg.size() - HEADER_SIZE) / 4, buflen, erased);
-            }
-        }
-        else {
-            if (msg.size() >= 70) {
-                char buf[100];
-                for (int q = 3; q < 30; q++) {
-                    snprintf(buf, sizeof buf, "%02x ", (unsigned char)msg[q]);
-                    start += buf;
-                }
-                start += "... ";
-                for (int q = -20; q < 0; q++) {
-                    snprintf(buf, sizeof buf, "%02x ", (unsigned char)msg[msg.size() - 1 + q]);
-                    start += buf;
-                }
-            }
-//                flog::info("=> BIN: {} bytes: {}", (int64_t)msg.size(), start);
         }
     };
     using namespace std::chrono_literals;
@@ -147,7 +222,80 @@ void KiwiSDRClient::init(const std::string& hostport) {
             wsClient.sendString("SET keepalive");
             lastPing = now;
         }
+        if (!webUiPath && !anyMessage && wsUpAt != Clock::time_point() && now - wsUpAt > kKrecSilenceTimeout) {
+            flog::warn("KiwiSDRClient: {}: no answer on the krec path, trying /kiwi/", hostPort);
+            retryOnWebUiPath = true;
+            wsClient.stopSocket();
+            return;
+        }
+        if (!connected.load() && refusalReason().empty() && wsUpAt != Clock::time_point() && now - wsUpAt > kRateTimeout) {
+            flog::warn("KiwiSDRClient: no sample_rate from the server, assuming {} S/s", audioRate());
+            if (!audioRateReported) {
+                trySend("SET AR OK in=" + std::to_string(audioRate()) + " out=48000");
+            }
+            goLive();
+        }
     };
+}
+
+void KiwiSDRClient::handlePacket(const SndPacket& packet) {
+    if (haveSeq && packet.seq != lastSeq + 1) {
+        seqGapCount += (uint32_t)(packet.seq - lastSeq - 1);
+    }
+    haveSeq = true;
+    lastSeq = packet.seq;
+    rssi.store(packet.rssiDbm);
+    if (packet.adcOverload) {
+        lastOverloadTicks.store(Clock::now().time_since_epoch().count());
+    }
+
+    if (packet.iq && packet.count != kKiwiPacketSamples) {
+        markCompatible("packets are not 512 samples");
+    }
+    if (packet.newFreq) {
+        newFreqSinceTune = true;
+        Flavour expected = Flavour::Unknown;
+        serverFlavour.compare_exchange_strong(expected, Flavour::KiwiSDR);
+    }
+    else if (!newFreqSinceTune.load()) {
+        const int64_t sent = tuneSentTicks.load();
+        if (sent != 0 && Clock::now() - Clock::time_point(Clock::duration(sent)) > kNewFreqTimeout) {
+            newFreqSinceTune = true;
+            markCompatible("no NEW_FREQ after a retune");
+        }
+    }
+
+    // Packets of the other mode arrive while a mode switch takes effect.
+    if (packet.iq != (currentModulation.load() == TUNE_IQ)) { return; }
+    onPacket(packet);
+    onSamples(packet.samples, packet.count);
+}
+
+void KiwiSDRClient::markCompatible(const char* why) {
+    if (serverFlavour.exchange(Flavour::KiwiCompatible) != Flavour::KiwiCompatible) {
+        flog::info("KiwiSDRClient: Kiwi-compatible server ({})", why);
+    }
+}
+
+void KiwiSDRClient::goLive() {
+    if (connected.load()) { return; }
+    sendAgcLine();
+    connected = true;
+    setConnectionStatus("Connected, waiting data...");
+    if (this->onConnected) {
+        onConnected();
+    }
+}
+
+void KiwiSDRClient::refuse(const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> lock(connectionStatusLock);
+        if (!refusal.empty()) { return; }
+        refusal = reason;
+    }
+    flog::warn("KiwiSDRClient: {}: {}", hostPort, reason);
+    onError(reason);
+    wsClient.stopSocket();
 }
 
 void KiwiSDRClient::tune(double freq, Modulation mod) {
@@ -190,15 +338,19 @@ bool KiwiSDRClient::trySend(const std::string& cmd) {
 
 void KiwiSDRClient::sendTuneCommand(double freq, Modulation mod) {
     const double serverFreq = freq - static_cast<double>(serverFrequencyOffset.load());
+    // The server clamps the passband to +-(rate/2 - 1); stay just inside.
+    const int halfBand = audioRate() / 2 - 100;
     char buf[1024];
     switch (mod) {
     case Modulation::TUNE_IQ:
-        snprintf(buf, sizeof buf, "SET mod=iq low_cut=-7000 high_cut=7000 freq=%0.3f", serverFreq / 1000.0);
+        snprintf(buf, sizeof buf, "SET mod=iq low_cut=%d high_cut=%d freq=%0.3f", -halfBand, halfBand, serverFreq / 1000.0);
         break;
     case Modulation::TUNE_REAL:
         snprintf(buf, sizeof buf, "SET mod=usb low_cut=0 high_cut=8000 freq=%0.3f", (serverFreq - 3000) / 1000.0);
         break;
     }
+    newFreqSinceTune = false;
+    tuneSentTicks.store(Clock::now().time_since_epoch().count());
     trySend(buf);
 }
 
@@ -224,7 +376,10 @@ void KiwiSDRClient::parseMsgFrame(const std::string& msg) {
     iss >> token;  // consume the "MSG" prefix
     while (iss >> token) {
         const auto eq = token.find('=');
-        if (eq == std::string::npos) continue;
+        if (eq == std::string::npos) {
+            onKeyValue(token, std::string());
+            continue;
+        }
         onKeyValue(token.substr(0, eq), url::decode(token.substr(eq + 1)));
     }
 }
@@ -235,7 +390,36 @@ void KiwiSDRClient::onKeyValue(const std::string& key, const std::string& value)
         return;
     }
     keyValues[key] = value;
-    if (key == "freq_offset") {
+    const std::string refused = refusalText(key, value);
+    if (!refused.empty()) {
+        refuse(refused);
+        return;
+    }
+    if (key == "audio_rate") {
+        const int rate = (int)std::lround(parseDouble(value));
+        if (rate > 0) {
+            audioRateHz.store(rate);
+            audioRateReported = true;
+            trySend("SET AR OK in=" + std::to_string(rate) + " out=48000");
+        }
+    }
+    else if (key == "sample_rate") {
+        const double rate = parseDouble(value);
+        if (rate > 0.0) {
+            sampleRateHz.store(rate);
+            flog::info("KiwiSDRClient: {}: audio_rate {}, sample_rate {}", hostPort, audioRate(), std::to_string(rate));
+            // KiwiSDR derives it from the corrected ADC clock, never exact.
+            if (audioRateReported && rate == (double)audioRate()) {
+                markCompatible("sample_rate equals audio_rate");
+            }
+            goLive();
+        }
+    }
+    else if (key == "wf_chans") {
+        // KiwiSDR firmware has at most 8 waterfall channels.
+        if (std::atoi(value.c_str()) > 8) { markCompatible("more than 8 waterfall channels"); }
+    }
+    else if (key == "freq_offset") {
         serverFrequencyOffset.store(parseKhzToHz(value));
         // Re-issue the last user-requested tune so the displayed
         // frequency stays correct once the offset is known. Skip if
@@ -247,11 +431,8 @@ void KiwiSDRClient::onKeyValue(const std::string& key, const std::string& value)
     }
     else if (key == "bandwidth") {
         // Reported in Hz (e.g. "30000000", or "32000000" on wideband Kiwis).
-        std::istringstream iss(value);
-        iss.imbue(std::locale::classic());
-        double hz = 0.0;
-        iss >> hz;
-        if (iss && hz > 0.0) {
+        const double hz = parseDouble(value);
+        if (hz > 0.0) {
             serverBandwidth.store(static_cast<int64_t>(std::llround(hz)));
         }
     }
@@ -340,6 +521,22 @@ void KiwiSDRClient::resetSessionState() {
     times.clear();
     serverFrequencyOffset.store(0);
     serverBandwidth.store(0);
+    sampleRateHz.store(0.0);
+    serverFlavour.store(Flavour::Unknown);
+    rssi.store(-127.0f);
+    seqGapCount.store(0);
+    lastOverloadTicks.store(0);
+    audioRateReported = false;
+    haveSeq = false;
+    lastSeq = 0;
+    wsUpAt = Clock::time_point();
+    webUiPath = false;
+    anyMessage = false;
+    retryOnWebUiPath = false;
+    tuneSentTicks.store(0);
+    newFreqSinceTune = true;
+    std::lock_guard<std::mutex> lock(connectionStatusLock);
+    refusal.clear();
 }
 
 void KiwiSDRClient::stop() {
@@ -348,6 +545,7 @@ void KiwiSDRClient::stop() {
     }
     running = false;
     wsClient.stopSocket();
+    if (waterfall) { waterfall->stop(); }
     if (looperThread.joinable()) {
         if (looperThread.get_id() != std::this_thread::get_id()) {
             looperThread.join();
@@ -376,8 +574,54 @@ void KiwiSDRClient::start() {
             }
             std::string origin;
             const uint64_t ts = fetchServerTimestamp(parsed->host, parsed->port, origin);
+            const std::string tsPath = std::to_string(ts);
+            // Set when the krec W/F got no answer at all: the Kiwi ignores
+            // the krec path, so SND goes to the web UI's at once.
+            bool sndOnWebUi = false;
+            if (waterfall && running.load()) {
+                // W/F first: it claims a waterfall-capable channel, which
+                // the SND connection with the same ts then joins.
+                const auto cancel = [this] { return !running.load(); };
+                waterfall->start(origin + "/" + tsPath + "/W/F", waterfallSpeed, 0, waterfallCfKhz);
+                bool ready = waterfall->waitReady(kWaterfallSetupTimeout, cancel);
+                if (!ready && !waterfall->serverAnswered() && running.load()) {
+                    flog::warn("KiwiSDRClient: {}: no answer on the krec W/F path, trying /kiwi/", hostPort);
+                    sndOnWebUi = true;
+                    waterfall->start(origin + "/kiwi/" + tsPath + "/W/F", waterfallSpeed, 0, waterfallCfKhz, true);
+                    ready = waterfall->waitReady(kWaterfallSetupTimeout, cancel);
+                }
+                if (!ready) {
+                    flog::warn("KiwiSDRClient: {}: no server waterfall ({}), audio only",
+                               hostPort, waterfall->unavailableReason());
+                    waterfall->stop();
+                }
+            }
             // origin is http(s)://host[:port]; WSClient maps it to ws(s).
-            wsClient.connectAndReceiveLoop(origin + "/kiwi/" + std::to_string(ts) + "/SND");
+            // The krec path first, not the web UI's /kiwi/<ts>/SND: a full
+            // Kiwi refuses it with too_busy instead of parking it as a
+            // monitor.
+            if (sndOnWebUi) {
+                webUiPath = true;
+                wsClient.connectAndReceiveLoop(origin + "/kiwi/" + tsPath + "/SND");
+            }
+            else {
+                wsClient.connectAndReceiveLoop(origin + "/" + tsPath + "/SND");
+            }
+            if (retryOnWebUiPath) {
+                retryOnWebUiPath = false;
+                webUiPath = true;
+                // reset() before reading running: a stop() that comes later
+                // still finds its stopSocket() in effect.
+                wsClient.reset();
+                if (running.load()) {
+                    wsClient.connectAndReceiveLoop(origin + "/kiwi/" + tsPath + "/SND");
+                }
+                else {
+                    wsClient.stopSocket();
+                    this->onDisconnected();
+                }
+            }
+            if (waterfall) { waterfall->stop(); }
             flog::info("x.connectAndReceiveLoop exited.");
             setConnectionStatus("Disconnected");
             connected = false;
@@ -385,6 +629,7 @@ void KiwiSDRClient::start() {
         }
         catch (const std::exception& e) {
             flog::error("KiwiSDRClient: Exception: {}", e.what());
+            if (waterfall) { waterfall->stop(); }
             char status[100];
             snprintf(status, sizeof status, "Error: %s", e.what());
             setConnectionStatus(status);
@@ -396,6 +641,7 @@ void KiwiSDRClient::start() {
             // Anything escaping this thread calls std::terminate and kills
             // the whole app — swallow and report instead.
             flog::error("KiwiSDRClient: unknown exception in network thread");
+            if (waterfall) { waterfall->stop(); }
             setConnectionStatus("Error: unknown exception");
             connected = false;
             running = false;

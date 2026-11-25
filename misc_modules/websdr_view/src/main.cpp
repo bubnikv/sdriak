@@ -88,7 +88,7 @@ public:
                     client->tune(lastTunedFrequency, KiwiSDRClient::TUNE_REAL);
                 };
                 client->start();
-                wf = std::make_shared<SubWaterfall>(client->IQDATA_FREQUENCY, 6000, id);
+                wf = std::make_shared<SubWaterfall>(client->audioRate(), 6000, id);
                 wf->setFreqVisible(false);
                 wf->init();
             }
@@ -244,7 +244,7 @@ public:
                             vec[i].r = vec[i].l = sampleData[i].re;
                         }
                         //                            flog::info("addAudioSamples: {}", vec.size());
-                        wf->addAudioSamples(vec.data(), vec.size(), client->IQDATA_FREQUENCY);
+                        wf->addAudioSamples(vec.data(), vec.size(), client->audioRate());
                     }
 
 
