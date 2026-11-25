@@ -493,6 +493,13 @@ namespace dsp::buffer {
             prebuffer.stop();
         }
 
+        // Stopped, with the writer idle: discard a block the writer handed
+        // over that the link never read. Such a block survives stop() and
+        // would be read and counted after the next start(), shifting the
+        // input index of everything a new session pushes by its size. Call
+        // before taking samplesIn() as a session's base.
+        void discardUnreadInput() { input->flush(); }
+
     private:
         stream<T>* input = nullptr;
         StreamPosition position;

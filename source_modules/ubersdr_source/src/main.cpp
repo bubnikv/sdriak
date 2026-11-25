@@ -913,6 +913,9 @@ private:
             std::lock_guard lck(_this->bufferModeMtx);
             _this->rawStream.clearWriteStop();
             _this->applyBufferModeLocked(true);
+            // A block left unread by the last session would shift this
+            // session's input indices (PrebufferedLink::discardUnreadInput).
+            _this->chain.discardUnreadInput();
             _this->chain.start();
         }
         {

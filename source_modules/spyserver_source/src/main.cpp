@@ -229,6 +229,9 @@ private:
 
         const int stage = _this->iqStage();
         _this->chain.setSampleRate(_this->sampleRate);
+        // A block left unread by the last session would shift this
+        // session's input indices (PrebufferedLink::discardUnreadInput).
+        _this->chain.discardUnreadInput();
         _this->chain.start();
         // The link has consumed everything this client published so far.
         _this->linkIndexBase = _this->chain.samplesIn() - _this->client->samplesPublished();
