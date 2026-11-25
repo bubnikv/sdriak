@@ -3,7 +3,8 @@
 Date: 2026-11-25. Status: current. Steps 1–7 implemented, not committed:
 built on Windows (bench tree), `remote_directory_tests` passes and the
 parsers read the real documents of 2026-11-25; the GUI, live probes and
-Connect are untested. Step 8 is open.
+Connect are untested. Step 8 is open. Steps 10–15 (receiver quality, the
+tabular view for desktop and phone) are planned, not built.
 
 **Idea.** One browser for every networked source, grown out of the
 KiwiSDR map selector of the SDRPPBrown port:
@@ -246,7 +247,8 @@ sigpath::remoteRegistry.unregisterHandler(kind);             // in the destructo
   filter for KiwiSDR.
 * **List view.** A sortable table: name, kind, location, distance from
   the user's QTH, users, ranges, SNR, last seen; with search. On phones
-  the list is often the better view. Entries without a position (Recent,
+  the list is often the better view. Its planned redesign is under
+  [Tabular presentation](#tabular-presentation). Entries without a position (Recent,
   LAN) appear only here.
 * **QTH.** No QTH setting exists yet. The browser keeps a Maidenhead
   locator field of its own in core config (`remoteBrowser.qth`); a later
@@ -273,6 +275,220 @@ sigpath::remoteRegistry.unregisterHandler(kind);             // in the destructo
     button.
   * **`websdr_view`:** its own view, filtered to KiwiSDR, with "Add".
 
+### How other directories present receivers
+
+Surveyed 2026-11-25 from each site's own page code and data feed.
+kiwisdr.com/public sits behind a click-through and sdr-list.xyz is a
+client-rendered app, so neither showed its controls.
+
+| directory | layout | per receiver | filters and sort | quality |
+|-----------|--------|--------------|------------------|---------|
+| instances.ubersdr.org | map + sidebar, compact or expanded cards | online dot, flag, callsign, free/max, name, day/night icon, location, km, PSKReporter rank, band badges | search, country, max distance, min free slots, min SNR, min session, IQ width, range (≤ 30 MHz / above), online, antenna, unlimited session, day only / night only, 9 features, condition per band (Any / Fair+ / Good+ / Excellent); sort distance, listeners, SNR | FT8 SNR per band, spectrum SNR pair, noise floor per band |
+| rx-888.com (Web-888) | map + cards, summary tiles | name, region, mode, "SNR All / HF", free slots, listeners, antenna, uptime | search, status, region (continent), coverage (HF / VHF); sort "Best SNR" (default) or "Most free slots" | the KiwiSDR pair |
+| rx.linkfanel.net (dyatlov) | map; a separate SNR ranking page | antenna, users, "S/N score", "Blocked spectrum %" | presets in the URL fragment (`#gps`, `#all`, `#62`, `#20khz`); by default only receivers wider than 5 MHz | marker colour = SNR on 0–20 dB; a rank score |
+| airspy.com (SpyServer) | globe + cards | listeners x/y, device, current frequency, description | search; All / Available / Full / Unreachable | none |
+| websdr.org | table: "Location and URL", "Frequency range", "Antenna", band cells coloured by activity | as the columns | band (LF/MF, 160m … UHF), region, mobile support, covering a given MHz | users per band |
+| receiverbook.de | paged cards + map | site, link, software and version, band tags | receiver type; frequency, band or service | none |
+| ab9il.net | plain link lists | name | none (browser find) | KiwiSDR top 75 by SNR, low SNR excluded |
+
+What they share:
+
+* **4–8 fields per receiver.** The rest is in a popup or card.
+* **Free slots and distance** are both columns and filters.
+* **A coarse region filter** (continent or country) sits next to distance.
+* **Quality is shown with its measurement time,** and stale or missing
+  values sort last.
+
+### Receiver quality
+
+* **KiwiSDR's SNR** (`SNR_calc` in Beagle_SDR_GPS `rx/rx_util.cpp`):
+  * **How it is measured:** hourly by default (the owner can choose 0, 1,
+    4, 6 or 24 h), an internal client averages 32 frames of the full-span
+    1024-bin waterfall.
+  * **The formula:** SNR = 95th percentile minus median, in dB.
+  * **The directory value:** `snr` is `"all,HF"`, over 0–30 MHz and
+    1.8–30 MHz.
+  * **Antenna check:** an HF value of 3 dB or less, with at most two bins
+    above −100 dBm, sets `ant_connected=0`.
+  * **Masked bins** (−190 dB) are skipped. rx.linkfanel.net publishes the
+    masked share as "blocked spectrum" and scales its rank score by it.
+  * **History:** each Kiwi keeps a week of hourly values, with 0–2,
+    2–10, 10–20 and 20–30 MHz splits, at `/snr`.
+  * **Web-888** uses the same `snr` pair.
+  * **What it measures:** contrast, not sensitivity. Strong MW
+    broadcasters raise the 0–30 MHz value and a noisy site lowers it. It
+    is higher at night, and linkfanel calls it "most relevant when
+    comparing receivers located in the same area". dyatlov prefers the
+    HF value and falls back to "all" only when HF is missing.
+* **UberSDR** publishes more with `GET /api/instances?conditions=true`.
+  That is the URL its own page uses, and it adds 30 kB to the plain
+  ~510 kB:
+  * `band_conditions`: SNR in the FT8 segment of each band, 2200 m to
+    6 m;
+  * `avg_band_snr`: their mean without 6 m, the directory's sort key;
+  * `conditions_updated_at`: older than 30 min counts as stale;
+  * `snr_0_30_mhz`, `snr_1_8_30_mhz`: the KiwiSDR-style pair;
+  * `antenna_connected`, `pskreporter_rank`, `country_code`.
+
+  Its grades are POOR < 6, FAIR 6–20, GOOD 20–30, EXCELLENT > 30 dB. On
+  2026-11-25 the correlation between `snr_1_8_30_mhz` and
+  `avg_band_snr` over 76 instances was 0.25: the spectrum value says
+  little about what is heard on a given band.
+* **Other KiwiSDR fields that bear on quality:** `adc_ov` (ADC overload
+  count), `gps_good` and `fixes` (TDoA-grade clock), `preempt`, `uptime`
+  and `updated`.
+* **SpyServer and Receiverbook publish no quality value.**
+* **The measure that applies to every kind** is the same statistic
+  computed by us: P95 minus median of the spectrum.
+  * **Why it works everywhere:** it is a difference in dB, so it needs no
+    calibration. SpyServer reports dBFS and OpenWebRX is uncalibrated.
+  * **The catch:** it depends on the span. A 2 MHz SpyServer at VHF and a
+    30 MHz Kiwi are not comparable over their full spans.
+  * **The fix:** compute it over one window, the band around the current
+    frequency, or ±100 kHz outside the ham bands. The value then compares
+    receivers for what the user wants to hear.
+  * **Which spectrum each probe reads:** KiwiSDR W/F frames, the UberSDR
+    spectrum, the SpyServer FFT stream, the OpenWebRX waterfall. The
+    SpyServer probe now stops at `CLIENT_SYNC` and the OpenWebRX probe at
+    `config`, so both must read a few frames more (about 2 s).
+  * **The limit:** it is probe-only. Gentleness forbids sweeping the
+    directory, so it ranks the receivers the user tests, not all of them.
+* **Absolute noise floor (dBm/Hz)** is calibrated only on KiwiSDR and
+  UberSDR: a detail, not a ranking key.
+* **Decode-based measures** (FT8 SNR, PSKReporter, WSPRnet or RBN spot
+  counts) would fit any receiver that spots under a callsign. Only
+  UberSDR links them today, and matching other receivers by callsign is
+  fragile: not pursued.
+
+**The model gains:**
+
+```cpp
+enum class QualitySource { None, SpectrumAll, SpectrumHF, Ft8Bands, Probe };
+
+struct RemoteQuality {
+    float db = 0.0f;
+    QualitySource source = QualitySource::None;
+    std::optional<int64_t> measuredUnix;           // absent: directory gives no time
+    std::vector<std::pair<std::string, float>> bands;   // "40m" -> dB, FT8 or probe
+};
+// in RemoteEntry, replacing snrDb:
+RemoteQuality quality;
+std::optional<bool> antennaConnected;
+bool adcOverload = false;
+std::string countryCode, countryName, continent;   // from the position, see below
+```
+
+* **Which value each provider fills:**
+  * **KiwiSDR, Web-888:** the HF value (`SpectrumHF`), the "all" value
+    when HF is 0 (a transverter offset), timestamp `updated`;
+    `ant_connected`; `adc_ov`.
+  * **UberSDR:** `avg_band_snr` and `band_conditions` (`Ft8Bands`) while
+    `conditions_updated_at` is under 30 min old, otherwise
+    `snr_1_8_30_mhz` (`SpectrumHF`); `antenna_connected`.
+  * **sdr-list.xyz, SpyServer, Receiverbook:** none until probed.
+* **A probe result** sets a `Probe` quality on the entry for the session,
+  with the window it measured, and wins over the directory value.
+* **Grades.** FT8 and probe values use UberSDR's thresholds (6 / 20 /
+  30 dB). Spectrum values run higher (KiwiSDR fleet median about 25 dB,
+  top about 45 dB), so they are graded by percentile within their own
+  source: top 25 % excellent, next 25 % good, next 35 % fair, the rest
+  poor.
+* **The rank key** for sorting across kinds is the percentile within the
+  source, 0–1. Entries with no value rank as 0.4: below good, above poor.
+  Stale values (FT8 over 30 min old, spectrum over 6 h old) drop one grade
+  and show their age.
+* **Country and continent** come from the position by point-in-polygon
+  against `res/cty/map.json`, which the map already loads. Its 175
+  Natural Earth features carry `iso_a2`, `name` and `continent`. The
+  lookup runs once per entry at rebuild; a point in no polygon (coast,
+  small island) takes the nearest polygon within 50 km, else stays
+  blank. UberSDR's own `country_code` wins when present.
+* **Day or night at the receiver** is the solar elevation at its
+  position, computed at draw time.
+
+### Tabular presentation
+
+The list view answers "find a receiver by quality, availability and
+location" better than the map: the map shows where receivers are, but it
+cannot rank them. The list becomes the default view, and the map stays
+one click away.
+
+* **One row source.** The filtered, sorted row vector the table draws
+  (`m_rows`) also feeds the map. The map shows the same filtered set, and
+  selection is shared, so a row picked in the list is centred on the map.
+* **Filter bar.** The filters people use most move out of the popup into
+  one row above the table:
+  * **Quality:** Any / Fair+ / Good+ / Excellent;
+  * **Available:** hides full receivers, receivers with no handler and
+    TLS entries the source cannot open (today's "Hide full" and
+    "Connectable only" merged);
+  * **Distance:** Any / 500 / 1000 / 2000 / 5000 km. It is disabled with
+    a hint when no QTH is set;
+  * **Region:** Any / one continent / one country, a combo built from the
+    countries present;
+  * **Here:** "covers the current frequency";
+  * **Search,** as now.
+
+  The other filters stay in "More filters...": kinds, full control, IQ,
+  waterfall, EXT API, favourites, antenna connected, day / night at the
+  receiver. A badge on the button counts the active ones.
+* **Sort presets** in a combo, next to clickable headers:
+  * **Best** (the default): grade first, then free slots, then distance;
+  * **Nearest;**
+  * **Most free;**
+  * **Quality:** the rank key.
+
+  A click on a header overrides the preset until the preset is chosen
+  again.
+* **Desktop columns** (wide: 70 em or more):
+
+  | column | content | sort |
+  |--------|---------|------|
+  | ★ | favourite toggle, clickable | favourites first |
+  | Name | kind glyph (the map's marker shape and fill), then the name; greyed with the reason in a tooltip when not connectable | name |
+  | Quality | grade chip, value, source letter (S spectrum, F FT8, P probe); tooltip with per-band values and age | rank key |
+  | Users | free/max as a small bar, red when full | free slots |
+  | km | distance from the QTH | distance |
+  | Country | two-letter code, full name in a tooltip | name |
+  | Range | served range in MHz | upper edge |
+  | Seen | age | age |
+
+  These are 8 columns. Hidden by default and enabled from the header
+  context menu (`ImGuiTableFlags_Hideable`, already set): Kind,
+  Location, Antenna, Version, Bands (the FT8 band badges, as UberSDR
+  shows them).
+* **Medium width** (40–70 em: a small desktop window, a tablet, a phone
+  in landscape). The same table drops columns by priority: Range, Seen,
+  Country, then km. Name, Quality and Users always stay. A column the
+  user enabled by hand is kept.
+* **Phone** (under 40 em, the portrait phone):
+  * **No table.** Each receiver is a two-line row with a full-width touch
+    target, at least `style::touchStyle` height:
+
+    ```
+    ▲ OK1XYZ Praha 40m loop                     GOOD 28 S
+      CZ · 312 km · 3 of 8 free · 5 min ago
+    ```
+
+  * **Controls.** Search on its own row; under it the Sort combo and a
+    "Filters (n)" button.
+  * **Filters page.** The button opens a full-screen filters page with
+    large controls: the same filter state as desktop.
+  * **Detail page.** A tap opens a full-screen detail page in place of
+    the list: all `details`, the per-band chips, Test, Connect, Favourite,
+    "Show on map", and Back. It replaces the 40 % bottom panel, which
+    leaves too few rows on a phone.
+  * **Map / List** stays a two-way toggle in the top row.
+  * **Scrolling.** `ImGuiListClipper` with a fixed two-line row height,
+    so 1,500 rows scroll smoothly.
+* **The tier is chosen from the popup's content width in em,** not from
+  the platform. A narrow desktop window gets the phone layout too, and
+  the layout follows `style::touchStyle` rather than `__ANDROID__`.
+* **Persistence.** The filter bar, the sort preset and the user's column
+  choices are saved under the view's config prefix, as the filters are
+  now. The phone and desktop tiers share the filter state, not the
+  column state.
+
 ### Gentleness
 
 * **Directory fetches:** one request per provider per refresh, sequential,
@@ -287,7 +503,8 @@ sigpath::remoteRegistry.unregisterHandler(kind);             // in the destructo
 
 ## Steps
 
-Steps 1–7, 9 and the Web-888 provider are implemented as described; step 8 is open.
+Steps 1–7, 9 and the Web-888 provider are implemented as described; steps
+8 and 10–15 are open.
 
 1. **Extract, behaviour-neutral.** Move `GeoMap` and `earcut.hpp` to
    `core/src/gui/remote/`; add the model, the directory service with its
@@ -322,6 +539,31 @@ Steps 1–7, 9 and the Web-888 provider are implemented as described; step 8 is 
    KiwiSDR handler greys. The bridge labels every waterfall line zoom 0,
    so `kiwisdr_source` detects a server whose headers never follow a zoom
    request and keeps that session at zoom 0.
+10. **Quality model.** `RemoteQuality` replaces `snrDb`. KiwiSDR and
+    Web-888 take the HF value; the UberSDR provider fetches
+    `?conditions=true` and fills `Ft8Bands`; `antennaConnected` and
+    `adcOverload` are filled. Per-source percentile grades and the rank
+    key are computed in `rebuild()`. Tests: parsing the pair with HF 0,
+    stale FT8 data, grade boundaries.
+11. **Country and continent.** Point-in-polygon against `map.json`,
+    loaded through `GeoMap`'s parser but kept apart from drawing, so the
+    list works before the map has ever drawn. Tests: a handful of known
+    receivers, a coastal point, mid-ocean.
+12. **Desktop table.** The new columns, sort presets, filter bar, "More
+    filters..." with its count, and the list as the default view. One
+    row vector feeds list and map, and selection is shared.
+13. **Responsive tiers.** Width-driven column priority (medium), then
+    the two-line phone rows with full-screen filter and detail pages.
+    Test on Android portrait and landscape, and in a narrow desktop
+    window.
+14. **Probe quality.** Each handler's probe reads a few spectrum frames
+    and reports P95 minus median over the window around the current
+    frequency (`ProbeResult` gains a `std::optional<RemoteQuality>`).
+    SpyServer and OpenWebRX+ probes are extended past their current stop
+    points. The value shows as source P.
+15. **Day / night filter and band chips:** solar elevation at the
+    receiver, and the FT8 per-band chips in the Bands column and the
+    detail page.
 
 ## Open questions
 
