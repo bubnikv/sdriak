@@ -19,6 +19,7 @@
 #include <gui/widgets/volume_meter.h>
 #include <regex>
 #include <gui/widgets/folder_select.h>
+#include <gui/widgets/narrow_iq_notice.h>
 #include <recorder_interface.h>
 #include <core.h>
 #include <utils/optionlist.h>
@@ -270,6 +271,7 @@ private:
         }
         ImGui::Columns(1, CONCAT("EndRecorderModeColumns##_", _this->name), false);
         ImGui::EndGroup();
+        if (_this->recMode == RECORDER_MODE_BASEBAND) { ImGui::NarrowIQNotice(); }
 
         // Recording path
         if (_this->folderSelect.render("##_recorder_fold_" + _this->name)) {

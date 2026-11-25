@@ -36,6 +36,7 @@ enum Mode {
 };
 
 #include "export_session.h"
+#include <gui/widgets/narrow_iq_notice.h>
 
 using iq_exporter::ExportSession;
 
@@ -293,6 +294,7 @@ private:
             _this->setMode(_this->modes.value(_this->modeId));
             config.edit().section(_this->name).set("mode", _this->modes.key(_this->modeId));
         }
+        if (_this->mode == MODE_BASEBAND) { ImGui::NarrowIQNotice(); }
 
         // In VFO mode, show samplerate selector
         if (_this->mode == MODE_VFO) {

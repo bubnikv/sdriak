@@ -103,6 +103,14 @@ if (OPT_BUILD_TESTS AND NOT ANDROID)
     target_link_libraries(frame_tap_tests PRIVATE sdrpp_core)
     add_test(NAME frame_tap_tests COMMAND frame_tap_tests)
 
+    add_executable(iq_window_tests tests/iq_window_tests.cpp)
+    target_link_libraries(iq_window_tests PRIVATE sdrpp_core)
+    add_test(NAME iq_window_tests COMMAND iq_window_tests)
+
+    add_executable(spectrum_frame_tests tests/spectrum_frame_tests.cpp)
+    target_link_libraries(spectrum_frame_tests PRIVATE sdrpp_core)
+    add_test(NAME spectrum_frame_tests COMMAND spectrum_frame_tests)
+
     add_executable(rigctl_server_tests tests/rigctl_server_tests.cpp)
     target_link_libraries(rigctl_server_tests PRIVATE sdrpp_core)
     add_test(NAME rigctl_server_tests COMMAND rigctl_server_tests)

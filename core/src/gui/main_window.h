@@ -8,6 +8,9 @@
 #include <mutex>
 #include <gui/tuner.h>
 #include <gui/waterfall_autorange.h>
+#include <signal_path/server_zoom.h>
+
+class SpectrumProvider;
 
 #define WINDOW_FLAGS ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBackground
 
@@ -16,6 +19,12 @@ public:
     void init();
     void draw();
     void setViewBandwidthSlider(float bandwidth);
+    // Move every VFO that sticks out of the waterfall span back inside it.
+    void clampVFOsToSpan();
+    // core::setDisplaySpan(): the span the source's server now shows.
+    void displaySpanConfirmed(double spanHz);
+    // Why the source's server waterfall fell back to the local FFT, or "".
+    const std::string& spectrumFallbackNotice() const { return spectrumNotice; }
     bool sdrIsRunning();
     void setFirstMenuRender();
     void onContentScaleChanged(float oldScale);
@@ -50,6 +59,19 @@ public:
 
 private:
     static void vfoAddedHandler(VFOManager::VFO* vfo, void* ctx);
+    // UI tick: follow the provider's zoom ladder and send wheel steps.
+    void serverZoomTick();
+    // UI tick: fall back to the local FFT when the provider is unavailable,
+    // and switch waterfall levels when the provider changes.
+    void spectrumProviderTick();
+    // Waterfall levels per provider: config waterfallLevels[<name>|"local"].
+    void loadLevels(const std::string& key, const SpectrumProvider* provider);
+    void persistLevels();
+
+    std::string levelsKey;
+    std::string spectrumNotice;
+
+    ServerZoom serverZoom;
 
     // Right-hand strip of the main window: Zoom / Range / Ref sliders and the
     // auto-range button. Drawn from draw(), into the third window column.

@@ -136,7 +136,7 @@ void IQFrontEnd::setSampleRate(double sampleRate) {
     effectiveSr = _sampleRate / _decimRatio;
     dcBlock.setRate(genDCBlockRate(effectiveSr));
     for (auto& [name, vfo] : vfos) {
-        vfo->setInSamplerate(effectiveSr);
+        if (!isVFORouted(name)) { vfo->setInSamplerate(effectiveSr); }
     }
 
     // Reconfigure the FFT
@@ -173,6 +173,31 @@ void IQFrontEnd::setDCBlocking(bool enabled) {
 
 void IQFrontEnd::setInvertIQ(bool enabled) {
     preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    _invertIQ = enabled;
+}
+
+void IQFrontEnd::setSpectrumProvider(SpectrumProvider* provider) {
+    if (provider == _spectrumProvider) { return; }
+    const bool wasLocal = (_spectrumProvider == nullptr);
+    _spectrumProvider = provider;
+    _spectrumQueue.clear();
+    if (provider && wasLocal) {
+        split.unbindStream(&fftIn);
+    }
+    else if (!provider) {
+        split.bindStream(&fftIn);
+        const int size = _pendingFFTSize;
+        _pendingFFTSize = -1;
+        updateFFTPath(true, size);
+    }
+}
+
+void IQFrontEnd::setNarrowIQ(bool narrow, double offset, double width) {
+    _narrowIQOffset = narrow ? offset : 0.0;
+    _narrowIQWidth = narrow ? width : 0.0;
+    if (narrow == _narrowIQ) { return; }
+    _narrowIQ = narrow;
+    onNarrowIQChanged.emit(narrow);
 }
 
 void IQFrontEnd::addPreprocessor(dsp::Processor<dsp::complex_t, dsp::complex_t>* processor, bool enabled) {
@@ -278,13 +303,38 @@ void IQFrontEnd::removeVFO(std::string name) {
     // Stop the VFO
     vfo->stop();
 
-    unbindIQStream(vfoIn);
+    // A routed VFO's own stream is not bound.
+    if (routedVFOs.erase(name) == 0) { unbindIQStream(vfoIn); }
     vfoStreams.erase(name);
     vfos.erase(name);
 
     // Delete the VFO and its input stream
     delete vfo;
     delete vfoIn;
+}
+
+bool IQFrontEnd::routeVFOInput(const std::string& name, dsp::stream<dsp::complex_t>* input, double sampleRate) {
+    auto it = vfos.find(name);
+    if (it == vfos.end()) { return false; }
+    dsp::channel::RxVFO* vfo = it->second;
+    dsp::stream<dsp::complex_t>* own = vfoStreams[name];
+    const bool routed = isVFORouted(name);
+    if (input) {
+        // Unbind first, so the splitter never blocks on a stream nobody
+        // reads; setInput() stops and restarts the VFO's worker.
+        if (!routed) { unbindIQStream(own); }
+        vfo->setInput(input);
+        vfo->setInSamplerate(sampleRate);
+        routedVFOs[name] = sampleRate;
+    }
+    else {
+        if (!routed) { return true; }
+        vfo->setInput(own);
+        vfo->setInSamplerate(effectiveSr);
+        routedVFOs.erase(name);
+        bindIQStream(own);
+    }
+    return true;
 }
 
 void IQFrontEnd::setFFTSize(int size) {
@@ -434,6 +484,13 @@ void IQFrontEnd::genFFTWindow(float* buf, int size) {
 }
 
 void IQFrontEnd::updateFFTPath(bool updateWaterfall, int newFFTSize) {
+    // A provider owns the waterfall and fftIn gets no samples: keep the
+    // request for setSpectrumProvider(nullptr), which rebuilds everything.
+    if (_spectrumProvider) {
+        if (newFFTSize > 0) { _pendingFFTSize = newFFTSize; }
+        return;
+    }
+
     // Temp stop branch. Scope guards, not bare tempStop()/tempStart(): the
     // reallocations below throw on OOM, and a throw past a bare tempStart()
     // leaves the FFT path stopped for good -- a frozen waterfall on top of

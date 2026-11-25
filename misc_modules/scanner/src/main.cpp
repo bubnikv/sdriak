@@ -3,6 +3,7 @@
 #include <gui/gui.h>
 #include <gui/style.h>
 #include <signal_path/signal_path.h>
+#include <gui/widgets/narrow_iq_notice.h>
 #include <chrono>
 #include <atomic>
 
@@ -50,6 +51,7 @@ private:
         // EndDisabled pair below unbalanced (the #1437 stack-mismatch pattern).
         bool running = _this->running.load(std::memory_order_relaxed);
 
+        ImGui::NarrowIQNotice();
         if (running) { ImGui::BeginDisabled(); }
         ImGui::LeftLabel("Start");
         ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());

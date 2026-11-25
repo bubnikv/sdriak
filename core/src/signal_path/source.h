@@ -19,6 +19,11 @@ public:
         void (*stopHandler)(void* ctx);
         void (*tuneHandler)(double freq, void* ctx);
         void* ctx;
+        // Once per GUI frame while the source is selected, on the UI thread,
+        // after the VFOs took the waterfall's changes (MainWindow::draw()).
+        // The place to read VFO geometry or apply state a network thread
+        // reported. Never called in --server mode.
+        void (*uiTickHandler)(void* ctx) = nullptr;
     };
 
     enum TuningMode {
@@ -34,7 +39,11 @@ public:
     void stop();
     void tune(double freq);
     void setTuningOffset(double offset);
+    // Converter offset: display frequency = hardware frequency + offset.
+    double getTuningOffset() const { return tuneOffset; }
     void setTuningMode(TuningMode mode);
+    // UI thread, once per frame: the selected source's uiTickHandler.
+    void uiTick();
     void setPanadapterIF(double freq);
 
     // Constrain / release the main-window frequency selector. Sources pass

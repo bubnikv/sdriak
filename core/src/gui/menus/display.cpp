@@ -220,6 +220,14 @@ namespace displaymenu {
             ImGui::EndCombo();
         }
 
+        // The provider's frames replace the local FFT, so its settings would
+        // only be stored; show them but keep them read-only.
+        const bool spectrumFromSource = (sigpath::iqFrontEnd.spectrumProvider() != nullptr);
+        if (spectrumFromSource) {
+            ImGui::TextDisabled("Spectrum supplied by the source");
+            style::beginDisabled();
+        }
+
         ImGui::LeftLabelFill("FFT Framerate");
         if (ImGui::InputInt("##sdrpp_fft_rate", &fftRate, 1, 10)) {
             fftRate = std::max<int>(1, fftRate);
@@ -239,6 +247,7 @@ namespace displaymenu {
             sigpath::iqFrontEnd.setFFTWindow(fftWindows.value(selectedWindow));
             core::configManager.edit().set("fftWindow", fftWindows.key(selectedWindow));
         }
+        if (spectrumFromSource) { style::endDisabled(); }
 
         if (colorMapNames.size() > 0) {
             ImGui::LeftLabelFill("Color Map");

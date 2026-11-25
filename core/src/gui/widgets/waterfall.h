@@ -2,6 +2,7 @@
 #include <vector>
 #include <mutex>
 #include <cmath>
+#include <functional>
 #include <gui/widgets/bandplan.h>
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
@@ -70,6 +71,9 @@ namespace ImGui {
         bool redrawRequired = true;
         bool lineVisible = true;
         bool bandwidthChanged = false;
+        // Passband outside the source's IQ window (VFOManager::setIQWindow);
+        // drawn hatched, and the VFO is muted.
+        bool outOfWindow = false;
 
         double minBandwidth;
         double maxBandwidth;
@@ -90,6 +94,7 @@ namespace ImGui {
         void draw();
         float* getFFTBuffer();
         void pushFFT();
+        int getRawFFTSize() const { return rawFFTSize; }
 
         void updatePallette(float colors[][3], int colorCount);
         void updatePalletteFromArray(const float* colors, int colorCount);
@@ -136,6 +141,13 @@ namespace ImGui {
         int getFFTHeight();
 
         void setRawFFTSize(int size);
+        // Clears the stored lines (to -200 dB) and the drawn waterfall:
+        // history in another span or geometry would be drawn wrong.
+        void resetHistory();
+
+        // Zoom wheel and pinch go here first; returning true consumes them
+        // and the local view zoom stays unchanged (server zoom).
+        std::function<bool(float steps)> zoomOverride;
 
         void setFullWaterfallUpdate(bool fullUpdate);
 

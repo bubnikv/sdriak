@@ -2,6 +2,8 @@
 #include <assert.h>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <mutex>
 #include <utility>
 #include "frequency_xlator.h"
@@ -175,10 +177,21 @@ namespace dsp::channel {
                     inSamplerate, _outSamplerate, _maxBlock));
         }
 
+        // Any thread. A muted VFO still runs the whole chain, so its output
+        // keeps its sample count and its filter history; it only writes
+        // zeros.
+        void setMuted(bool muted) { m_muted.store(muted, std::memory_order_release); }
+        bool muted() const { return m_muted.load(std::memory_order_acquire); }
+        // Any thread: zero the output for the next `inputSamples` input
+        // samples (counted from the next processed block). Hides the
+        // transient of an IQ-window commit. Replaces a running countdown.
+        void muteFor(int inputSamples) { m_muteSamples.store((std::max)(0, inputSamples), std::memory_order_release); }
+
         // IN-PLACE: safe in practice (in == out). FrequencyXlator relies on
         // undocumented VOLK aliasing behavior; RationalResampler and FIR are
         // in-place safe and then run on out.
         inline int process(int count, const complex_t* in, complex_t* out) {
+            const int inCount = count;
             xlator.process(count, in, out);
             count = resamp.process(count, out, out);
             // filterNeeded is written by setBandwidth() from the UI while this
@@ -188,10 +201,24 @@ namespace dsp::channel {
                 std::lock_guard<std::mutex> lck(filterMtx);
                 if (filterNeeded) { filter.process(count, out, out); }
             }
+            if (consumeMute(inCount) && count > 0) {
+                std::memset((void*)out, 0, (size_t)count * sizeof(complex_t));
+            }
             return count;
         }
 
     protected:
+        // True when this block's output must be zeroed. A muteFor() that
+        // lands while the countdown is updated wins over the update.
+        bool consumeMute(int inCount) {
+            int left = m_muteSamples.load(std::memory_order_acquire);
+            if (left > 0) {
+                m_muteSamples.compare_exchange_strong(left, (std::max)(0, left - inCount), std::memory_order_acq_rel);
+                return true;
+            }
+            return m_muted.load(std::memory_order_acquire);
+        }
+
         tap<float> generateTaps() const {
             return generateTaps(_bandwidth, _outSamplerate);
         }
@@ -228,6 +255,9 @@ namespace dsp::channel {
         double _outSamplerate = 0.0;
         double _bandwidth = 0.0;
         double _offset = 0.0;
+
+        std::atomic<bool> m_muted{false};
+        std::atomic<int> m_muteSamples{0};
 
         std::mutex filterMtx;
     };
@@ -280,6 +310,10 @@ namespace dsp::channel {
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
             kernel.setBandwidth(bandwidth);
         }
+
+        // Lock-free, any thread; see RxVFOKernel.
+        void setMuted(bool muted) { kernel.setMuted(muted); }
+        void muteFor(int inputSamples) { kernel.muteFor(inputSamples); }
 
         // IN-PLACE: safe (in == out). Delegates to RxVFOKernel above.
         inline int process(int count, const complex_t* in, complex_t* out) {

@@ -129,6 +129,19 @@ namespace ImGui {
         glGenTextures(1, &textureId);
     }
 
+    // Diagonal hatch over a VFO passband outside the IQ window.
+    static void drawOutOfWindowHatch(ImDrawList* drawList, ImVec2 min, ImVec2 max) {
+        if (max.x <= min.x || max.y <= min.y) { return; }
+        const float step = style::dp(6.0f);
+        const ImU32 col = IM_COL32(255, 80, 80, 150);
+        drawList->PushClipRect(min, max, true);
+        const float h = max.y - min.y;
+        for (float x = min.x - h; x < max.x; x += step) {
+            drawList->AddLine(ImVec2(x, max.y), ImVec2(x + h, min.y), col, style::lineWidth());
+        }
+        drawList->PopClipRect();
+    }
+
     void WaterFall::drawFFT() {
         std::lock_guard<std::recursive_mutex> lck(latestFFTMtx);
         // Calculate scaling factor
@@ -233,6 +246,7 @@ namespace ImGui {
             IS_IN_AREA(mPos, wfMin, wfMax) && !gui::mainWindow.lockWaterfallControls && !inputHandled) {
             for (auto const& [name, vfo] : vfos) {
                 window->DrawList->AddRectFilled(vfo->wfRectMin, vfo->wfRectMax, vfo->color);
+                if (vfo->outOfWindow) { drawOutOfWindowHatch(window->DrawList, vfo->wfRectMin, vfo->wfRectMax); }
                 if (!vfo->lineVisible) { continue; }
                 window->DrawList->AddLine(vfo->wfLineMin, vfo->wfLineMax, (name == selectedVFO) ? IM_COL32(255, 0, 0, 255) : IM_COL32(255, 255, 0, 255), style::lineWidth());
             }
@@ -561,6 +575,7 @@ namespace ImGui {
 #endif
         if (mouseWheel != 0.0f && ImGui::GetIO().KeyCtrl && (mouseInFFT || mouseInWaterfall || mouseInFreq))
             zoomWheel = mouseWheel;
+        if (zoomWheel != 0.0f && zoomOverride && zoomOverride(zoomWheel)) { return; }
         if (zoomWheel != 0.0f) {
             double newBw = viewBandwidth * std::pow(0.9, (double)zoomWheel);
             newBw = std::clamp(newBw, wholeBandwidth / 200.0, wholeBandwidth);
@@ -613,6 +628,7 @@ namespace ImGui {
                     ImGui::BeginTooltip();
 
                     ImGui::TextUnformatted(name.c_str());
+                    if (_vfo->outOfWindow) { ImGui::TextUnformatted("Outside the server's IQ window"); }
 
                     if (ImGui::GetIO().KeyCtrl) {
                         ImGui::Separator();
@@ -1530,6 +1546,15 @@ namespace ImGui {
         updateWaterfallFb();
     }
 
+    void WaterFall::resetHistory() {
+        std::lock_guard<std::recursive_mutex> lck(buf_mtx);
+        if (rawFFTs != NULL) {
+            std::fill_n(rawFFTs, (size_t)rawFFTSize * (size_t)std::max<int>(1, waterfallHeight), -200.0f);
+        }
+        fftLines = 0;
+        updateWaterfallFb();
+    }
+
     void WaterFall::setBandPlanPos(int pos) {
         bandPlanPos = pos;
     }
@@ -1734,6 +1759,7 @@ namespace ImGui {
 
     void WaterfallVFO::draw(ImGuiWindow* window, bool selected) {
         window->DrawList->AddRectFilled(rectMin, rectMax, color);
+        if (outOfWindow) { drawOutOfWindowHatch(window->DrawList, rectMin, rectMax); }
         if (lineVisible) {
             window->DrawList->AddLine(lineMin, lineMax, selected ? IM_COL32(255, 0, 0, 255) : IM_COL32(255, 255, 0, 255), style::lineWidth());
         }

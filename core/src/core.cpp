@@ -51,6 +51,14 @@ namespace core {
         return ConfigManager::flushAll();
     }
 
+    // Whole span, no local zoom.
+    static void resetWaterfallSpan(double span) {
+        gui::waterfall.setBandwidth(span);
+        gui::waterfall.setViewOffset(0);
+        gui::waterfall.setViewBandwidth(span);
+        gui::mainWindow.setViewBandwidthSlider(1.0);
+    }
+
     void setInputSampleRate(double samplerate) {
         // Forward this to the server
         if (args["server"].b()) { server::setInputSampleRate(samplerate); return; }
@@ -59,14 +67,33 @@ namespace core {
         sigpath::iqFrontEnd.setSampleRate(samplerate);
         double effectiveSr  = sigpath::iqFrontEnd.getEffectiveSamplerate();
         
-        // Reset zoom
-        gui::waterfall.setBandwidth(effectiveSr);
-        gui::waterfall.setViewOffset(0);
-        gui::waterfall.setViewBandwidth(effectiveSr);
-        gui::mainWindow.setViewBandwidthSlider(1.0);
+        // Reset zoom. A span set by the source replaces the rate as the
+        // waterfall's width; the DSP still runs at the effective rate.
+        double span = sigpath::iqFrontEnd.displaySpanOverride();
+        resetWaterfallSpan((span > 0.0) ? span : effectiveSr);
 
         // Debug logs
         flog::info("New DSP samplerate: {0} (source samplerate is {1})", effectiveSr, samplerate);
+    }
+
+    void setDisplaySpan(double spanHz) {
+        if (args["server"].b() || !(spanHz > 0.0)) { return; }
+        const bool changed = (spanHz != gui::waterfall.getBandwidth());
+        sigpath::iqFrontEnd.setDisplaySpanOverride(spanHz);
+        resetWaterfallSpan(spanHz);
+        gui::mainWindow.displaySpanConfirmed(spanHz);
+        gui::mainWindow.clampVFOsToSpan();
+        if (changed) { gui::waterfall.resetHistory(); }
+    }
+
+    void clearDisplaySpan() {
+        if (args["server"].b() || sigpath::iqFrontEnd.displaySpanOverride() == 0.0) { return; }
+        sigpath::iqFrontEnd.setDisplaySpanOverride(0.0);
+        const double effectiveSr = sigpath::iqFrontEnd.getEffectiveSamplerate();
+        const bool changed = (effectiveSr != gui::waterfall.getBandwidth());
+        resetWaterfallSpan(effectiveSr);
+        gui::mainWindow.clampVFOsToSpan();
+        if (changed) { gui::waterfall.resetHistory(); }
     }
 
     // Relative paths from the config (e.g. "./modules" on Windows, "../Plugins"

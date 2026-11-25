@@ -3,17 +3,17 @@
 #include <gui/icons.h> // icons::CONTRAST
 #include <gui/style.h>
 #include <gui/widgets/toggle_style.h>
-#include <core.h>      // core::configManager
 #ifdef __ANDROID__
 #include <android_backend.h>
 #endif
 #include <algorithm>
 #include <cmath>
 
-void WaterfallAutoRange::init(float* min, float* max, bool stickyFromConfig) {
+void WaterfallAutoRange::init(float* min, float* max, bool sticky, std::function<void()> persistLevels) {
     fftMin = min;
     fftMax = max;
-    stickyEnabled = stickyFromConfig;
+    persist = std::move(persistLevels);
+    stickyEnabled = sticky;
     initialized = false;
     normalizeRange();
 }
@@ -50,22 +50,15 @@ void WaterfallAutoRange::oneShotFit() {
     gui::waterfall.freeAutorangeScratch();
     if (!ok) { return; }
     applyRef(ref);
-    auto configAccess = core::configManager.edit();
-    configAccess.set("min", *fftMin);
-    configAccess.set("max", *fftMax);
+    if (persist) { persist(); }
 }
 
 void WaterfallAutoRange::setSticky(bool on) {
     stickyEnabled = on;
     initialized = false; // snap to the first fit on (re)acquire
-    auto configAccess = core::configManager.edit();
-    configAccess.set("waterfallAutoRange", stickyEnabled);
-    if (!stickyEnabled) {
-        // Persist wherever the auto-scaler left the range so the manual
-        // sliders resume from there.
-        configAccess.set("min", *fftMin);
-        configAccess.set("max", *fftMax);
-    }
+    // Also stores wherever the auto-scaler left the range, so the manual
+    // sliders resume from there.
+    if (persist) { persist(); }
 }
 
 // Glyph and the padding around it, matching the toolbar's ImageButtons.

@@ -12,6 +12,12 @@ namespace core {
     SDRPP_EXPORT CommandArgsParser args;
 
     void setInputSampleRate(double samplerate);
+    // The waterfall span a source's server shows, independent of the IQ
+    // rate: resets zoom, clears the waterfall history on a change and keeps
+    // the VFOs inside. clearDisplaySpan() returns to the effective sample
+    // rate. UI thread; both are no-ops in --server mode.
+    void setDisplaySpan(double spanHz);
+    void clearDisplaySpan();
 
     // Commit live UI state that is not continuously persisted, then synchronously
     // flush every autosaved core and module config. This is non-terminal because

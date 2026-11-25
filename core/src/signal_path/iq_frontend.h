@@ -8,6 +8,9 @@
 #include "../dsp/sink.h"
 #include "../dsp/math/conjugate.h"
 #include "../dsp/buffer/fftw.h"
+#include "spectrum_provider.h"
+#include "spectrum_frame.h"
+#include <utils/event.h>
 
 class IQFrontEnd {
 public:
@@ -32,7 +35,38 @@ public:
     void setBuffering(bool enabled);
     void setDecimation(int ratio);
     void setInvertIQ(bool enabled);
+    bool getInvertIQ() const { return _invertIQ; }
     void setDCBlocking(bool enabled);
+
+    // UI thread. A provider supplies the waterfall instead of the local FFT:
+    // fftIn is unbound from the splitter, so the FFT branch gets no samples
+    // and costs nothing. FFT size, rate and window changes are stored and
+    // applied when the local FFT returns. nullptr rebinds fftIn and
+    // restarts the local FFT with a cleared waterfall. Either way the frame
+    // queue is emptied. GUI only; see spectrum_provider.h.
+    void setSpectrumProvider(SpectrumProvider* provider);
+    SpectrumProvider* spectrumProvider() const { return _spectrumProvider; }
+
+    // Provider frames. push: any thread, never blocks (SpectrumQueue).
+    // pop: UI thread, only frames that are due.
+    bool pushSpectrum(SpectrumFrame&& frame) { return _spectrumQueue.push(std::move(frame)); }
+    bool popSpectrum(SpectrumFrame& out) { return _spectrumQueue.pop(out); }
+    uint64_t droppedSpectrumFrames() const { return _spectrumQueue.dropped(); }
+
+    // Display span set by the source (core::setDisplaySpan), or 0 when the
+    // waterfall shows the effective sample rate.
+    void setDisplaySpanOverride(double spanHz) { _displaySpan = spanHz; }
+    double displaySpanOverride() const { return _displaySpan; }
+
+    // The IQ carries only a narrow window of the display (offset from the
+    // display centre and width, Hz), set by VFOManager::setIQWindow and
+    // cleared by clearIQWindow. Consumers that want the whole band warn
+    // (ImGui::NarrowIQNotice). UI thread.
+    void setNarrowIQ(bool narrow, double offset = 0.0, double width = 0.0);
+    bool isIQNarrow() const { return _narrowIQ; }
+    double narrowIQOffset() const { return _narrowIQOffset; }
+    double narrowIQWidth() const { return _narrowIQWidth; }
+    Event<bool> onNarrowIQChanged;
 
     // Runtime insertion of external blocks (e.g. wideband noise reduction)
     // into the pre-processing chain, ahead of the FFT and all VFOs.
@@ -45,6 +79,12 @@ public:
 
     dsp::channel::RxVFO* addVFO(std::string name, double sampleRate, double bandwidth, double offset);
     void removeVFO(std::string name);
+    // UI thread: feed VFO `name` from `input` at `sampleRate` (a source's
+    // stream of its own for that VFO) instead of the splitter; nullptr
+    // restores the splitter feed. The caller keeps `input` written until it
+    // routes the VFO back. False when there is no such VFO.
+    bool routeVFOInput(const std::string& name, dsp::stream<dsp::complex_t>* input, double sampleRate);
+    bool isVFORouted(const std::string& name) const { return routedVFOs.count(name) != 0; }
 
     void setFFTSize(int size);
     void setFFTRate(double rate);
@@ -113,6 +153,9 @@ protected:
     // VFOs
     std::map<std::string, dsp::stream<dsp::complex_t>*> vfoStreams;
     std::map<std::string, dsp::channel::RxVFO*> vfos;
+    // VFOs fed by routeVFOInput(), with their input rate; their own input
+    // stream is unbound from the splitter meanwhile.
+    std::map<std::string, double> routedVFOs;
 
     // Parameters
     double _sampleRate;
@@ -138,6 +181,16 @@ protected:
     float* fftDbOut = NULL;
 
     double effectiveSr;
+
+    bool _invertIQ = false;
+    SpectrumProvider* _spectrumProvider = nullptr;
+    SpectrumQueue _spectrumQueue;
+    // FFT size requested while a provider is active, or -1.
+    int _pendingFFTSize = -1;
+    double _displaySpan = 0.0;
+    bool _narrowIQ = false;
+    double _narrowIQOffset = 0.0;
+    double _narrowIQWidth = 0.0;
 
     bool _init = false;
 

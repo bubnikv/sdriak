@@ -100,6 +100,13 @@ void SourceManager::tune(double freq) {
     currentFreq = freq;
 }
 
+void SourceManager::uiTick() {
+    if (selectedHandler == NULL || selectedHandler->uiTickHandler == nullptr) {
+        return;
+    }
+    selectedHandler->uiTickHandler(selectedHandler->ctx);
+}
+
 void SourceManager::setTuningOffset(double offset) {
     tuneOffset = offset;
     // The offset shifts the display<->hardware mapping, so the selector limit

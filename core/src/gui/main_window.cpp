@@ -222,15 +222,11 @@ void MainWindow::init() {
     // Read every field first and let go of the lock: applying them tunes the
     // source and steps the module manager, which reach for the config themselves.
     double frequency = 0.0;
-    bool stickyAutoRange = false;
     float rawMenuWidth = 250.0f;
     float rawFftHeight = 150.0f;
     bool centerTuning = false;
     {
         auto configAccess = core::configManager.read();
-        configAccess.tryGet("min", fftMin);
-        configAccess.tryGet("max", fftMax);
-        stickyAutoRange = configAccess.value("waterfallAutoRange", false);
         configAccess.tryGet("frequency", frequency);
         configAccess.tryGet("showMenu", showMenu);
         rawMenuWidth = configAccess.value("menuWidth", rawMenuWidth);
@@ -238,11 +234,7 @@ void MainWindow::init() {
         centerTuning = configAccess.value("centerTuning", false);
     }
 
-    autoRange.init(&fftMin, &fftMax, stickyAutoRange);
-    gui::waterfall.setFFTMin(fftMin);
-    gui::waterfall.setWaterfallMin(fftMin);
-    gui::waterfall.setFFTMax(fftMax);
-    gui::waterfall.setWaterfallMax(fftMax);
+    loadLevels("local", nullptr);
 
     startedWithMenuClosed = !showMenu;
 
@@ -267,7 +259,23 @@ void MainWindow::init() {
     tuningMode = centerTuning ? tuner::TUNER_MODE_CENTER : tuner::TUNER_MODE_NORMAL;
     gui::waterfall.VFOMoveSingleClick = (tuningMode == tuner::TUNER_MODE_CENTER);
 
-    // Correct the offset of all VFOs so that they fit on the screen
+    clampVFOsToSpan();
+
+    // Server zoom takes the zoom wheel and pinch while the provider has a
+    // ladder; otherwise the waterfall zooms its local view.
+    gui::waterfall.zoomOverride = [this](float steps) {
+        if (!serverZoom.active()) { return false; }
+        serverZoom.wheel(steps);
+        return true;
+    };
+
+    autostart = core::args["autostart"].b();
+    initComplete = true;
+
+    core::moduleManager.doPostInitAll();
+}
+
+void MainWindow::clampVFOsToSpan() {
     float finalBwHalf = gui::waterfall.getBandwidth() / 2.0;
     for (auto& [_name, _vfo] : gui::waterfall.vfos) {
         if (_vfo->lowerOffset < -finalBwHalf) {
@@ -279,11 +287,118 @@ void MainWindow::init() {
             continue;
         }
     }
+}
 
-    autostart = core::args["autostart"].b();
-    initComplete = true;
+void MainWindow::displaySpanConfirmed(double spanHz) {
+    serverZoom.confirm(spanHz);
+    bw = serverZoom.sliderPos();
+}
 
-    core::moduleManager.doPostInitAll();
+void MainWindow::loadLevels(const std::string& key, const SpectrumProvider* provider) {
+    levelsKey = key;
+    float min = fftMin;
+    float max = fftMax;
+    bool sticky = false;
+    bool stored = false;
+    {
+        auto configAccess = core::configManager.read();
+        auto levels = configAccess.section("waterfallLevels", key);
+        if (levels.exists()) {
+            stored = true;
+            levels.tryGet("min", min);
+            levels.tryGet("max", max);
+            sticky = levels.value("sticky", false);
+        }
+        else if (key == "local") {
+            // The global keys predate per-provider levels.
+            configAccess.tryGet("min", min);
+            configAccess.tryGet("max", max);
+            sticky = configAccess.value("waterfallAutoRange", false);
+        }
+        else if (provider) {
+            auto [defMin, defMax] = provider->defaultLevels();
+            min = defMin;
+            max = defMax;
+        }
+    }
+    fftMin = min;
+    fftMax = max;
+    autoRange.init(&fftMin, &fftMax, sticky, [this] { persistLevels(); });
+    gui::waterfall.setFFTMin(fftMin);
+    gui::waterfall.setWaterfallMin(fftMin);
+    gui::waterfall.setFFTMax(fftMax);
+    gui::waterfall.setWaterfallMax(fftMax);
+    if (!stored) { persistLevels(); }
+}
+
+void MainWindow::persistLevels() {
+    if (levelsKey.empty()) { return; }
+    auto configAccess = core::configManager.edit();
+    auto levels = configAccess.section("waterfallLevels", levelsKey);
+    levels.set("min", fftMin);
+    levels.set("max", fftMax);
+    levels.set("sticky", autoRange.sticky());
+}
+
+void MainWindow::spectrumProviderTick() {
+    SpectrumProvider* provider = sigpath::iqFrontEnd.spectrumProvider();
+    if (provider && !provider->available()) {
+        std::string reason = provider->unavailableReason();
+        spectrumNotice = "Server waterfall unavailable";
+        if (!reason.empty()) { spectrumNotice += ": " + reason; }
+        sigpath::iqFrontEnd.setSpectrumProvider(nullptr);
+        core::clearDisplaySpan();
+        sigpath::vfoManager.clearIQWindow();
+        provider = nullptr;
+    }
+    else if (provider) {
+        spectrumNotice.clear();
+    }
+
+    std::string key = provider ? provider->name() : std::string("local");
+    if (key != levelsKey) {
+        persistLevels();
+        loadLevels(key, provider);
+    }
+}
+
+void MainWindow::serverZoomTick() {
+    SpectrumProvider* provider = sigpath::iqFrontEnd.spectrumProvider();
+    if (!provider) {
+        serverZoom.setLadder({}, 0.0);
+        return;
+    }
+    serverZoom.setLadder(provider->zoomSpans(), gui::waterfall.getBandwidth());
+    double span = serverZoom.tick(ServerZoom::Clock::now());
+    if (span > 0.0) { provider->requestSpan(span); }
+}
+
+// UI thread, once per frame: draw every due provider frame as a waterfall
+// line, mapped onto the displayed span [C - S/2, C + S/2]. No provider, no
+// work.
+static void pumpSpectrumFrames() {
+    SpectrumProvider* provider = sigpath::iqFrontEnd.spectrumProvider();
+    if (!provider) { return; }
+
+    static SpectrumFrame frame;
+    static std::vector<float> line;
+    while (sigpath::iqFrontEnd.popSpectrum(frame)) {
+        int size = provider->binCount();
+        if (size <= 0) { size = (int)frame.bins.size(); }
+        if (size <= 0) { continue; }
+        // setRawFFTSize() reallocates the history: only on a real change.
+        if (size != gui::waterfall.getRawFFTSize()) { gui::waterfall.setRawFFTSize(size); }
+
+        const double span = gui::waterfall.getBandwidth();
+        const double start = gui::waterfall.getCenterFrequency() - (span / 2.0);
+        line.resize((size_t)size);
+        if (!mapSpectrumFrame(frame, start, span, line.data(), size)) { continue; }
+
+        float* buf = gui::waterfall.getFFTBuffer();
+        if (!buf) { continue; }
+        std::copy(line.begin(), line.end(), buf);
+        gui::waterfall.pushFFT();
+    }
 }
 
 float* MainWindow::acquireFFTBuffer(void* ctx) {
@@ -375,6 +490,10 @@ void MainWindow::draw() {
 
     // Clears wtfVFO->centerOffsetChanged of all VFOs and updates DSP.
     sigpath::vfoManager.updateFromWaterfall(&gui::waterfall);
+    sigpath::sourceManager.uiTick();
+    spectrumProviderTick();
+    serverZoomTick();
+    pumpSpectrumFrames();
 
     // Handle selection of another VFO
     if (gui::waterfall.selectedVFOChanged) {
@@ -1046,11 +1165,19 @@ void MainWindow::drawWaterfallControls(ImGui::WaterfallVFO* vfo, const ImVec4& t
     centerFor(ImGui::CalcTextSize("Zoom").x);
     ImGui::TextUnformatted("Zoom");
     centerFor(sliderW);
+    // With server zoom the slider shows and picks a rung of the ladder.
+    const bool serverZoomActive = serverZoom.active();
+    if (serverZoomActive) { bw = serverZoom.sliderPos(); }
     bool zoomSliderChanged = ImGui::VSliderFloat("##_7_", wfSliderSize, &bw, 1.0, 0.0, "");
     // Applies to the last submitted item: keeps wheel events over the slider
     // from scrolling the child window under it.
     ImGui::SetItemUsingMouseWheel();
-    if (zoomSliderChanged) {
+    if (zoomSliderChanged && serverZoomActive) {
+        double span = serverZoom.slider(bw);
+        SpectrumProvider* provider = sigpath::iqFrontEnd.spectrumProvider();
+        if (span > 0.0 && provider) { provider->requestSpan(span); }
+    }
+    else if (zoomSliderChanged) {
         double factor = (double)bw * (double)bw;
 
         // Map 0.0 -> 1.0 to 1000.0 -> bandwidth
@@ -1077,9 +1204,7 @@ void MainWindow::drawWaterfallControls(ImGui::WaterfallVFO* vfo, const ImVec4& t
     ImGui::SetItemUsingMouseWheel();
     if (rangeSliderChanged) {
         fftMax = fftMin + wfRange;
-        auto configAccess = core::configManager.edit();
-        configAccess.set("min", fftMin);
-        configAccess.set("max", fftMax);
+        persistLevels();
     }
 
     if (sliderSeparators) ImGui::NewLine();
@@ -1100,9 +1225,7 @@ void MainWindow::drawWaterfallControls(ImGui::WaterfallVFO* vfo, const ImVec4& t
             float range = fftMax - fftMin; // keep the user's Range, slide the window
             fftMin = wfRef;
             fftMax = wfRef + range;
-            auto configAccess = core::configManager.edit();
-            configAccess.set("min", fftMin);
-            configAccess.set("max", fftMax);
+            persistLevels();
         }
         ImGui::EndDisabled();
 

@@ -277,6 +277,13 @@ namespace sourcemenu {
 
         sigpath::sourceManager.showSelectedMenu();
 
+        const std::string& spectrumNotice = gui::mainWindow.spectrumFallbackNotice();
+        if (!spectrumNotice.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+            ImGui::TextWrapped("%s", spectrumNotice.c_str());
+            ImGui::PopStyleColor();
+        }
+
         if (ImGui::Checkbox("IQ Correction##_sdrpp_iq_corr", &iqCorrection)) {
             sigpath::iqFrontEnd.setDCBlocking(iqCorrection);
             core::configManager.edit().set("iqCorrection", iqCorrection);

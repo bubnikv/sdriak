@@ -1,5 +1,6 @@
 #pragma once
 #include <imgui/imgui.h>
+#include <functional>
 
 // Continuous ("sticky") waterfall auto-range, driven by the autoscale button.
 //
@@ -22,8 +23,9 @@ public:
     static constexpr float RANGE_MIN = 30.0f;
     static constexpr float RANGE_MAX = 160.0f;
 
-    // Bind to MainWindow's fftMin/fftMax and seed the latch from config.
-    void init(float* fftMin, float* fftMax, bool stickyFromConfig);
+    // Bind to MainWindow's fftMin/fftMax and seed the latch. persist
+    // stores fftMin/fftMax and sticky() wherever the owner keeps them.
+    void init(float* fftMin, float* fftMax, bool sticky, std::function<void()> persist);
 
     // Side of the (square) autoscale button: the app's icon-button footprint,
     // 30 dp glyph + 5 dp padding, as the toolbar buttons use -- squared so the
@@ -56,6 +58,7 @@ private:
 
     float* fftMin = nullptr;
     float* fftMax = nullptr;
+    std::function<void()> persist;
 
     bool stickyEnabled = false;
     bool initialized = false; // animated range seeded from the first fit
