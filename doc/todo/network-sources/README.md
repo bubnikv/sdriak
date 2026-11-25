@@ -1,10 +1,10 @@
 # Networked sources with server-side waterfall: master plan
 
-Date: 2026-11-24. Status: transport/1–3 implemented and committed;
-kiwisdr/1–3 and core-spectrum/1–5 implemented, not committed; spyserver/0
-measured (doc/research/spyserver-streams.md); spyserver/1–4 and ubersdr/1–4 implemented, not
-committed; openwebrx/1–3 implemented and committed (2026-11-25). None of the
-implemented steps has been through its GUI review gate yet.
+Date: 2026-11-25. Status: transport/1–3, kiwisdr/1–3, core-spectrum/1–5,
+spyserver/0–4, ubersdr/1–4 and openwebrx/1–3 implemented, committed and
+pushed. openwebrx/4 is planned, not to be built until asked. sdrconnect/ is
+not to be implemented (no public directory). None of the implemented steps has been through its GUI review
+gate yet.
 
 This folder holds independent, self-contained implementation plans for an
 implementation agent. Each sub-plan lists its own prerequisites, files,
@@ -31,8 +31,20 @@ Two shared foundations come first:
 | [transport/](transport/README.md) | TLS, HTTP proxy, HTTPS requests for every networked source: `WSClient` moved onto libcurl's WebSocket API |
 | [core-spectrum/](core-spectrum/README.md) | the core architecture: spectrum capability, IQ window with stream-position commit, frame ingest, display span and server zoom, levels and fallback |
 
+A fifth source was planned and set aside, since SDRconnect has no public
+server directory:
+
+| source | plan |
+|--------|------|
+| SDRconnect (new `sdrconnect_source`), SDRplay's WebSocket API, port 5454, int16 IQ and uint8 spectrum | [sdrconnect/](sdrconnect/README.md) |
+
+PhantomSDR-Plus receivers with its KiwiSDR bridge need no new source:
+`kiwisdr_source` connects to them
+([../../research/phantomsdr-family.md](../../research/phantomsdr-family.md)).
+
 Related but separate: [../remote-receiver-browser.md](../remote-receiver-browser.md)
-(one map/list browser over the KiwiSDR, UberSDR and SpyServer directories).
+(one map/list browser over the KiwiSDR, Web-888, UberSDR, SpyServer and
+Receiverbook directories).
 
 ## Order and dependencies
 
