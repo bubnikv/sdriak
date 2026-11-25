@@ -70,12 +70,107 @@ namespace spyserver {
         return deviceInfoAvailable;
     }
 
-    void SpyServerClientClass::sendCommand(uint32_t command, void* data, int len) {
+    void SpyServerClientClass::sendCommand(uint32_t command, const void* data, int len) {
+        std::lock_guard lck(m_writeMtx);
         SpyServerCommandHeader* hdr = (SpyServerCommandHeader*)writeBuf;
         hdr->CommandType = command;
         hdr->BodySize = len;
-        memcpy(&writeBuf[sizeof(SpyServerCommandHeader)], data, len);
+        if (len > 0) { memcpy(&writeBuf[sizeof(SpyServerCommandHeader)], data, len); }
         client->write(sizeof(SpyServerCommandHeader) + len, writeBuf);
+    }
+
+    void SpyServerClientClass::ping(std::function<void(bool, uint64_t)> onPong) {
+        {
+            // Queued before the send, so the PONG always finds it.
+            std::lock_guard lck(m_pingMtx);
+            m_pings.push_back(PendingPing{ Clock::now(), std::move(onPong) });
+        }
+        sendCommand(SPYSERVER_CMD_PING, nullptr, 0);
+    }
+
+    void SpyServerClientClass::handlePong() {
+        PendingPing p;
+        {
+            std::lock_guard lck(m_pingMtx);
+            if (m_pings.empty()) { return; }
+            p = std::move(m_pings.front());
+            m_pings.pop_front();
+        }
+        if (p.onPong) { p.onPong(true, m_samplesPublished.load()); }
+    }
+
+    void SpyServerClientClass::expirePings() {
+        std::vector<PendingPing> expired;
+        {
+            std::lock_guard lck(m_pingMtx);
+            const auto deadline = Clock::now() - kPongTimeout;
+            while (!m_pings.empty() && m_pings.front().sentAt < deadline) {
+                expired.push_back(std::move(m_pings.front()));
+                m_pings.pop_front();
+            }
+        }
+        for (auto& p : expired) {
+            if (p.onPong) { p.onPong(false, m_samplesPublished.load()); }
+        }
+    }
+
+    bool SpyServerClientClass::clientSync(SpyServerClientSync& out) const {
+        std::lock_guard lck(m_syncMtx);
+        out = m_sync;
+        return m_syncValid;
+    }
+
+    SpyServerClientClass::IqMeter SpyServerClientClass::readIqMeter() {
+        std::lock_guard lck(m_meterMtx);
+        IqMeter m = m_meter;
+        m_meter = IqMeter();
+        return m;
+    }
+
+    void SpyServerClientClass::meterUInt8(const uint8_t* data, size_t values) {
+        int peak = 0;
+        uint64_t railed = 0;
+        for (size_t i = 0; i < values; i++) {
+            const int v = (int)data[i] - 128;
+            peak = (std::max)(peak, v < 0 ? -v : v);
+            if (data[i] == 0 || data[i] == 255) { railed++; }
+        }
+        std::lock_guard lck(m_meterMtx);
+        m_meter.peak = (std::max)(m_meter.peak, (float)peak / 128.0f);
+        m_meter.railed += railed;
+        m_meter.values += values;
+    }
+
+    void SpyServerClientClass::meterInt16(const int16_t* data, size_t values) {
+        int peak = 0;
+        uint64_t railed = 0;
+        for (size_t i = 0; i < values; i++) {
+            const int v = data[i];
+            peak = (std::max)(peak, v < 0 ? -v : v);
+            if (v >= 32767 || v <= -32767) { railed++; }
+        }
+        std::lock_guard lck(m_meterMtx);
+        m_meter.peak = (std::max)(m_meter.peak, (float)peak / 32768.0f);
+        m_meter.railed += railed;
+        m_meter.values += values;
+    }
+
+    void SpyServerClientClass::handleFft(const uint8_t* data, int count) {
+        if (!onFft || count <= 0) { return; }
+        // Measured: a larger offset brightens the bins (byte = 255 * (dB +
+        // offset + range) / range), the reverse of jp's reconstruction.
+        const float offset = (float)m_fftDbOffset.load();
+        const float range = (float)m_fftDbRange.load();
+        m_fftDb.resize((size_t)count);
+        for (int i = 0; i < count; i++) {
+            m_fftDb[(size_t)i] = -offset - range * (1.0f - (float)data[i] / 255.0f);
+        }
+        FftFrame frame;
+        frame.bins = m_fftDb.data();
+        frame.count = count;
+        frame.arrival = Clock::now();
+        frame.iqIndex = m_samplesPublished.load();
+        onFft(frame);
     }
 
     void SpyServerClientClass::sendHandshake(std::string appName) {
@@ -149,14 +244,18 @@ namespace spyserver {
         // stream on 32-bit Android (and twice what one did at 262144 anywhere).
         // convert(offset, n, dst) writes samples [offset, offset + n).
         auto publish = [_this](int sampCount, auto convert) {
+            _this->m_lastMessageSamples = sampCount;
             dsp::stream<dsp::complex_t>* out = _this->output;
             for (int done = 0; done < sampCount;) {
                 const int n = (std::min)(sampCount - done, out->capacity());
                 convert(done, n, out->writeBuf);
                 if (!out->swap(n)) { return; }
+                _this->m_samplesPublished.fetch_add((uint64_t)n);
                 done += n;
             }
         };
+
+        _this->expirePings();
 
         if (mtype == SPYSERVER_MSG_TYPE_DEVICE_INFO) {
             {
@@ -170,11 +269,35 @@ namespace spyserver {
             }
             _this->deviceInfoCnd.notify_all();
         }
+        else if (mtype == SPYSERVER_MSG_TYPE_CLIENT_SYNC) {
+            SpyServerClientSync sync{};
+            memcpy(&sync, _this->readBuf, (std::min)((size_t)bodySize, sizeof(sync)));
+            {
+                std::lock_guard lck(_this->m_syncMtx);
+                _this->m_sync = sync;
+                _this->m_syncValid = true;
+            }
+            _this->m_canControl = (sync.CanControl != 0);
+            _this->m_syncCount.fetch_add(1);
+        }
+        else if (mtype == SPYSERVER_MSG_TYPE_PONG) {
+            _this->handlePong();
+        }
+        else if (mtype == SPYSERVER_MSG_TYPE_UINT8_FFT) {
+            _this->handleFft(_this->readBuf, (int)bodySize);
+        }
+        else if (mtype == SPYSERVER_MSG_TYPE_DINT4_FFT) {
+            if (!_this->m_dint4Logged) {
+                _this->m_dint4Logged = true;
+                flog::warn("SpyServer: DINT4 FFT frames are not supported, ignoring them");
+            }
+        }
         else if (mtype == SPYSERVER_MSG_TYPE_UINT8_IQ) {
             const int sampCount = (int)(bodySize / (sizeof(uint8_t) * 2));
             const float gain = pow(10, (double)mflags / 20.0);
             const float scale = 1.0f / (gain * 128.0f);
             const uint8_t* src = _this->readBuf;
+            _this->meterUInt8(src, (size_t)sampCount * 2);
             publish(sampCount, [src, scale](int offset, int n, dsp::complex_t* dst) {
                 const uint8_t* in = &src[2 * offset];
                 for (int i = 0; i < n; i++) {
@@ -187,6 +310,7 @@ namespace spyserver {
             const int sampCount = (int)(bodySize / (sizeof(int16_t) * 2));
             const float gain = pow(10, (double)mflags / 20.0);
             const int16_t* src = (const int16_t*)_this->readBuf;
+            _this->meterInt16(src, (size_t)sampCount * 2);
             publish(sampCount, [src, gain](int offset, int n, dsp::complex_t* dst) {
                 volk_16i_s32f_convert_32f((float*)dst, &src[2 * offset], 32768.0 * gain, n * 2);
             });
