@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <locale>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -168,7 +169,7 @@ namespace remote {
             return out;
         }
 
-        std::optional<RemoteEntry> parseKiwiEntry(const json& entry) {
+        std::optional<RemoteEntry> parseKiwiEntry(const json& entry, const char* provider) {
             if (!(entry.contains("gps") && entry.contains("name") && entry.contains("url") && entry.contains("loc") &&
                   entry.contains("snr") && entry.contains("users") && entry.contains("users_max") && entry.contains("offline"))) {
                 return std::nullopt;
@@ -194,10 +195,10 @@ namespace remote {
 
             RemoteEntry e;
             e.kind = RemoteKind::KiwiSDR;
-            e.provider = "kiwisdr.com";
+            e.provider = provider;
             e.target = *target;
             e.target.path.clear();
-            e.id = "kiwisdr.com/" + lower(e.target.hostPort());
+            e.id = std::string(provider) + "/" + lower(e.target.hostPort());
             e.name = str(entry, "name");
             e.location = str(entry, "loc");
             e.latLon = std::make_pair(lat, lon);
@@ -253,6 +254,59 @@ namespace remote {
                 r.etag = doc.etag;
                 r.lastModified = doc.lastModified;
                 if (!doc.notModified) { r.entries = parseKiwiSDRDirectory(doc.body); }
+                return r;
+            }
+        };
+
+        // =====================================================================
+        // Web-888 (rx-888.com)
+
+        constexpr const char* RX888_URL = "https://www.rx-888.com/api/devices";
+
+        struct Rx888Provider : DirectoryProvider {
+            std::string id() const override { return "rx-888.com"; }
+            std::string name() const override { return "Web-888"; }
+            FetchResult fetch(const FetchRequest& request) override {
+                auto doc = fetchDocument(RX888_URL, request, 4 * 1024 * 1024);
+                FetchResult r;
+                r.notModified = doc.notModified;
+                r.etag = doc.etag;
+                r.lastModified = doc.lastModified;
+                if (!doc.notModified) { r.entries = parseRx888Directory(doc.body); }
+                return r;
+            }
+        };
+
+        // =====================================================================
+        // sdr-list.xyz
+
+        constexpr const char* SDRLIST_URL = "https://sdr-list.xyz/api/v1/receivers";
+
+        // "2026-11-25T17:39:48Z" as Unix seconds; nullopt when malformed.
+        std::optional<int64_t> parseUtc(const std::string& s) {
+            int y, mo, d, h, mi, sec;
+            if (std::sscanf(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &sec) != 6) { return std::nullopt; }
+            if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) { return std::nullopt; }
+            // Days from the civil date (Howard Hinnant, days_from_civil).
+            y -= mo <= 2;
+            const int era = (y >= 0 ? y : y - 399) / 400;
+            const int yoe = y - era * 400;
+            const int doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+            const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            const int64_t days = (int64_t)era * 146097 + doe - 719468;
+            return days * 86400 + h * 3600 + mi * 60 + sec;
+        }
+
+        struct SdrListProvider : DirectoryProvider {
+            std::string id() const override { return "sdr-list.xyz"; }
+            std::string name() const override { return "sdr-list.xyz"; }
+            FetchResult fetch(const FetchRequest& request) override {
+                auto doc = fetchDocument(SDRLIST_URL, request, 4 * 1024 * 1024);
+                FetchResult r;
+                r.notModified = doc.notModified;
+                r.etag = doc.etag;
+                r.lastModified = doc.lastModified;
+                if (!doc.notModified) { r.entries = parseSdrListDirectory(doc.body, nowUnix()); }
                 return r;
             }
         };
@@ -342,6 +396,8 @@ namespace remote {
     }
 
     std::unique_ptr<DirectoryProvider> makeKiwiSDRProvider() { return std::make_unique<KiwiSDRProvider>(); }
+    std::unique_ptr<DirectoryProvider> makeRx888Provider() { return std::make_unique<Rx888Provider>(); }
+    std::unique_ptr<DirectoryProvider> makeSdrListProvider() { return std::make_unique<SdrListProvider>(); }
     std::unique_ptr<DirectoryProvider> makeSpyServerProvider() { return std::make_unique<SpyServerProvider>(); }
     std::unique_ptr<DirectoryProvider> makeUberSDRProvider() { return std::make_unique<UberSDRProvider>(); }
     std::unique_ptr<DirectoryProvider> makeReceiverbookProvider() { return std::make_unique<ReceiverbookProvider>(); }
@@ -351,7 +407,7 @@ namespace remote {
         std::vector<RemoteEntry> out;
         for (const auto& entry : doc) {
             try {
-                if (auto e = parseKiwiEntry(entry)) { out.push_back(std::move(*e)); }
+                if (auto e = parseKiwiEntry(entry, "kiwisdr.com")) { out.push_back(std::move(*e)); }
             }
             catch (const std::exception& ex) {
                 flog::warn("Skipping a KiwiSDR directory entry: {}", ex.what());
@@ -361,6 +417,123 @@ namespace remote {
         std::stable_sort(out.begin(), out.end(), [](const RemoteEntry& a, const RemoteEntry& b) {
             return a.snrDb.value_or(0.0f) < b.snrDb.value_or(0.0f);
         });
+        return out;
+    }
+
+    std::vector<RemoteEntry> parseRx888Directory(const std::string& body) {
+        const json doc = json::parse(body);
+        if (!doc.is_object() || !doc.contains("devices") || !doc["devices"].is_array()) {
+            throw std::runtime_error("No device list");
+        }
+        std::vector<RemoteEntry> out;
+        std::set<std::string> seen;
+        for (const auto& d : doc["devices"]) {
+            try {
+                if (!d.is_object()) { continue; }
+                // "active", "Inaccessible" (the directory's own reachability
+                // check failed) or "offline".
+                if (lower(str(d, "status")) != "active") { continue; }
+                // The same fields as kiwisdr.com, apart from max_users, no
+                // offline flag, and no loc: the name is "CALL | Location".
+                const std::string name = str(d, "name");
+                const auto bar = name.rfind(" | ");
+                json k = {
+                    { "name", name },
+                    { "url", str(d, "url") },
+                    { "loc", bar == std::string::npos ? std::string() : name.substr(bar + 3) },
+                    { "gps", str(d, "gps") },
+                    { "snr", str(d, "snr") },
+                    { "users", str(d, "users") },
+                    { "users_max", str(d, "max_users") },
+                    { "offline", "no" },
+                    { "sdr_hw", "Web-888" },
+                };
+                if (d.contains("bands")) { k["bands"] = str(d, "bands"); }
+                if (d.contains("antenna")) { k["antenna"] = str(d, "antenna"); }
+                auto e = parseKiwiEntry(k, "rx-888.com");
+                // The list repeats some receivers.
+                if (e && seen.insert(e->id).second) { out.push_back(std::move(*e)); }
+            }
+            catch (const std::exception& ex) {
+                flog::warn("Skipping a Web-888 directory entry: {}", ex.what());
+            }
+        }
+        std::stable_sort(out.begin(), out.end(), [](const RemoteEntry& a, const RemoteEntry& b) {
+            return a.snrDb.value_or(0.0f) < b.snrDb.value_or(0.0f);
+        });
+        return out;
+    }
+
+    std::vector<RemoteEntry> parseSdrListDirectory(const std::string& body, int64_t fetchedUnix) {
+        constexpr int64_t kMaxAge = 24 * 3600;
+        const json doc = json::parse(body);
+        if (!doc.is_array()) { throw std::runtime_error("No receiver list"); }
+        std::vector<RemoteEntry> out;
+        std::set<std::string> seen;
+        for (const auto& s : doc) {
+            try {
+                if (!s.is_object()) { continue; }
+                // PhantomSDR-Plus serves the KiwiSDR protocol through its
+                // bridge. The UberSDR entries are the instances.ubersdr.org
+                // set; NovaSDR, FernSDR and the rest have no source here.
+                if (str(s, "software") != "PhantomSDR+") { continue; }
+                const auto lastSeen = parseUtc(str(s, "last_seen"));
+                if (!lastSeen || fetchedUnix - *lastSeen > kMaxAge) { continue; }
+                const std::string host = str(s, "hostname");
+                const auto port = num(s, "port");
+                if (host.empty() || !port || *port <= 0 || *port > 65535) { continue; }
+
+                RemoteEntry e;
+                e.kind = RemoteKind::KiwiSDR;
+                e.provider = "sdr-list.xyz";
+                e.target.scheme = (int)*port == 443 ? "https" : "http";
+                e.target.host = host;
+                e.target.port = (int)*port;
+                e.tlsRequired = e.target.scheme == "https";
+                e.id = "sdr-list.xyz/" + lower(e.target.hostPort());
+                // A host with several receivers is listed once per receiver
+                // under one host:port.
+                if (!seen.insert(e.id).second) { continue; }
+                e.name = str(s, "name");
+                if (e.name.empty()) { e.name = e.target.hostPort(); }
+                const std::string city = str(s, "location_city");
+                const std::string country = str(s, "location_country");
+                e.location = city.empty() ? country : (country.empty() ? city : city + ", " + country);
+                // The directory publishes a jittered position beside the
+                // exact one; its own map shows the jittered one.
+                auto lat = num(s, "lat_jittered");
+                auto lon = num(s, "lon_jittered");
+                if (!lat || !lon) {
+                    lat = num(s, "lat");
+                    lon = num(s, "lon");
+                }
+                if (lat && lon && validLatLon(*lat, *lon)) { e.latLon = std::make_pair(*lat, *lon); }
+                const auto users = num(s, "users");
+                const auto usersMax = num(s, "max_users");
+                if (users) { e.users = (int)*users; }
+                if (usersMax) { e.usersMax = (int)*usersMax; }
+                const auto lo = num(s, "range_start_hz");
+                const auto hi = num(s, "range_end_hz");
+                if (lo && hi && *hi > *lo && *lo >= 0) { e.ranges.emplace_back((uint64_t)*lo, (uint64_t)*hi); }
+                e.lastSeenUnix = *lastSeen;
+                e.version = str(s, "version");
+
+                e.details.emplace_back("Software", "PhantomSDR-Plus (KiwiSDR bridge)");
+                if (!e.version.empty()) { e.details.emplace_back("Version", e.version); }
+                if (!e.ranges.empty()) { e.details.emplace_back("Range", formatRanges(e)); }
+                if (users && usersMax) { e.details.emplace_back("Users", std::to_string((int)*users) + "/" + std::to_string((int)*usersMax)); }
+                if (!str(s, "grid_locator").empty()) { e.details.emplace_back("QTH", str(s, "grid_locator")); }
+                e.details.emplace_back("IQ", "only where the operator enables it; Test tells");
+                e.details.emplace_back("URL", e.target.url());
+
+                e.flags.push_back("waterfall");
+                if (hi && *hi > 32000000.0) { e.flags.push_back("wide"); }
+                out.push_back(std::move(e));
+            }
+            catch (const std::exception& ex) {
+                flog::warn("Skipping an sdr-list.xyz entry: {}", ex.what());
+            }
+        }
         return out;
     }
 

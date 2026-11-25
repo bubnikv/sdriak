@@ -53,6 +53,8 @@ namespace remote {
         std::vector<std::unique_ptr<DirectoryProvider>> builtInProviders() {
             std::vector<std::unique_ptr<DirectoryProvider>> out;
             out.push_back(makeKiwiSDRProvider());
+            out.push_back(makeRx888Provider());
+            out.push_back(makeSdrListProvider());
             out.push_back(makeUberSDRProvider());
             out.push_back(makeSpyServerProvider());
             out.push_back(makeReceiverbookProvider());

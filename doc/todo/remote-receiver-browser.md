@@ -15,16 +15,24 @@ KiwiSDR map selector of the SDRPPBrown port:
 
 ## Why now
 
-* **Four public directories exist, one per source we have:**
+* **Six public directories serve the sources we have:**
 
   | directory | source | endpoint | entries | position | capacity | other fields |
   |-----------|--------|----------|---------|----------|----------|--------------|
   | KiwiSDR | `kiwisdr_source` | `http://rx.linkfanel.net/kiwisdr_com.js` (mirror of kiwisdr.com/public; no TLS) | 842 | `gps` "(lat, lon)" | `users` / `users_max` | `bands`, `snr`, `sdr_hw`, `ext_api`, `antenna`, `sw_version`, `offline` |
+  | sdr-list.xyz | `kiwisdr_source` (PhantomSDR-Plus through its KiwiSDR bridge) | `https://sdr-list.xyz/api/v1/receivers`, a JSON array | 113 entries: 77 UberSDR (the instances.ubersdr.org set), 15 PhantomSDR+, ~20 others with no source | `lat_jittered`/`lon_jittered`, `grid_locator` | `users` / `max_users` | `software`, `version`, `range_start_hz`/`range_end_hz`, `last_seen`; no e-mail |
+  | Web-888 | `kiwisdr_source` | `https://www.rx-888.com/api/devices`, `{devices[]}`, ~50 kB | 190 entries, 162 distinct, 89 `active` | `gps` "(lat, lon)" | `users` / `max_users` | `bands` (up to 64 MHz), `snr`, `antenna`, `status` (`active`, `Inaccessible`, `offline`), `uptime`; no e-mail. Almost none are in kiwisdr.com or Receiverbook |
   | UberSDR | `ubersdr_source` | `https://instances.ubersdr.org/api/instances`, `{count, instances[]}`, ~780 kB | 77 | `latitude`/`longitude`, `maidenhead` | `available_clients` / `max_clients` | `host`, `port`, `tls` (74 of 77), `public_url`, `public_iq_modes`, `tuning_range.{min,max}_frequency` (Hz), `snr_0_30_mhz`, `is_online`, `last_report_age_seconds`, `load_status`, `cw_skimmer`, `version` |
   | SpyServer | `spyserver_source` | `https://airspy.com/directory/status.json`, `{servers[]}` | 220 | `antennaLocation.{lat,long}` | `currentClientCount` / `maxClients` | `deviceType`, `minimumFrequency`/`maximumFrequency`, `maximumIQSampleRate`, `fullControlAllowed`, `streamingHost`/`streamingPort`, `online`, `lastSeen`, `generalDescription`, `antennaType`, `maxSessionDuration` |
   | Receiverbook | `openwebrx_source` | `https://www.receiverbook.de/map`, HTML with a `var receivers = [...];` JSON literal, ~380 kB | 1234 sites: 430 OpenWebRX, 721 KiwiSDR, 99 WebSDR | GeoJSON `location.coordinates` [lon, lat] per site | none | per receiver `{label, url, type, version}`; 205 OpenWebRX on 1.2.129 or later, 159 over https |
 
   Counts from 2026-11-25 (KiwiSDR from 2026-11-24).
+
+  Web-888 receivers run KiwiSDR-derived firmware (`sw_version`
+  `Web888_v2026.205`, `version_maj=2026`). The rx-888.com list's
+  `active` status is not current: of three `active` receivers tried on
+  2026-11-25, one timed out and one had no backend behind
+  `proxy.rx-888.com`.
 
 * **The KiwiSDR map selector was KiwiSDR-only,** while its `GeoMap` (pan,
   zoom, hit-test, tooltips) was generic. Two users shared it:
@@ -138,6 +146,11 @@ struct RemoteEntry {
 * **Built-in providers:**
   * **KiwiSDR:** the current parser, moved. `offline != "no"` entries are
     dropped, as now.
+  * **Web-888:** `status == "active"` entries only, repeated receivers
+    once. Each device is mapped onto the kiwisdr.com fields (`max_users`
+    to `users_max`, `loc` from the part of the name after the last
+    " | ") and goes through the KiwiSDR parser as KiwiSDR kind. When
+    kiwisdr.com lists the same host:port, its entry wins.
   * **UberSDR:** `is_online` entries only; target from `host`, `port`,
     `tls`, falling back to `public_url`.
   * **SpyServer:** `online` entries only; target
@@ -274,7 +287,7 @@ sigpath::remoteRegistry.unregisterHandler(kind);             // in the destructo
 
 ## Steps
 
-Steps 1–7 are implemented as described; step 8 is open.
+Steps 1–7, 9 and the Web-888 provider are implemented as described; step 8 is open.
 
 1. **Extract, behaviour-neutral.** Move `GeoMap` and `earcut.hpp` to
    `core/src/gui/remote/`; add the model, the directory service with its
@@ -299,6 +312,16 @@ Steps 1–7 are implemented as described; step 8 is open.
    options.
 8. **Optional:** LAN discovery providers, and `hermes_source` through
    them.
+9. **sdr-list.xyz provider** (`GET https://sdr-list.xyz/api/v1/receivers`,
+   [phantomsdr-family.md](../research/phantomsdr-family.md) §2). It emits
+   only `software == "PhantomSDR+"` entries, as KiwiSDR kind, for the
+   KiwiSDR bridge (§5); the UberSDR entries are the instances.ubersdr.org
+   set, and NovaSDR, FernSDR and the rest have no source. Entries not seen
+   for a day are dropped. The KiwiSDR probe tells IQ from audio-only (the
+   operator's `[server] iq`). Port 443 entries are https, which the
+   KiwiSDR handler greys. The bridge labels every waterfall line zoom 0,
+   so `kiwisdr_source` detects a server whose headers never follow a zoom
+   request and keeps that session at zoom 0.
 
 ## Open questions
 

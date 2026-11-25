@@ -597,7 +597,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         for (int z = 0; z < (int)wfSpans.size(); z++) {
             if (wfSpans[(size_t)z] >= spanHz * (1.0 - 1e-9)) { zoom = z; }
         }
-        wantZoom = zoom;
+        wantZoom = zoomUnsupported.load() ? 0 : zoom;
     }
 
     void serverWaterfallTick() {
@@ -645,9 +645,21 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // a held-back change goes out once the interval has passed.
         const double cfKhz = (lastTuneFrequency - (double)kiwiSdrClient.frequencyOffsetHz()) / 1e3;
         const auto now = std::chrono::steady_clock::now();
+        // A server whose frame headers never leave zoom 0, x_bin 0 after a
+        // zoom request (the PhantomSDR-Plus KiwiSDR bridge labels every line
+        // that way) would have its zoomed lines drawn across the whole band.
+        // Such a session stays at zoom 0. One header with another zoom or
+        // offset rules this out for the session.
+        if (!zoomUnsupported.load() && !zoomHeaderSeen.load() && sentZoom > 0 && now - lastViewSend >= std::chrono::seconds(2)
+            && framesSinceView.load() >= 10) {
+            zoomUnsupported = true;
+            wantZoom = 0;
+            flog::warn("KiwiSDR: the server's waterfall frames do not report their zoom; staying at zoom 0");
+        }
         const bool changed = (wantZoom != sentZoom) || std::fabs(cfKhz - sentCfKhz) >= 0.001;
         if (changed && now - lastViewSend >= std::chrono::milliseconds(125)) {
             wfClient.setView(wantZoom, cfKhz);
+            framesSinceView = 0;
             sentZoom = wantZoom;
             sentCfKhz = cfKhz;
             lastViewSend = now;
@@ -687,6 +699,8 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         wfFrame.spanHz = span;
         wfFrame.presentAt = presentAt(frame.seq);
         frameZoom.store(frame.zoom);
+        framesSinceView.fetch_add(1);
+        if (frame.zoom != 0 || frame.xBin != 0) { zoomHeaderSeen = true; }
         // The queue swaps in an older buffer, which the next frame reuses.
         sigpath::iqFrontEnd.pushSpectrum(std::move(wfFrame));
     }
@@ -718,6 +732,9 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         }
         _this->seqClock.clear();
         _this->frameZoom = -1;
+        _this->framesSinceView = 0;
+        _this->zoomHeaderSeen = false;
+        _this->zoomUnsupported = false;
         // The link has consumed everything pushed so far; this session's
         // samples continue its input count.
         _this->sndInputBase = _this->chain.samplesIn();
@@ -927,7 +944,12 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             if (playing && _this->connected.load()) {
                 if (_this->providerRegistered) {
                     const auto setup = _this->wfClient.setup();
-                    SmGui::TextF("Waterfall: server, zoom %d of %d", std::max(_this->appliedZoom, 0), setup.zoomCap);
+                    if (_this->zoomUnsupported.load()) {
+                        SmGui::TextF("Waterfall: server, zoom 0 only (frames do not report their zoom)");
+                    }
+                    else {
+                        SmGui::TextF("Waterfall: server, zoom %d of %d", std::max(_this->appliedZoom, 0), setup.zoomCap);
+                    }
                 }
                 else {
                     const std::string reason = _this->wfClient.unavailableReason();
@@ -1006,6 +1028,9 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     // W/F thread.
     SpectrumFrame wfFrame;
     std::atomic<int> frameZoom{-1};  // zoom of the latest frame
+    std::atomic<int> framesSinceView{0};      // frames since the last setView
+    std::atomic<bool> zoomHeaderSeen{false};  // a frame reported zoom or x_bin other than 0
+    std::atomic<bool> zoomUnsupported{false}; // this session stays at zoom 0
     SeqClock seqClock;
 
     // IQ window. intendedW: UI thread writes, the tune path reads.

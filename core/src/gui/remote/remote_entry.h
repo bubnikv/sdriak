@@ -51,7 +51,7 @@ namespace remote {
     struct RemoteEntry {
         std::string id;       // stable: provider + host:port (or directory id)
         RemoteKind kind = RemoteKind::Other;
-        std::string provider; // "kiwisdr.com", "ubersdr.org", "airspy.com", "receiverbook.de", "recent"
+        std::string provider; // "kiwisdr.com", "rx-888.com", "sdr-list.xyz", "ubersdr.org", "airspy.com", "receiverbook.de", "recent"
         std::string name;
         std::string location;
         // Latitude, longitude in degrees. Absent: list view only.

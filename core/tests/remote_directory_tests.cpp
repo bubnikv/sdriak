@@ -3,7 +3,7 @@
 // (owner e-mail never kept), and the directory service's cache: a fresh
 // cache skips the fetch, 304 keeps the entries, a failure keeps the stale
 // list.
-// `remote_directory_tests --files <kiwisdr_com.js> <status.json> <instances.json> <receiverbook.html>`
+// `remote_directory_tests --files <kiwisdr_com.js> <status.json> <instances.json> <receiverbook.html> [<rx-888 devices.json> [<sdr-list receivers.json>]]`
 // parses saved real documents instead and prints the counts.
 #include <gui/remote/directory.h>
 #include <gui/remote/providers.h>
@@ -80,6 +80,48 @@ namespace {
         require(low.hasFlag("ext-api") && !low.isFull(), "kiwi flags");
         require(entries[1].tlsRequired && entries[1].isFull() && entries[1].hasFlag("wide"), "https, full, wide");
         require(remote::entryToJson(low).dump().find("owner@") == std::string::npos, "e-mail kept");
+    }
+
+    void rx888Parser() {
+        const std::string body = R"json({"devices":[
+            {"url":"http://a.proxy.rx-888.com:8073","name":"OK1ABC - Web-888 | Prague, Czechia","snr":"20,15","users":"2",
+             "max_users":"8","antenna":"Loop","status":"active","bands":"0-64000000","gps":"(50.08, 14.42)","uptime":"100"},
+            {"url":"http://a.proxy.rx-888.com:8073","name":"OK1ABC - Web-888 | Prague, Czechia","snr":"20,15","users":"2",
+             "max_users":"8","status":"active","bands":"0-64000000","gps":"(50.08, 14.42)"},
+            {"url":"http://b.example:8074","name":"Busy","snr":"5,5","users":"4","max_users":"4","status":"active",
+             "bands":"0-30000000","gps":"(10, 20)"},
+            {"url":"http://down.example:8073","name":"Down","snr":"0,0","users":"0","max_users":"4","status":"Inaccessible",
+             "bands":"0-30000000","gps":"(1, 2)"},
+            {"url":"http://:8073","name":"No host","snr":"0,0","users":"0","max_users":"3","status":"active","gps":"(3, 4)"}]})json";
+        const auto entries = remote::parseRx888Directory(body);
+        require(entries.size() == 2, "inaccessible, hostless and repeated entries dropped");
+        require(entries[0].name == "Busy" && entries[0].isFull(), "low SNR first, full");
+        const auto& e = entries[1];
+        require(e.kind == remote::RemoteKind::KiwiSDR && e.provider == "rx-888.com", "kiwi kind");
+        require(e.location == "Prague, Czechia" && e.usersMax == 8 && e.hasFlag("wide"), "rx-888 fields");
+        require(remote::entryKey(e) == "kiwisdr/a.proxy.rx-888.com:8073", "key merges with kiwisdr.com");
+    }
+
+    void sdrListParser() {
+        const std::string body = R"json([
+            {"id":1,"name":"Uber","hostname":"uber.example","port":80,"software":"UberSDR","last_seen":"2026-11-25T17:39:48Z"},
+            {"id":2,"name":"Phantom","hostname":"Ph.Example","port":8900,"software":"PhantomSDR+","version":"v.6.0.0",
+             "users":11,"max_users":100,"range_start_hz":0,"range_end_hz":30000000,"grid_locator":"JN79",
+             "lat":50.0,"lon":14.0,"lat_jittered":50.01,"lon_jittered":14.02,"location_city":"Prague",
+             "location_country":"Czechia","last_seen":"2026-11-25T17:39:48Z"},
+            {"id":3,"name":"Phantom rx 2","hostname":"ph.example","port":8900,"software":"PhantomSDR+","last_seen":"2026-11-25T17:39:48Z"},
+            {"id":4,"name":"Stale","hostname":"old.example","port":80,"software":"PhantomSDR+","last_seen":"2026-11-16T10:00:00Z"},
+            {"id":5,"name":"Tls","hostname":"tls.example","port":443,"software":"PhantomSDR+","last_seen":"2026-11-25T12:00:00Z"},
+            {"id":6,"name":"Nova","hostname":"nova.example","port":80,"software":"NovaSDR","last_seen":"2026-11-25T17:39:48Z"}])json";
+        const auto entries = remote::parseSdrListDirectory(body, 1795629600);  // 2026-11-25T18:00:00Z
+        require(entries.size() == 2, "PhantomSDR+ only, repeated host and stale entry dropped");
+        const auto& e = entries[0];
+        require(e.kind == remote::RemoteKind::KiwiSDR && e.target.url() == "http://Ph.Example:8900/", "kiwi target");
+        require(e.lastSeenUnix == 1795628388, "last_seen parsed");
+        require(e.latLon && std::fabs(e.latLon->first - 50.01) < 1e-9, "jittered position");
+        require(e.location == "Prague, Czechia" && e.users == 11 && e.usersMax == 100 && e.ranges.size() == 1, "sdr-list fields");
+        require(remote::entryKey(e) == "kiwisdr/ph.example:8900", "key merges with other KiwiSDR lists");
+        require(entries[1].tlsRequired && entries[1].target.scheme == "https", "port 443 is https");
     }
 
     void spyParser() {
@@ -217,7 +259,7 @@ namespace {
 }
 
 int main(int argc, char** argv) {
-    if (argc == 6 && std::string(argv[1]) == "--files") {
+    if (argc >= 6 && argc <= 8 && std::string(argv[1]) == "--files") {
         try {
             const auto kiwi = remote::parseKiwiSDRDirectory(readFile(argv[2]));
             const auto spy = remote::parseSpyServerDirectory(readFile(argv[3]), remote::nowUnix());
@@ -233,6 +275,8 @@ int main(int argc, char** argv) {
             }
             std::printf("kiwisdr %zu, spyserver %zu, ubersdr %zu, receiverbook %zu (openwebrx %d, %d with iq; kiwisdr %d)\n",
                         kiwi.size(), spy.size(), uber.size(), rb.size(), owrx, owrxIq, rbKiwi);
+            if (argc >= 7) { std::printf("rx-888 %zu\n", remote::parseRx888Directory(readFile(argv[6])).size()); }
+            if (argc >= 8) { std::printf("sdr-list %zu\n", remote::parseSdrListDirectory(readFile(argv[7]), remote::nowUnix()).size()); }
             return 0;
         }
         catch (const std::exception& e) {
@@ -246,6 +290,8 @@ int main(int argc, char** argv) {
         { "maidenhead", maidenhead },
         { "openwebrx versions", owrxVersions },
         { "kiwisdr parser", kiwiParser },
+        { "rx-888 parser", rx888Parser },
+        { "sdr-list parser", sdrListParser },
         { "spyserver parser", spyParser },
         { "ubersdr parser", uberParser },
         { "receiverbook parser", receiverbookParser },

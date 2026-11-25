@@ -14,6 +14,17 @@ namespace remote {
     std::unique_ptr<DirectoryProvider> makeKiwiSDRProvider();
     std::vector<RemoteEntry> parseKiwiSDRDirectory(const std::string& body);
 
+    // Web-888: https://www.rx-888.com/api/devices, {devices[]} in the
+    // kiwisdr.com field format. The receivers speak the KiwiSDR protocol.
+    std::unique_ptr<DirectoryProvider> makeRx888Provider();
+    std::vector<RemoteEntry> parseRx888Directory(const std::string& body);
+
+    // sdr-list.xyz: https://sdr-list.xyz/api/v1/receivers, a JSON array.
+    // Only PhantomSDR-Plus receivers, as KiwiSDR kind (their KiwiSDR
+    // bridge); entries not seen for a day are dropped.
+    std::unique_ptr<DirectoryProvider> makeSdrListProvider();
+    std::vector<RemoteEntry> parseSdrListDirectory(const std::string& body, int64_t fetchedUnix);
+
     // SpyServer: https://airspy.com/directory/status.json, {servers[]}.
     std::unique_ptr<DirectoryProvider> makeSpyServerProvider();
     std::vector<RemoteEntry> parseSpyServerDirectory(const std::string& body, int64_t fetchedUnix);

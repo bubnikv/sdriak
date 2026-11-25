@@ -68,8 +68,11 @@ namespace remote {
         }
 
         // Provider preference when two providers list the same receiver:
-        // the kind's own directory first, Receiverbook last.
+        // the kind's own directory first, then rx-888.com and sdr-list.xyz
+        // (fewer fields than kiwisdr.com for the same receiver), Receiverbook
+        // last.
         int providerRank(const RemoteEntry& e) {
+            if (e.provider == "rx-888.com" || e.provider == "sdr-list.xyz") { return 1; }
             if (e.provider == "receiverbook.de") { return 2; }
             if (e.provider == "recent") { return 3; }
             return 0;
