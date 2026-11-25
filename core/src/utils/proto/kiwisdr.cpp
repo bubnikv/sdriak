@@ -410,16 +410,10 @@ void KiwiSDRClient::onKeyValue(const std::string& key, const std::string& value)
         if (rate > 0.0) {
             sampleRateHz.store(rate);
             flog::info("KiwiSDRClient: {}: audio_rate {}, sample_rate {}", hostPort, audioRate(), std::to_string(rate));
-            // KiwiSDR derives it from the corrected ADC clock, never exact.
-            if (audioRateReported && rate == (double)audioRate()) {
-                markCompatible("sample_rate equals audio_rate");
-            }
+            // An exact rate does not tell the flavour: Web-888 firmware
+            // reports one too and still sends NEW_FREQ. The packets decide.
             goLive();
         }
-    }
-    else if (key == "wf_chans") {
-        // KiwiSDR firmware has at most 8 waterfall channels.
-        if (std::atoi(value.c_str()) > 8) { markCompatible("more than 8 waterfall channels"); }
     }
     else if (key == "freq_offset") {
         serverFrequencyOffset.store(parseKhzToHz(value));

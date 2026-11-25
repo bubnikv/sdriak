@@ -51,9 +51,10 @@ struct KiwiSDRClient {
     };
 
     // Who serves the protocol. KiwiCompatible is a server that emulates it,
-    // like UberSDR: 240-sample packets, no NEW_FREQ flag, sample_rate equal
-    // to audio_rate, an unrelated waterfall seq. Unknown until the stream
-    // shows one or the other.
+    // like UberSDR: 240-sample packets, no NEW_FREQ flag, an unrelated
+    // waterfall seq. Only the packets decide: Web-888 firmware is KiwiSDR
+    // (NEW_FREQ, 512 samples) yet reports an exact sample_rate and up to 13
+    // waterfall channels. Unknown until the stream shows one or the other.
     enum class Flavour { Unknown, KiwiSDR, KiwiCompatible };
 
     // SND header flags (byte 3).

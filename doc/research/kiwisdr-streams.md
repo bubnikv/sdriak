@@ -504,7 +504,24 @@ frequency. One session at a time after a `/status` check, 15–20 s apart.
 | `sdr-amradioantennas.com:8072` (`rx3.wf3`) | the krec W/F path stays silent, as the krec SND path does (§8.4). On `/kiwi/<ts>/W/F` (`p=#`) the setup arrives (`wf_chans=3`, `wf_cal=-10`), and SND on `/kiwi/` pairs with it. Zoom 8 around 77.5 kHz: start 18.906 kHz, span 117.188 kHz, so centred on the request. About 6 frames/s at zoom 8. |
 | `ams.dedyn.io` (32 MHz) | krec W/F and SND: `bandwidth=32000000`, `wf_chans=3`, about 20 frames/s at zoom 0, zoom 8 around 162 kHz from 99.499 kHz over 125 kHz. |
 
-### 8.8 What this changes
+### 8.8 Fifth batch: Web-888
+
+**Method.** Run on 2026-11-25 on `ra3vlz-sdr.ru:8073` (Web-888, 0–60 MHz
+in the rx-888.com list, 1 of 12 users): `/status`, then one raw SND
+session that retunes once and logs the SND flags, then
+`websock_tests --kiwi-client` and `--kiwi-waterfall`, one at a time.
+
+| item | result |
+|------|--------|
+| identity | `/status`: `sdr_hw=KiwiSDR v2026.205 …`, `sw_version=Web888_v2026.205`; `/VER` `{"maj":2026,"min":205}`; SND `MSG version_maj=2026 version_min=205`. The firmware is KiwiSDR-derived with date-based versions. |
+| SND | `audio_rate=12000`, `sample_rate=12000.000000` exactly; 512-sample IQ packets; first packet `0x0d`; **`NEW_FREQ` (`0x0c`) about 236 ms after a retune**, as on KiwiSDR. |
+| W/F | `wf_chans 13`, `zoom_max 11`, `zoom_cap 11`, `wf_cal −13`, `bandwidth 30720000`. Zoom 0 spans 0–30.72 MHz; zoom 8 around 14 074 kHz starts at 14 014 kHz over 120 kHz, centred on the request. |
+| reachability | of three receivers the rx-888.com list showed as `active`, one timed out and one had no backend behind `proxy.rx-888.com` (HTTP 404 on every path). |
+
+An exact `sample_rate` and more than 8 waterfall channels therefore do not
+mark a Kiwi-compatible server: Web-888 shows both and is KiwiSDR firmware.
+
+### 8.9 What this changes
 
 * **TLS is a prerequisite.** Without `wss://`, this Kiwi, and any Kiwi
   behind HTTPS, is out of reach: 17 of the 432 reachable direct receivers
@@ -520,9 +537,9 @@ frequency. One session at a time after a `/status` check, 15–20 s apart.
   baseband domain, so subtract `freq_offset` from both.
 * **Detect Kiwi-protocol servers that are not Kiwis.** UberSDR (§8.5)
   lists itself as a KiwiSDR 2 but has no `NEW_FREQ` flag and no SND-linked
-  waterfall `seq`. Detect it by behaviour (non-512 packet sizes,
-  `sample_rate` exactly the audio rate, `wf_chans` above 8, waterfall `seq`
-  not tracking SND), not by `sdr_hw`. For those servers, commit IQ-window
+  waterfall `seq`. Detect it by its packets (non-512 sample counts, no
+  `NEW_FREQ` after a retune), not by `sdr_hw`, the rate or the channel
+  count (§8.8). For those servers, commit IQ-window
   moves on a timeout after the command, and present frames by arrival time.
 * **Don't trust `seq` blindly.** A Kiwi-compatible server numbers its
   waterfall frames independently. Use `seq` for presentation only while

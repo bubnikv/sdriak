@@ -94,9 +94,10 @@ Tests:
 6. **Flavour detection.** Set `flavour = KiwiSDR` or `KiwiCompatible` from
    any of these signs:
    * packet sample count ≠ 512;
-   * `sample_rate` exactly equal to `audio_rate`;
-   * `wf_chans > 8` (kiwi/2);
    * no `NEW_FREQ` seen within 2 s after a retune.
+
+   An exact `sample_rate` or `wf_chans > 8` is not a sign: Web-888
+   firmware shows both and is KiwiSDR (kiwisdr-streams.md §8.8).
 
    UberSDR's Kiwi emulation has no `NEW_FREQ` and an unrelated waterfall
    `seq` (ubersdr.md §2). Plans 2 and 3 branch on the flavour.
