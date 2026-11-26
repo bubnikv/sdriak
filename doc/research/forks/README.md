@@ -11,7 +11,8 @@ links. Forks that got a full review have their own file here:
 - [qmx-panadapter (SteffenLav)](qmx-panadapter.md)
 - [Community Edition (LunaeMons)](community-edition.md)
 - [LDighera / WB6BBB](ldighera.md) — AI-assisted Pi5 fork: S-meter, manual notch, SSB AGC, CW/SSTV/FreeDV/HD Radio
-- [SDR++ jp (jprincl)](jp.md) — FT8/FT4/WSPR, SpyServer VFO+FFT, AGC work, Android fixes; experimental WEFAX branch
+- [SDRIAK zh (lzh173)](zh.md) — tracks us; Windows non-ASCII paths, Android file source + document picker, KiwiSDR HTTP proxy, seekable file playback, FT8/FT4 on ft8_lib, Simplified-Chinese UI
+- [SDR++ jp (jprincl)](jp.md) — Linux window-ID/AppImage fixes, EiBi/Aoki Frequency Info, FT8/FT4/WSPR, F4JTV-sourced WEFAX/SSTV/RTTY, AGC ceiling, SpyServer VFO+FFT, Android GL-context loss
 - [aurimasniekis](aurimasniekis.md) — ESP32 antenna switcher module (skip); worth taking: atv_decoder teardown order, two z-order gaps, and a pointer to a real RtAudio macOS encoding bug
 
 ## Survey
