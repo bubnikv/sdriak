@@ -38,7 +38,6 @@ namespace net::websock {
     struct WSClient::Connection {
         CURL* curl = nullptr;
         curl_slist* headers = nullptr;
-        char errbuf[CURL_ERROR_SIZE] = {};
 
         Connection() = default;
         ~Connection() {
@@ -48,9 +47,6 @@ namespace net::websock {
         Connection(const Connection&) = delete;
         Connection& operator=(const Connection&) = delete;
 
-        std::string errorText(CURLcode rc) const {
-            return errbuf[0] ? std::string(errbuf) : std::string(curl_easy_strerror(rc));
-        }
     };
 
     struct WSClient::Assembly {
@@ -133,6 +129,15 @@ namespace net::websock {
             bool m_ok = false;
         };
 
+        std::string diagnosticEndpoint(const std::string& url) {
+            UrlHandle u(url);
+            const std::string host = u.get(CURLUPART_HOST);
+            if (host.empty()) { return "<invalid endpoint>"; }
+            const std::string port = u.get(CURLUPART_PORT);
+            return u.get(CURLUPART_SCHEME) + "://" + host
+                + (port.empty() ? "" : ":" + port) + u.get(CURLUPART_PATH);
+        }
+
         // Origin for the upgrade request: the http(s) form of the URL's
         // host, with the port only when it is not the scheme default.
         std::string originFor(const std::string& wsUrl) {
@@ -165,8 +170,10 @@ namespace net::websock {
                 // https" redirect, not a new endpoint: hra.remoteqth.com
                 // answers ws://host:8073/kiwi/<ts>/SND with
                 // 302 -> https://host:8073/. Keep the endpoint path and query.
-                const std::string curQuery = cur.get(CURLUPART_QUERY);
-                if (!curQuery.empty()) { nxt.set(CURLUPART_QUERY, curQuery); }
+                if (cur.get(CURLUPART_HOST) == nxt.get(CURLUPART_HOST)) {
+                    const std::string curQuery = cur.get(CURLUPART_QUERY);
+                    if (!curQuery.empty()) { nxt.set(CURLUPART_QUERY, curQuery); }
+                }
                 flog::info("websock: redirect to the site root, keeping endpoint {}", curPath);
                 const std::string rebuilt = nxt.get(CURLUPART_URL);
                 if (!rebuilt.empty()) { next = toWsScheme(rebuilt); }
@@ -234,6 +241,7 @@ namespace net::websock {
 
             HandshakeProgress progress{ &m_stopped, Clock::now() + std::chrono::milliseconds(kHandshakeTimeoutMs) };
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
             curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, 2L); // WebSocket upgrade, then hand over
             // libcurl does not follow a redirect on the upgrade; the loop
             // below does, mapping the scheme and keeping the path's case.
@@ -244,12 +252,12 @@ namespace net::websock {
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, (long)kHandshakeTimeoutMs);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_HTTPHEADER, conn->headers);
-            curl_easy_setopt(h, CURLOPT_ERRORBUFFER, conn->errbuf);
             curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, handshakeProgress);
             curl_easy_setopt(h, CURLOPT_XFERINFODATA, &progress);
             curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
 
-            flog::info("websock: connecting to {}", url);
+            const std::string endpoint = diagnosticEndpoint(url);
+            flog::info("websock: connecting to {}", endpoint);
             const CURLcode rc = curl_easy_perform(h);
 
             // progress lives on this stack frame.
@@ -259,18 +267,18 @@ namespace net::websock {
             long status = 0;
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
 
-            if (rc == CURLE_OK) {
+            if (m_stopped) { return nullptr; }
+            if (rc == CURLE_OK && status == 101) {
                 char* effective = nullptr;
                 curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, &effective);
                 {
                     std::lock_guard<std::mutex> lock(m_urlMtx);
                     m_effectiveUrl = effective ? effective : url;
                 }
-                flog::info("websock: connected to {} (HTTP {})", effectiveUrl(), status);
+                flog::info("websock: connected to {} (HTTP {})", diagnosticEndpoint(effectiveUrl()), status);
                 return conn;
             }
-            if (m_stopped) { return nullptr; }
-            if (progress.timedOut) { throw std::runtime_error("websock: upgrade timed out: " + url); }
+            if (progress.timedOut) { throw std::runtime_error("websock: upgrade timed out: " + endpoint); }
 
             if (status >= 300 && status < 400) {
                 // libcurl refuses a non-101 answer to the upgrade before it
@@ -281,20 +289,20 @@ namespace net::websock {
                     (curl_easy_header(h, "Location", 0, CURLH_HEADER, -1, &header) == CURLHE_OK && header && header->value)
                     ? std::string(header->value) : std::string();
                 if (location.empty()) {
-                    throw std::runtime_error("websock: HTTP " + std::to_string(status) + " redirect without Location: " + url);
+                    throw std::runtime_error("websock: HTTP " + std::to_string(status) + " redirect without Location: " + endpoint);
                 }
                 if (redirectsLeft <= 0) {
-                    throw std::runtime_error("websock: too many redirects, last to " + location);
+                    throw std::runtime_error("websock: too many redirects from " + endpoint);
                 }
                 const std::string next = redirectTarget(url, location);
-                flog::info("websock: following redirect ({} left) to {}", redirectsLeft, next);
+                flog::info("websock: following redirect ({} left) to {}", redirectsLeft, diagnosticEndpoint(next));
                 url = next;
                 continue;
             }
-            if (status != 0) {
-                throw std::runtime_error("websock: upgrade failed: HTTP " + std::to_string(status));
+            if (status != 0 || rc == CURLE_OK) {
+                throw std::runtime_error("websock: upgrade failed at " + endpoint + " (HTTP " + std::to_string(status) + ")");
             }
-            throw std::runtime_error("websock: connect failed: " + conn->errorText(rc));
+            throw std::runtime_error("websock: connect failed at " + endpoint + ": " + curl_easy_strerror(rc));
         }
     }
 
@@ -303,7 +311,6 @@ namespace net::websock {
         while (budget > 0) {
             size_t n = 0;
             const curl_ws_frame* meta = nullptr;
-            m_conn->errbuf[0] = 0;
             const CURLcode rc = curl_ws_recv(m_conn->curl, buf.data(), buf.size(), &n, &meta);
             if (rc == CURLE_AGAIN) { return Drain::Idle; }
             if (rc == CURLE_GOT_NOTHING) {
@@ -311,11 +318,11 @@ namespace net::websock {
                 return Drain::Closed;
             }
             if (rc == CURLE_RECV_ERROR) {
-                flog::warn("websock: connection lost: {}", m_conn->errorText(rc));
+                flog::warn("websock: connection lost: {}", curl_easy_strerror(rc));
                 return Drain::Closed;
             }
             if (rc != CURLE_OK) {
-                throw std::runtime_error("websock: receive failed: " + m_conn->errorText(rc));
+                throw std::runtime_error(std::string("websock: receive failed: ") + curl_easy_strerror(rc));
             }
             // Count a nominal header too, so a run of empty frames ends.
             budget -= std::min(budget, n + 16);
@@ -364,7 +371,21 @@ namespace net::websock {
         std::vector<char> buf(kRecvChunk);
         Assembly assembly;
         std::vector<Message> ready;
+        std::deque<Command> commands;
         while (!m_stopped) {
+            commands.clear();
+            {
+                std::lock_guard lock(m_commandMtx);
+                commands.swap(m_commands);
+            }
+            for (const auto& command : commands) {
+                if (m_stopped) { return; }
+                try { sendString(command.message); }
+                catch (...) {
+                    if (m_stopped) { return; }
+                    throw;
+                }
+            }
             ready.clear();
             Drain result;
             {
@@ -394,17 +415,16 @@ namespace net::websock {
         const char* p = static_cast<const char*>(data);
         for (;;) {
             size_t sent = 0;
-            m_conn->errbuf[0] = 0;
             const CURLcode rc = curl_ws_send(m_conn->curl, p, len, &sent, 0, flags);
             sent = std::min(sent, len);
-            p += sent;
+            if (sent) { p += sent; }
             len -= sent;
             if (rc == CURLE_OK) {
                 if (len == 0) { return; }
                 continue;
             }
             if (rc != CURLE_AGAIN) {
-                throw std::runtime_error("websock: send failed: " + m_conn->errorText(rc));
+                throw std::runtime_error(std::string("websock: send failed: ") + curl_easy_strerror(rc));
             }
             if (m_stopped) { throw std::runtime_error("websock: send aborted, client stopped"); }
             if (Clock::now() >= deadline) { throw std::runtime_error("websock: send timed out"); }
@@ -425,6 +445,19 @@ namespace net::websock {
 
     void WSClient::sendBinary(const std::vector<uint8_t>& data) {
         sendFrame(data.data(), data.size(), CURLWS_BINARY);
+    }
+
+    bool WSClient::queueString(std::string message, std::string key) {
+        std::lock_guard lock(m_commandMtx);
+        if (m_stopped) { return false; }
+        if (!key.empty() && !m_commands.empty() && m_commands.back().key == key) {
+            m_commands.back().message = std::move(message);
+        }
+        else {
+            if (m_commands.size() >= 64) { return false; }
+            m_commands.push_back({std::move(message), std::move(key)});
+        }
+        return true;
     }
 
     void WSClient::closeConnection() {
@@ -492,6 +525,8 @@ namespace net::websock {
     }
 
     void WSClient::reset() {
+        std::lock_guard lock(m_commandMtx);
+        m_commands.clear();
         m_stopped = false;
     }
 

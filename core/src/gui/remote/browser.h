@@ -60,9 +60,10 @@ namespace remote {
         void loadFilters();
         void saveFilters();
         bool kindShown(RemoteKind kind) const;
-        // Cached per frame by updateVisibility() for entries in m_entries.
+        // Cached by updateVisibility() for entries in m_entries.
         bool entryVisible(const RemoteEntry& e) const;
-        bool computeVisible(const RemoteEntry& e) const;
+        bool entryConnectable(const RemoteEntry& e) const;
+        bool computeVisible(const RemoteEntry& e, const std::string& searchText, const std::string& needle) const;
         void updateVisibility();
         // First visible member, or -1.
         int groupLead(const Group& g) const;
@@ -97,7 +98,13 @@ namespace remote {
 
         geomap::GeoMap m_geoMap;
         std::vector<RemoteEntry> m_entries;
-        std::vector<uint8_t> m_visible; // per m_entries, this frame
+        std::vector<uint8_t> m_visible;
+        std::vector<std::string> m_searchText;
+        std::map<RemoteKind, bool> m_tlsSupport;
+        uint64_t m_handlerGeneration = 0;
+        uint64_t m_filterFrequency = 0;
+        size_t m_visibleCount = 0;
+        bool m_visibilityDirty = true;
         std::vector<Group> m_groups;
         std::map<std::string, int> m_groupByKey;
         uint64_t m_dirGeneration = 0;

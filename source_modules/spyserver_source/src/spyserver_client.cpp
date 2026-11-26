@@ -9,9 +9,9 @@
 using namespace std::chrono_literals;
 
 namespace spyserver {
-    SpyServerClientClass::SpyServerClientClass(net::Conn conn, dsp::stream<dsp::complex_t>* out) {
+    SpyServerClientClass::SpyServerClientClass(net::Conn conn, dsp::stream<dsp::complex_t>* out, bool publishIq)
+        : m_acceptIq(publishIq) {
         readBuf = new uint8_t[SPYSERVER_MAX_MESSAGE_BODY_SIZE];
-        writeBuf = new uint8_t[SPYSERVER_MAX_MESSAGE_BODY_SIZE];
         client = std::move(conn);
         output = out;
 
@@ -20,31 +20,44 @@ namespace spyserver {
         sendHandshake("SDRIAK");
 
         client->readAsync(sizeof(SpyServerMessageHeader), (uint8_t*)&receivedHeader, dataHandler, this);
+        m_controlThread = std::thread(&SpyServerClientClass::controlLoop, this);
     }
 
     SpyServerClientClass::~SpyServerClientClass() {
         close();
         delete[] readBuf;
-        delete[] writeBuf;
     }
 
     void SpyServerClientClass::startStream() {
+        std::lock_guard lock(m_publishMtx);
         output->clearWriteStop();
+        m_acceptIq = true;
         setSetting(SPYSERVER_SETTING_STREAMING_ENABLED, true);
     }
 
     void SpyServerClientClass::stopStream() {
         output->stopWriter();
+        {
+            std::lock_guard lock(m_publishMtx);
+            m_acceptIq = false;
+            m_position.clearMarkers();
+        }
         setSetting(SPYSERVER_SETTING_STREAMING_ENABLED, false);
     }
 
     void SpyServerClientClass::close() {
+        {
+            std::lock_guard lock(m_controlMtx);
+            m_stopControl = true;
+        }
+        m_controlCv.notify_one();
         output->stopWriter();
         client->close();
+        if (m_controlThread.joinable()) { m_controlThread.join(); }
     }
 
     bool SpyServerClientClass::isOpen() {
-        return client->isOpen();
+        return !m_controlFailed.load() && client->isOpen();
     }
 
     int SpyServerClientClass::computeDigitalGain(int serverBits, int deviceGain, int decimationId) {
@@ -70,22 +83,59 @@ namespace spyserver {
         return deviceInfoAvailable;
     }
 
-    void SpyServerClientClass::sendCommand(uint32_t command, const void* data, int len) {
-        std::lock_guard lck(m_writeMtx);
-        SpyServerCommandHeader* hdr = (SpyServerCommandHeader*)writeBuf;
-        hdr->CommandType = command;
-        hdr->BodySize = len;
-        if (len > 0) { memcpy(&writeBuf[sizeof(SpyServerCommandHeader)], data, len); }
-        client->write(sizeof(SpyServerCommandHeader) + len, writeBuf);
+    bool SpyServerClientClass::sendCommand(uint32_t command, const void* data, int len) {
+        const SpyServerCommandHeader header{command, (uint32_t)len};
+        writeBuf.resize(sizeof(header) + len);
+        memcpy(writeBuf.data(), &header, sizeof(header));
+        if (len > 0) { memcpy(writeBuf.data() + sizeof(header), data, len); }
+        return client->write((int)writeBuf.size(), writeBuf.data());
     }
 
     void SpyServerClientClass::ping(std::function<void(bool, uint64_t)> onPong) {
-        {
-            // Queued before the send, so the PONG always finds it.
-            std::lock_guard lck(m_pingMtx);
-            m_pings.push_back(PendingPing{ Clock::now(), std::move(onPong) });
+        enqueueControl({0, 0, std::move(onPong)});
+    }
+
+    void SpyServerClientClass::enqueueControl(Control control) {
+        std::lock_guard lock(m_controlMtx);
+        if (m_stopControl) { return; }
+        if (!control.onPong && control.setting != SPYSERVER_SETTING_STREAMING_ENABLED && !m_controls.empty()
+            && !m_controls.back().onPong && m_controls.back().setting == control.setting) {
+            m_controls.back().value = control.value;
         }
-        sendCommand(SPYSERVER_CMD_PING, nullptr, 0);
+        else if (m_controls.size() < 128) {
+            m_controls.push_back(std::move(control));
+        }
+        else {
+            m_controlFailed = true;
+            m_stopControl = true;
+            m_controls.clear();
+            flog::warn("SpyServer: control queue full, retiring the connection");
+        }
+        m_controlCv.notify_one();
+    }
+
+    void SpyServerClientClass::controlLoop() {
+        for (;;) {
+            Control control;
+            {
+                std::unique_lock lock(m_controlMtx);
+                m_controlCv.wait(lock, [this] { return m_stopControl || !m_controls.empty(); });
+                if (m_stopControl) { return; }
+                control = std::move(m_controls.front());
+                m_controls.pop_front();
+            }
+            if (control.onPong) {
+                {
+                    std::lock_guard lock(m_pingMtx);
+                    m_pings.push_back({Clock::now(), std::move(control.onPong)});
+                }
+                if (!sendCommand(SPYSERVER_CMD_PING, nullptr, 0)) { return; }
+            }
+            else {
+                const SpyServerSettingTarget target{control.setting, control.value};
+                if (!sendCommand(SPYSERVER_CMD_SET_SETTING, &target, sizeof(target))) { return; }
+            }
+        }
     }
 
     void SpyServerClientClass::handlePong() {
@@ -187,10 +237,7 @@ namespace spyserver {
     }
 
     void SpyServerClientClass::setSetting(uint32_t setting, uint32_t arg) {
-        SpyServerSettingTarget target;
-        target.Setting = setting;
-        target.Value = arg;
-        sendCommand(SPYSERVER_CMD_SET_SETTING, &target, sizeof(SpyServerSettingTarget));
+        enqueueControl({setting, arg, {}});
     }
 
     int SpyServerClientClass::readSize(int count, uint8_t* buffer) {
@@ -244,11 +291,14 @@ namespace spyserver {
         // stream on 32-bit Android (and twice what one did at 262144 anywhere).
         // convert(offset, n, dst) writes samples [offset, offset + n).
         auto publish = [_this](int sampCount, auto convert) {
-            _this->m_lastMessageSamples = sampCount;
+            std::lock_guard lock(_this->m_publishMtx);
+            if (!_this->m_acceptIq) { return; }
             dsp::stream<dsp::complex_t>* out = _this->output;
+            _this->m_lastMessageSamples = (std::min)(sampCount, out->capacity());
             for (int done = 0; done < sampCount;) {
                 const int n = (std::min)(sampCount - done, out->capacity());
                 convert(done, n, out->writeBuf);
+                _this->m_position.fireBefore(_this->m_samplesPublished.load() + n);
                 if (!out->swap(n)) { return; }
                 _this->m_samplesPublished.fetch_add((uint64_t)n);
                 done += n;
@@ -331,11 +381,12 @@ namespace spyserver {
         _this->client->readAsync(sizeof(SpyServerMessageHeader), (uint8_t*)&_this->receivedHeader, dataHandler, _this);
     }
 
-    SpyServerClient connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, int timeoutMS, bool viaProxy) {
+    SpyServerClient connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out,
+                            int timeoutMS, bool viaProxy, bool publishIq) {
         net::Conn conn = viaProxy ? net::proxy::connect(host, port, timeoutMS) : net::connect(host, port, timeoutMS);
         if (!conn) {
             return NULL;
         }
-        return SpyServerClient(new SpyServerClientClass(std::move(conn), out));
+        return SpyServerClient(new SpyServerClientClass(std::move(conn), out, publishIq));
     }
 }

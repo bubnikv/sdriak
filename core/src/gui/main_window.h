@@ -6,6 +6,10 @@
 #include <string>
 #include <utils/event.h>
 #include <mutex>
+#include <atomic>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <gui/tuner.h>
 #include <gui/waterfall_autorange.h>
 #include <signal_path/server_zoom.h>
@@ -36,6 +40,7 @@ public:
     void setVFO(double freq);
 
     void setPlayState(bool _playing);
+    void runOnUiThread(std::function<void()> action);
     bool isPlaying();
 
     // Android Back: dismiss the topmost UI layer (popup/modal, then the
@@ -90,7 +95,10 @@ private:
     WaterfallAutoRange autoRange;
     float bw = 8000000;
     float wheelAccum = 0.0f;
-    bool playing = false;
+    std::atomic<bool> playing{false};
+    std::thread::id uiThread;
+    std::mutex uiActionsMtx;
+    std::deque<std::function<void()>> uiActions;
     bool showCredits = false;
     std::string audioStreamName = "";
     std::string sourceName = "";

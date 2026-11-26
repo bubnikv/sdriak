@@ -2,6 +2,7 @@
 #include <utils/networking.h>
 #include <spyserver_protocol.h>
 #include <dsp/stream.h>
+#include <dsp/buffer/prebuffer.h>
 #include <dsp/types.h>
 #include <atomic>
 #include <chrono>
@@ -40,7 +41,7 @@ namespace spyserver {
             uint64_t values = 0;
         };
 
-        SpyServerClientClass(net::Conn conn, dsp::stream<dsp::complex_t>* out);
+        SpyServerClientClass(net::Conn conn, dsp::stream<dsp::complex_t>* out, bool publishIq = true);
         ~SpyServerClientClass();
 
         bool waitForDevInfo(int timeoutMS);
@@ -48,7 +49,7 @@ namespace spyserver {
         void startStream();
         void stopStream();
 
-        // Any thread: commands are serialised by a write mutex.
+        // Any thread: controls are sent in order by the connection writer.
         void setSetting(uint32_t setting, uint32_t arg);
 
         // Any thread. Sends PING; onPong runs on the network thread with
@@ -91,14 +92,24 @@ namespace spyserver {
 
         // IQ samples published to the output stream so far.
         uint64_t samplesPublished() const { return m_samplesPublished.load(); }
+        void scheduleMarker(uint64_t sample, std::function<void()> callback) {
+            m_position.schedule(sample, std::move(callback));
+        }
         // Samples in the last IQ message: the block size downstream sees.
         int lastMessageSamples() const { return m_lastMessageSamples.load(); }
 
         SpyServerDeviceInfo devInfo;
 
     private:
-        void sendCommand(uint32_t command, const void* data, int len);
+        bool sendCommand(uint32_t command, const void* data, int len);
         void sendHandshake(std::string appName);
+        struct Control {
+            uint32_t setting = 0;
+            uint32_t value = 0;
+            std::function<void(bool, uint64_t)> onPong;
+        };
+        void enqueueControl(Control control);
+        void controlLoop();
 
         int readSize(int count, uint8_t* buffer);
 
@@ -113,10 +124,13 @@ namespace spyserver {
         net::Conn client;
 
         uint8_t* readBuf;
-        uint8_t* writeBuf;
-        // writeBuf and the socket's write side: the UI thread sends settings
-        // while the network thread may send PINGs.
-        std::mutex m_writeMtx;
+        std::vector<uint8_t> writeBuf;
+        std::mutex m_controlMtx;
+        std::condition_variable m_controlCv;
+        std::deque<Control> m_controls;
+        bool m_stopControl = false;
+        std::atomic<bool> m_controlFailed{false};
+        std::thread m_controlThread;
 
         bool deviceInfoAvailable = false;
         std::mutex deviceInfoMtx;
@@ -145,6 +159,9 @@ namespace spyserver {
 
         std::atomic<uint64_t> m_samplesPublished{0};
         std::atomic<int> m_lastMessageSamples{0};
+        std::mutex m_publishMtx;
+        bool m_acceptIq = true;
+        dsp::buffer::StreamPosition m_position;
 
         SpyServerMessageHeader receivedHeader;
 
@@ -156,6 +173,7 @@ namespace spyserver {
     // timeoutMS bounds DNS resolution and the TCP connect; negative for the
     // OS default (tens of seconds — avoid on the GUI thread).
     // viaProxy: through the Network proxy with CONNECT (net::proxy::connect).
-    SpyServerClient connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out, int timeoutMS = -1, bool viaProxy = false);
+    SpyServerClient connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out,
+                            int timeoutMS = -1, bool viaProxy = false, bool publishIq = true);
 
 }

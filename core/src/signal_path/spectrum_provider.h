@@ -18,7 +18,7 @@ public:
     virtual std::string name() const = 0;
 
     // Nominal bins per frame: the waterfall's raw line size. Frames of
-    // another size are resampled onto it.
+    // another size are resampled onto it. Zero uses each frame's bin count.
     virtual int binCount() const = 0;
 
     // Server zoom ladder: display spans in Hz, widest first. One entry

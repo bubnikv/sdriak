@@ -230,7 +230,7 @@ public:
     // Why the server refused the session, empty when it did not.
     std::string refusalReason() const;
 
-    void init(const std::string& hostport);
+    void init(const std::string& hostport, bool tls = false);
 
     void tune(double freq, Modulation mod);
 
@@ -285,15 +285,15 @@ private:
 
     static int64_t parseKhzToHz(const std::string& value);
 
-    // Synchronously GET http://host:port/VER and return its 'ts' field.
+    // Synchronously GET origin + "/VER" and return its 'ts' field.
     // KiwiSDR uses this value in the websocket path (/<ts>/SND) to pair a
     // client's connections; some servers reject paths whose timestamp
     // drifts too far from their own clock. Falls back to the local epoch ms
     // if the fetch or parse fails — local-clock ms is still unique enough
     // for session disambiguation.
-    // origin receives the server's http(s)://host[:port] after redirects
-    // (the scheme probe), or http://host:port when the fetch fails.
-    uint64_t fetchServerTimestamp(const std::string& host, int port, std::string& origin);
+    // origin starts with the selected scheme and is updated after redirects.
+    uint64_t fetchServerTimestamp(std::string& origin);
+    bool useTls = false;
 
     void resetSessionState();
 

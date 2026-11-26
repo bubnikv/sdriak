@@ -36,6 +36,8 @@ namespace remote {
         // UI thread, after the browser selected sourceName. Fills the
         // module's host/port or URL and connects as its own button would.
         std::function<void(const RemoteEntry&)> connect;
+        // UI thread. A transient reason to defer Connect, if any.
+        std::function<std::string()> connectBlockedReason;
     };
 
     // One probe at a time, across every browser view.
@@ -62,6 +64,8 @@ namespace remote {
         std::optional<RemoteHandler> handler(RemoteKind kind) const;
         // Why an entry cannot be connected to, empty when it can.
         std::string unavailableReason(const RemoteEntry& entry) const;
+        uint64_t handlerGeneration() const { return m_handlerGeneration.load(); }
+        std::map<RemoteKind, bool> tlsSupportSnapshot(uint64_t& generation) const;
 
         // Start a probe; false when one is running or the kind has no prober.
         bool startProbe(const RemoteEntry& entry);
@@ -76,6 +80,7 @@ namespace remote {
         mutable std::mutex m_mtx;
         std::condition_variable m_cv;
         std::map<RemoteKind, RemoteHandler> m_handlers;
+        std::atomic<uint64_t> m_handlerGeneration{0};
         std::thread m_probeThread;
         std::atomic<bool> m_cancel{ false };
         bool m_probeRunning = false;

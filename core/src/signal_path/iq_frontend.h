@@ -50,7 +50,7 @@ public:
     // Provider frames. push: any thread, never blocks (SpectrumQueue).
     // pop: UI thread, only frames that are due.
     bool pushSpectrum(SpectrumFrame&& frame) { return _spectrumQueue.push(std::move(frame)); }
-    bool popSpectrum(SpectrumFrame& out) { return _spectrumQueue.pop(out); }
+    bool popSpectrum(SpectrumFrame& out, std::chrono::steady_clock::time_point now) { return _spectrumQueue.pop(out, now); }
     uint64_t droppedSpectrumFrames() const { return _spectrumQueue.dropped(); }
 
     // Display span set by the source (core::setDisplaySpan), or 0 when the
@@ -193,5 +193,6 @@ protected:
     double _narrowIQWidth = 0.0;
 
     bool _init = false;
+    bool _running = false;
 
 };

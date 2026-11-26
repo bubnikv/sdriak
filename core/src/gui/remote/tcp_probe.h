@@ -11,6 +11,6 @@ namespace remote {
 
     // expectBytes > 0: also wait up to 3 s for that many bytes (rtl_tcp
     // sends its 12-byte "RTL0" header on accept). Worker thread.
-    ProbeResult probeTcp(const RemoteEntry& entry, const std::atomic<bool>& cancel, int expectBytes = 0);
+    ProbeResult probeTcp(const RemoteEntry& entry, const std::atomic<bool>& cancel, int expectBytes = 0, bool viaProxy = false);
 
 }

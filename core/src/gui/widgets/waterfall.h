@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <atomic>
 #include <vector>
 #include <mutex>
 #include <cmath>
@@ -248,7 +250,7 @@ namespace ImGui {
         bool calculateVFOSignalInfo(float* fftLine, WaterfallVFO* vfo, float& strength, float& snr);
         bool collectAutorangeBins(std::vector<float>& out, int lines); // pooled visible raw bins minus edges/DC notch
 
-        bool waterfallUpdate = false;
+        std::atomic<bool> waterfallUpdate{false};
 
         uint32_t waterfallPallet[WATERFALL_RESOLUTION];
 
@@ -310,6 +312,8 @@ namespace ImGui {
         int fftLines = 0;
 
         uint32_t* waterfallFb;
+        int textureWidth = 0;
+        int textureHeight = 0;
 
         bool draggingFW = false;
         int FFTAreaHeight;

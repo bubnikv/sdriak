@@ -1,8 +1,12 @@
 #include "test_support.h"
 
+#include <gui/gui.h>
+#include <signal_path/signal_path.h>
 #include <signal_path/server_zoom.h>
 #include <signal_path/spectrum_frame.h>
 
+#include <condition_variable>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -49,6 +53,103 @@ void testQueueDropsOldest() {
     expect(!q.pop(out), "clear left frames");
 }
 
+void testDelayedRowsAndPeakReduction() {
+    SpectrumQueue q;
+    const auto now = Clock::now();
+    for (int i = 0; i <= 20; ++i) {
+        auto frame = ramp(2, (double)i, 2.0);
+        frame.presentAt = now + std::chrono::seconds(1) + std::chrono::milliseconds(50 * i);
+        expect(q.push(std::move(frame)), "delayed row rejected");
+    }
+    SpectrumFrame frame;
+    expect(q.pop(frame, now + std::chrono::seconds(1)) && frame.startHz == 0.0, "first delayed row was evicted");
+
+    frame.startHz = 1000.0;
+    frame.spanHz = 16384;
+    frame.bins.assign(16384, -120.0f);
+    frame.bins[200] = -33.0f;
+    frame.bins[203] = -42.0f;
+    std::vector<float> out(8192);
+    expect(mapSpectrumFrame(frame, frame.startHz, frame.spanHz, out.data(), (int)out.size()), "wide row dropped");
+    expect(out[100] == -33.0f && out[101] == -42.0f, "reduction lost a narrow peak");
+}
+
+void testLocalFftHandoff() {
+    constexpr int localSize = 65536;
+    constexpr int serverSize = 1024;
+    struct TestProvider : SpectrumProvider {
+        std::string name() const override { return "test"; }
+        int binCount() const override { return serverSize; }
+        std::vector<double> zoomSpans() const override { return {}; }
+        void requestSpan(double) override {}
+        bool available() const override { return true; }
+    } provider;
+    struct Destination {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::vector<float> bins = std::vector<float>(localSize);
+        bool acquired = false;
+        bool canWrite = false;
+        std::atomic<int> rows{0};
+    } destination;
+    auto acquire = [](void* ctx) -> float* {
+        auto& dest = *static_cast<Destination*>(ctx);
+        std::unique_lock lock(dest.mutex);
+        dest.acquired = true;
+        dest.ready.notify_one();
+        dest.ready.wait(lock, [&] { return dest.canWrite; });
+        return dest.bins.data();
+    };
+    auto release = [](void* ctx) { ++static_cast<Destination*>(ctx)->rows; };
+    dsp::stream<dsp::complex_t> input(localSize);
+    auto& frontend = sigpath::iqFrontEnd;
+    struct Stop {
+        IQFrontEnd& frontend;
+        Destination& destination;
+        ~Stop() {
+            {
+                std::lock_guard lock(destination.mutex);
+                destination.canWrite = true;
+                destination.ready.notify_one();
+            }
+            frontend.stop();
+        }
+    };
+    frontend.init(&input, localSize, false, 1, false, localSize, 1, IQFrontEnd::RECTANGULAR,
+                  acquire, release, &destination);
+    Stop stop{frontend, destination};
+    frontend.start();
+    for (int i = 0; i < 3; ++i) {
+        {
+            std::lock_guard lock(destination.mutex);
+            destination.acquired = false;
+            destination.canWrite = false;
+        }
+        std::fill_n(input.writeBuf, localSize, dsp::complex_t{1.0f, 0.0f});
+        expect(input.swap(localSize), "could not feed the local FFT");
+        bool acquired;
+        {
+            std::unique_lock lock(destination.mutex);
+            acquired = destination.ready.wait_for(lock, std::chrono::seconds(2), [&] { return destination.acquired; });
+        }
+        std::thread allowWrite([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::lock_guard lock(destination.mutex);
+            destination.canWrite = true;
+            destination.ready.notify_one();
+        });
+        frontend.setSpectrumProvider(&provider);
+        const bool wroteBeforeHandoff = destination.rows.load() == i + 1;
+        allowWrite.join();
+        expect(acquired && wroteBeforeHandoff, "server provider took ownership while the local FFT was writing");
+        gui::waterfall.setRawFFTSize(serverSize);
+        destination.bins.resize(serverSize);
+        frontend.setSpectrumProvider(nullptr);
+        expect(gui::waterfall.getRawFFTSize() == localSize, "fallback did not restore local FFT size");
+        destination.bins.resize(localSize);
+    }
+}
+
 void testMapShift() {
     // Same span and size, display shifted by +2 bins: a whole-bin shift with
     // the top two bins uncovered.
@@ -59,6 +160,20 @@ void testMapShift() {
 
     expect(mapSpectrumFrame(f, 998.0, 8.0, out.data(), 8), "shifted frame dropped");
     expect(out == std::vector<float>({ kUncoveredDb, kUncoveredDb, 0, 1, 2, 3, 4, 5 }), "negative shift wrong");
+}
+
+void testCarrierWithTuningOffset() {
+    constexpr double offset = 250000.0;
+    constexpr double centre = 1004.0;
+    for (bool invert : {false, true}) {
+        auto f = ramp(8, 0.0, 8.0);
+        f.bins.assign(8, -120.0f);
+        f.bins[6] = -20.0f;
+        placeSpectrumFrame(f, 1000.0 + offset, offset, centre, invert);
+        std::vector<float> out(8);
+        expect(mapSpectrumFrame(f, 1000.0, 8.0, out.data(), 8), "shifted carrier outside the display");
+        expect(out[invert ? 1 : 6] == -20.0f, "carrier mapped to the wrong display frequency");
+    }
 }
 
 void testMapResample() {
@@ -134,10 +249,13 @@ int main() {
     return test_support::run("spectrum_frame_tests", [] {
         testQueueOrderAndDue();
         testQueueDropsOldest();
+        testDelayedRowsAndPeakReduction();
         testMapShift();
+        testCarrierWithTuningOffset();
         testMapResample();
         testMapDropsPoorOverlap();
         testServerZoomWheel();
         testServerZoomSlider();
+        testLocalFftHandoff();
     });
 }

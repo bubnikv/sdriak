@@ -57,6 +57,7 @@ namespace {
 }
 
 void MainWindow::init() {
+    uiThread = std::this_thread::get_id();
     LoadingScreen::show("Initializing UI");
     gui::waterfall.init();
     gui::waterfall.setRawFFTSize(fftSize);
@@ -374,7 +375,7 @@ void MainWindow::serverZoomTick() {
     if (span > 0.0) { provider->requestSpan(span); }
 }
 
-// UI thread, once per frame: draw every due provider frame as a waterfall
+// UI thread, once per frame: draw a bounded batch of due provider frames
 // line, mapped onto the displayed span [C - S/2, C + S/2]. No provider, no
 // work.
 static void pumpSpectrumFrames() {
@@ -383,7 +384,8 @@ static void pumpSpectrumFrames() {
 
     static SpectrumFrame frame;
     static std::vector<float> line;
-    while (sigpath::iqFrontEnd.popSpectrum(frame)) {
+    const auto now = std::chrono::steady_clock::now();
+    for (int i = 0; i < 4 && sigpath::iqFrontEnd.popSpectrum(frame, now); ++i) {
         int size = provider->binCount();
         if (size <= 0) { size = (int)frame.bins.size(); }
         if (size <= 0) { continue; }
@@ -444,6 +446,12 @@ void MainWindow::vfoAddedHandler(VFOManager::VFO* vfo, void* ctx) {
 
 void MainWindow::draw() {
     ImGui::Begin("Main", NULL, WINDOW_FLAGS);
+    std::deque<std::function<void()>> actions;
+    {
+        std::lock_guard lock(uiActionsMtx);
+        actions.swap(uiActions);
+    }
+    for (auto& action : actions) { action(); }
     ImVec4 textCol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
 
     // On a scale change, child windows still carry the previous
@@ -1246,7 +1254,20 @@ void MainWindow::drawWaterfallControls(ImGui::WaterfallVFO* vfo, const ImVec4& t
     ImGui::EndChild();
 }
 
+void MainWindow::runOnUiThread(std::function<void()> action) {
+    if (std::this_thread::get_id() == uiThread) {
+        action();
+        return;
+    }
+    std::lock_guard lock(uiActionsMtx);
+    uiActions.push_back(std::move(action));
+}
+
 void MainWindow::setPlayState(bool _playing) {
+    if (std::this_thread::get_id() != uiThread) {
+        runOnUiThread([this, _playing] { setPlayState(_playing); });
+        return;
+    }
     if (_playing == playing) { return; }
     if (_playing) {
         sigpath::iqFrontEnd.flushInputBuffer();

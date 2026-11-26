@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -60,6 +61,10 @@ namespace net::websock {
         // or the send fails.
         void sendString(const std::string& str);
         void sendBinary(const std::vector<uint8_t>& data);
+        // Enqueue control messages for the connection thread. A key replaces
+        // only the immediately preceding command of that kind, preserving
+        // order across setup commands and other control messages.
+        bool queueString(std::string message, std::string key = {});
 
         // Signals the receive loop to exit. Safe to call from any thread,
         // including from inside a callback. The receive loop notices within
@@ -105,6 +110,12 @@ namespace net::websock {
         std::string m_effectiveUrl;
 
         std::atomic<bool> m_stopped{false};
+        struct Command {
+            std::string message;
+            std::string key;
+        };
+        std::mutex m_commandMtx;
+        std::deque<Command> m_commands;
 
         // Upgrade with redirects. Returns nullptr if stopped during the
         // handshake; throws on failure.

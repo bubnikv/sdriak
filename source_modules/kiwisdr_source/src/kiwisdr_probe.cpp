@@ -30,8 +30,8 @@ remote::ProbeResult probeKiwiSDR(const remote::RemoteEntry& entry, const std::at
     using Clock = std::chrono::steady_clock;
 
     remote::ProbeResult result;
-    if (entry.target.scheme != "http") {
-        result.reason = "TLS required";
+    if (entry.target.scheme != "http" && entry.target.scheme != "https") {
+        result.reason = "expected an HTTP or HTTPS receiver";
         return result;
     }
     const std::string hostPort = entry.target.hostPort();
@@ -43,8 +43,9 @@ remote::ProbeResult probeKiwiSDR(const remote::RemoteEntry& entry, const std::at
     std::atomic<bool> disconnected{ false };
     std::atomic<bool> gotSamples{ false };
     std::atomic<int> firstSampleMs{ -1 };
+    std::string error;
     const auto t0 = Clock::now();
-    client.init(hostPort);
+    client.init(hostPort, entry.target.scheme == "https");
     client.onSamples = [&](const dsp::complex_t*, int count) {
         if (count > 0 && !gotSamples.exchange(true)) {
             firstSampleMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
@@ -56,6 +57,10 @@ remote::ProbeResult probeKiwiSDR(const remote::RemoteEntry& entry, const std::at
         client.tune(double(f), KiwiSDRClient::TUNE_IQ);
     };
     client.onDisconnected = [&]() { disconnected = true; };
+    client.onError = [&](const std::string& reason) {
+        error = reason;
+        disconnected = true;
+    };
     client.start();
     while (!cancel && !disconnected && !gotSamples && Clock::now() - t0 < 5s) {
         std::this_thread::sleep_for(50ms);
@@ -64,10 +69,6 @@ remote::ProbeResult probeKiwiSDR(const remote::RemoteEntry& entry, const std::at
     const auto served = client.getServedRange();
     const int rate = client.audioRate();
     client.stop();
-    if (connected) {
-        const auto waitStart = Clock::now();
-        while (!disconnected && Clock::now() - waitStart < 5s) { std::this_thread::sleep_for(50ms); }
-    }
 
     if (cancel) {
         result.reason = "cancelled";
@@ -83,6 +84,9 @@ remote::ProbeResult probeKiwiSDR(const remote::RemoteEntry& entry, const std::at
             result.negotiated.emplace_back("Served range", remote::formatRangeMHz((uint64_t)std::max<int64_t>(0, served->minHz),
                                                                                   (uint64_t)std::max<int64_t>(0, served->maxHz)));
         }
+    }
+    else if (!error.empty()) {
+        result.reason = error;
     }
     else if (connected) {
         result.reason = "connected, but no data within 5 s";

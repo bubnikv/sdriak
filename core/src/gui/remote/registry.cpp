@@ -17,6 +17,7 @@ namespace remote {
     void Registry::registerHandler(const RemoteHandler& handler) {
         std::lock_guard lck(m_mtx);
         m_handlers[handler.kind] = handler;
+        ++m_handlerGeneration;
     }
 
     void Registry::unregisterHandler(RemoteKind kind) {
@@ -25,7 +26,7 @@ namespace remote {
             m_cancel = true;
             joinProbe(lck);
         }
-        m_handlers.erase(kind);
+        if (m_handlers.erase(kind)) { ++m_handlerGeneration; }
     }
 
     bool Registry::hasHandler(RemoteKind kind) const {
@@ -47,8 +48,15 @@ namespace remote {
         if (entry.tlsRequired && !it->second.supportsTls) {
             return std::string("The ") + kindName(entry.kind) + " source has no TLS (https) support yet";
         }
-        if (entry.hasFlag("audio-only")) { return "Server too old for IQ: needs OpenWebRX+ 1.2.129 or later"; }
         return {};
+    }
+
+    std::map<RemoteKind, bool> Registry::tlsSupportSnapshot(uint64_t& generation) const {
+        std::lock_guard lck(m_mtx);
+        std::map<RemoteKind, bool> support;
+        for (const auto& [kind, handler] : m_handlers) { support.emplace(kind, handler.supportsTls); }
+        generation = m_handlerGeneration.load();
+        return support;
     }
 
     void Registry::joinProbe(std::unique_lock<std::mutex>& lck) {

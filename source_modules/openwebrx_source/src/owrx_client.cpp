@@ -48,10 +48,7 @@ namespace owrx {
             handleBinary(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
         };
         m_ws.onDisconnected = [this] {
-            const bool wasHandshaken = m_handshaken.load();
             m_connected = false;
-            if (!wasHandshaken && m_running.load()) { onError("the server closed the connection before the handshake"); }
-            onDisconnected();
         };
     }
 
@@ -106,22 +103,25 @@ namespace owrx {
             m_details = Details();
         }
         m_clients = 0;
+        m_handshaken = false;
+        m_hasModeList = false;
         const std::string url = socketUrl(receiverUrl);
         m_running = true;
         m_ws.reset();
         m_thread = std::thread([this, url] {
             try {
                 m_ws.connectAndReceiveLoop(url);
+                if (m_running.load() && !m_handshaken.load()) { onError("the server closed the connection before the handshake"); }
             }
             catch (const std::exception& e) {
                 flog::warn("OpenWebRxClient: {}", e.what());
-                onError(explainFailure(e.what()));
+                if (m_running.load()) { onError(explainFailure(e.what())); }
             }
             catch (...) {
-                onError("connection failed");
+                if (m_running.load()) { onError("connection failed"); }
             }
             m_connected = false;
-            m_running = false;
+            if (m_running.exchange(false)) { onDisconnected(); }
         });
     }
 
@@ -144,16 +144,16 @@ namespace owrx {
         }
     }
 
-    void OpenWebRxClient::sendDsp(const nlohmann::json& params) {
+    void OpenWebRxClient::sendDsp(const nlohmann::json& params, const char* key) {
         nlohmann::json j;
         j["type"] = "dspcontrol";
         j["params"] = params;
-        trySend(j.dump());
+        m_ws.queueString(j.dump(), key);
     }
 
     void OpenWebRxClient::startIq(double offsetHz) {
         if (!m_connected.load()) { return; }
-        trySend("{\"type\":\"dspcontrol\",\"action\":\"start\"}");
+        m_ws.queueString("{\"type\":\"dspcontrol\",\"action\":\"start\"}");
         nlohmann::json p;
         p["mod"] = "iq";
         p["offset_freq"] = (int64_t)std::llround(offsetHz);
@@ -166,7 +166,7 @@ namespace owrx {
         if (!m_connected.load()) { return; }
         nlohmann::json p;
         p["offset_freq"] = (int64_t)std::llround(offsetHz);
-        sendDsp(p);
+        sendDsp(p, "offset");
     }
 
     void OpenWebRxClient::selectProfile(const std::string& profileKey) {
@@ -174,7 +174,7 @@ namespace owrx {
         nlohmann::json j;
         j["type"] = "selectprofile";
         j["params"]["profile"] = profileKey;
-        trySend(j.dump());
+        m_ws.queueString(j.dump(), "profile");
     }
 
     std::string OpenWebRxClient::serverVersion() const {
@@ -293,6 +293,7 @@ namespace owrx {
             }
             std::lock_guard lck(m_stateMtx);
             m_modes = std::move(list);
+            m_hasModeList = true;
         }
         else if (type == "receiver_details" && v.is_object()) {
             std::lock_guard lck(m_stateMtx);

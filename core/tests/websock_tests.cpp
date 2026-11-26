@@ -589,6 +589,71 @@ namespace {
         require(c.disconnected == 0 && ws.isStopped(), "refused upgrade: state");
     }
 
+    void missingUpgradeResponseAndRedirectSecrets() {
+        const std::string secret = "network-source-test-secret-41d1";
+        Server srv([&](Peer& p, const Request&, int index) {
+            if (index == 0) { respond(p, "302 Found", "Location: /closed?password=" + secret + "\r\n"); }
+            // The redirect target accepts TCP and closes before HTTP.
+        });
+        WSClient ws;
+        Collector c;
+        c.attach(ws);
+        ClientRun run;
+        run.start(ws, srv.url("/start?password=" + secret));
+        run.join(5000, "missing HTTP response: loop did not end");
+        require(run.failed() && run.errorText().find("/closed") != std::string::npos,
+                "missing HTTP response: expected the redirected endpoint");
+        require(run.errorText().find(secret) == std::string::npos, "upgrade error exposes its query");
+        require(c.connected == 0 && ws.effectiveUrl().empty(), "missing HTTP response was treated as a connection");
+    }
+
+    void queuedCommandsKeepOrder() {
+        Server* self = nullptr;
+        Server srv(echoHandler(self));
+        self = &srv;
+        WSClient ws;
+        Collector c;
+        c.attach(ws);
+        // Queue before the worker runs so coalescing is deterministic.
+        require(ws.queueString("superseded", "tune"), "enqueue tune");
+        require(ws.queueString("latest tune", "tune"), "replace tune");
+        require(ws.queueString("setup"), "enqueue setup");
+        require(ws.queueString("next tune", "tune"), "enqueue tune after setup");
+        ClientRun run;
+        run.start(ws, srv.url("/echo"));
+        require(c.waitFor([&] { return c.msgs.size() >= 3; }, 3000), "queued commands were not delivered");
+        ws.stopSocket();
+        run.join(2000, "queued commands: loop did not stop");
+        requireNoError(run, "queued commands");
+        require(c.msgs == std::vector<Message>{{false, "latest tune"}, {false, "setup"}, {false, "next tune"}},
+                "queued commands arrived in the wrong order");
+    }
+
+    void queuedCommandsDuringStalledWrite() {
+        std::atomic<bool> release{false};
+        Server srv([&](Peer& p, const Request& r, int) {
+            accept101(p, r);
+            const auto until = Clock::now() + std::chrono::seconds(2);
+            while (!release && Clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+        });
+        WSClient ws;
+        Collector c;
+        c.attach(ws);
+        ClientRun run;
+        run.start(ws, srv.url("/stalled"));
+        require(c.waitFor([&] { return c.connected.load() == 1; }, 3000), "stalled write: no connection");
+        require(ws.queueString(std::string(16 * 1024 * 1024, 'x')), "stalled write: enqueue large frame");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto t0 = Clock::now();
+        const bool accepted = ws.queueString("new tune", "tune");
+        const auto elapsed = msSince(t0);
+        ws.stopSocket();
+        release = true;
+        run.join(2000, "stalled write: stop did not interrupt the writer");
+        require(accepted && elapsed < 500, "stalled write blocked the command producer");
+        requireNoError(run, "stalled write");
+    }
+
     void refusedConnect() {
         uint16_t port = 0;
         {
@@ -935,9 +1000,12 @@ namespace {
             if (!k.waitCommand(p, "SET AR OK")) { return; }
             p.send(frame(2, "MSG sample_rate=20250.880000 bandwidth=30000000"));
             if (!k.waitCommand(p, "SET mod=iq")) { return; }
-            p.send(frame(2, sndPacket(0x0d, 0, 700, 512)));  // first packet: IQ + NEW_FREQ + LPF
-            p.send(frame(2, sndPacket(0x08, 1, 700, 512)));
-            p.send(frame(2, sndPacket(0x0a, 3, 700, 512)));  // seq 2 lost; ADC overload
+            p.send(frame(2, sndPacket(0x0d, 0xfffffffdu, 700, 512))); // IQ + NEW_FREQ + LPF
+            p.send(frame(2, sndPacket(0x08, 0xfffffffbu, 700, 512))); // late packet
+            p.send(frame(2, sndPacket(0x08, 0xfffffffeu, 700, 512)));
+            p.send(frame(2, sndPacket(0x08, 0xfffffffeu, 700, 512))); // duplicate
+            p.send(frame(2, sndPacket(0x08, 0, 700, 512)));           // one missing at wraparound
+            p.send(frame(2, sndPacket(0x0a, 1, 700, 512)));           // ADC overload
             k.drain(p);
         };
         Server srv(kiwi.handler());
@@ -956,7 +1024,7 @@ namespace {
         client.onSamples = [&](const dsp::complex_t*, int n) { samples += n; };
         client.start();
         const auto t0 = Clock::now();
-        while (msSince(t0) < 5000 && samples.load() < 3 * 512 && !failed) {
+        while (msSince(t0) < 5000 && samples.load() < 6 * 512 && !failed) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         const bool wasConnected = client.connected.load();
@@ -972,7 +1040,7 @@ namespace {
         const auto paths = srv.paths();
         require(paths.size() >= 2 && paths[0] == "/VER" && paths[1] == "/4611686213435808288/SND",
                 "fake kiwi: paths " + (paths.size() >= 2 ? paths[0] + " " + paths[1] : std::string("missing")));
-        require(samples.load() == 3 * 512 && packets.load() == 3, "fake kiwi: samples " + std::to_string(samples.load()));
+        require(samples.load() == 6 * 512 && packets.load() == 6, "fake kiwi: samples " + std::to_string(samples.load()));
         require(newFreqPackets.load() == 1, "fake kiwi: NEW_FREQ packets " + std::to_string(newFreqPackets.load()));
         require(gaps == 1, "fake kiwi: seq gaps " + std::to_string(gaps));
         require(overload, "fake kiwi: ADC overload not reported");
@@ -1154,6 +1222,49 @@ namespace {
         require(!wf.available(), "waterfall: still available after stop");
     }
 
+    void kiwiFakeWaterfallOnly() {
+        FakeKiwi kiwi;
+        kiwi.wfSession = [](Peer& p, FakeKiwi& k) {
+            if (!k.waitCommand(p, "SERVER DE CLIENT sdriak W/F")) { return; }
+            p.send(frame(2, "MSG bandwidth=30000000 zoom_max=14 zoom_cap=11 wf_setup"));
+            if (!k.waitCommand(p, "SET zoom=0")) { return; }
+            p.send(frame(2, wfPacket(0, 0, 1, 200)));
+            if (!k.waitCommand(p, "SET zoom=2")) { return; }
+            for (uint32_t i = 2; i <= 11; ++i) { p.send(frame(2, wfPacket(0, 0, i, 200))); }
+            k.drain(p);
+        };
+        kiwi.session = [](Peer& p, FakeKiwi& k, const std::string&) {
+            if (!k.waitCommand(p, "SET compression=0")) { return; }
+            p.send(frame(2, "MSG sample_rate=12000"));
+            if (!k.waitCommand(p, "SET mod=iq")) { return; }
+            k.drain(p);
+        };
+        Server srv(kiwi.handler());
+        KiwiWaterfallClient wf;
+        std::atomic<int> rows{0};
+        std::atomic<bool> constantHeaders{true};
+        wf.onFrame = [&](const KiwiWaterfallClient::Frame& f) {
+            if (f.zoom != 0 || f.xBin != 0) { constantHeaders = false; }
+            ++rows;
+        };
+        KiwiSDRClient client;
+        std::atomic<int> iqSamples{0};
+        client.init("127.0.0.1:" + std::to_string(srv.port()));
+        client.waterfall = &wf;
+        client.onConnected = [&] { client.tune(7100000.0, KiwiSDRClient::TUNE_IQ); };
+        client.onSamples = [&](const dsp::complex_t*, int count) { iqSamples += count; };
+        client.start();
+        const auto t0 = Clock::now();
+        while (!rows && msSince(t0) < 3000) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+        wf.setView(2, 7100.0);
+        while (msSince(t0) < 4000 && (rows < 11 || kiwi.indexOf("SET mod=iq") < 0)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        client.stop();
+        require(rows == 11 && constantHeaders, "bridge waterfall must keep its reported zoom and origin");
+        require(kiwi.indexOf("SET mod=iq") >= 0 && iqSamples == 0, "waterfall availability must not imply IQ");
+    }
+
     // No waterfall channel: the session goes on with SND alone.
     void kiwiFakeWaterfallBusy() {
         FakeKiwi kiwi;
@@ -1333,6 +1444,9 @@ int main(int argc, char** argv) {
         { "redirect to site root", redirectToRootKeepsEndpoint },
         { "redirect cap", redirectCap },
         { "refused upgrade", refusedUpgrade },
+        { "missing upgrade response and redirect secrets", missingUpgradeResponseAndRedirectSecrets },
+        { "queued commands keep order", queuedCommandsKeepOrder },
+        { "queued commands during a stalled write", queuedCommandsDuringStalledWrite },
         { "refused connect", refusedConnect },
         { "stop during handshake", stopDuringHandshake },
         { "stop/start x10", stopStartTenTimes },
@@ -1346,6 +1460,7 @@ int main(int argc, char** argv) {
         { "kiwi: silent krec path falls back to /kiwi/", kiwiFakeSilentKrec },
         { "kiwi: parse W/F frame", kiwiParseWf },
         { "kiwi: fake server waterfall", kiwiFakeWaterfall },
+        { "kiwi: waterfall-only bridge and constant zoom headers", kiwiFakeWaterfallOnly },
         { "kiwi: fake server waterfall busy", kiwiFakeWaterfallBusy },
     };
     int failures = 0;

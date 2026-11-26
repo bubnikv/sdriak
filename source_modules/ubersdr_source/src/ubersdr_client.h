@@ -62,7 +62,7 @@ namespace ubersdr {
         // replaces the first on the server.
         void start(const std::string& baseUrl, const std::string& mode, double freqHz,
                    const std::string& password = {}, int vfo = 0);
-        // Close and join. Any thread except the client's own; idempotent.
+        // Close and join on the same owner thread as start().
         void stop();
         bool running() const { return m_running.load(); }
         bool connected() const { return m_connected.load(); }
@@ -91,7 +91,6 @@ namespace ubersdr {
 
         std::string m_sessionId;
         net::websock::WSClient m_ws;
-        std::mutex m_lifeMtx;   // start() / stop()
         std::thread m_thread;
         std::atomic<bool> m_running{false};
         std::atomic<bool> m_connected{false};
@@ -163,7 +162,6 @@ namespace ubersdr {
         bool trySend(const std::string& msg);
 
         net::websock::WSClient m_ws;
-        std::mutex m_lifeMtx;
         std::thread m_thread;
         std::atomic<bool> m_running{false};
         std::atomic<bool> m_connected{false};

@@ -231,8 +231,7 @@ namespace ImGui {
     }
 
     void WaterFall::drawWaterfall() {
-        if (waterfallUpdate) {
-            waterfallUpdate = false;
+        if (waterfallUpdate.exchange(false)) {
             updateWaterfallTexture();
         }
         {
@@ -774,18 +773,20 @@ namespace ImGui {
         int count = std::min<float>(waterfallHeight, fftLines);
         if (rawFFTs != NULL && fftLines >= 0) {
             for (int i = 0; i < count; i++) {
+                const int row = (i + currentFFTLine) % waterfallHeight;
                 drawDataSize = (viewBandwidth / wholeBandwidth) * rawFFTSize;
                 drawDataStart = (((double)rawFFTSize / 2.0) * (offsetRatio + 1)) - (drawDataSize / 2);
                 doZoom(drawDataStart, drawDataSize, rawFFTSize, dataWidth, &rawFFTs[((i + currentFFTLine) % waterfallHeight) * rawFFTSize], tempData);
                 for (int j = 0; j < dataWidth; j++) {
                     pixel = (std::clamp<float>(tempData[j], waterfallMin, waterfallMax) - waterfallMin) / dataRange;
-                    waterfallFb[(i * dataWidth) + j] = waterfallPallet[(int)(pixel * (WATERFALL_RESOLUTION - 1))];
+                    waterfallFb[(row * dataWidth) + j] = waterfallPallet[(int)(pixel * (WATERFALL_RESOLUTION - 1))];
                 }
             }
 
             for (int i = count; i < waterfallHeight; i++) {
+                const int row = (i + currentFFTLine) % waterfallHeight;
                 for (int j = 0; j < dataWidth; j++) {
-                    waterfallFb[(i * dataWidth) + j] = (uint32_t)255 << 24;
+                    waterfallFb[(row * dataWidth) + j] = (uint32_t)255 << 24;
                 }
             }
         }
@@ -865,12 +866,23 @@ namespace ImGui {
     }
 
     void WaterFall::updateWaterfallTexture() {
+        std::lock_guard<std::recursive_mutex> bufLock(buf_mtx);
         std::lock_guard<std::mutex> lck(texMtx);
         glBindTexture(GL_TEXTURE_2D, textureId);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dataWidth, waterfallHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, (uint8_t*)waterfallFb);
+        if (textureWidth != dataWidth || textureHeight != waterfallHeight) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dataWidth, waterfallHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            textureWidth = dataWidth;
+            textureHeight = waterfallHeight;
+        }
+        const int firstRows = waterfallHeight - currentFFTLine;
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dataWidth, firstRows, GL_RGBA, GL_UNSIGNED_BYTE,
+                        waterfallFb + currentFFTLine * dataWidth);
+        if (currentFFTLine > 0) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, firstRows, dataWidth, currentFFTLine, GL_RGBA, GL_UNSIGNED_BYTE, waterfallFb);
+        }
     }
 
     void WaterFall::onPositionChange() {
@@ -1112,8 +1124,8 @@ namespace ImGui {
     }
 
     float* WaterFall::getFFTBuffer() {
-        if (rawFFTs == NULL) { return NULL; }
         buf_mtx.lock();
+        if (rawFFTs == NULL) { buf_mtx.unlock(); return NULL; }
         if (waterfallVisible) {
             currentFFTLine--;
             fftLines++;
@@ -1133,13 +1145,13 @@ namespace ImGui {
 
         if (waterfallVisible) {
             doZoom(drawDataStart, drawDataSize, rawFFTSize, dataWidth, &rawFFTs[currentFFTLine * rawFFTSize], latestFFT);
-            memmove(&waterfallFb[dataWidth], waterfallFb, dataWidth * (waterfallHeight - 1) * sizeof(uint32_t));
+            uint32_t* row = waterfallFb + currentFFTLine * dataWidth;
             float pixel;
             float dataRange = waterfallMax - waterfallMin;
             for (int j = 0; j < dataWidth; j++) {
                 pixel = (std::clamp<float>(latestFFT[j], waterfallMin, waterfallMax) - waterfallMin) / dataRange;
                 int id = (int)(pixel * (WATERFALL_RESOLUTION - 1));
-                waterfallFb[j] = waterfallPallet[id];
+                row[j] = waterfallPallet[id];
             }
             waterfallUpdate = true;
         }

@@ -130,7 +130,7 @@ namespace sourcemenu {
     void onSourceUnregister(std::string name, void* ctx) {
         if (name != selectedSource) { return; }
 
-        // TODO: Stop everything
+        gui::mainWindow.setPlayState(false);
     }
 
     void reloadOffsets() {

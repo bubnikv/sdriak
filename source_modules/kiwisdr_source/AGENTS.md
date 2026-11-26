@@ -22,8 +22,8 @@ The pieces, and what to update together:
 - `core/src/gui/remote/browser.{h,cpp}` — map and list views, filters,
   Test/Connect/Favourite.
 - `src/kiwisdr_probe.cpp` — this module's Test: `probeKiwiSDR`.
-- `src/main.cpp` — registers the `RemoteHandler` (`supportsTls = false`:
-  the SND client speaks plain http) and `connectRemote`, which goes
+- `src/main.cpp` — registers the `RemoteHandler` with HTTP and HTTPS support
+  and `connectRemote`, which goes
   through `commitServer` and starts playing.
 - `core/tests/remote_directory_tests.cpp` — parser tests; `--files` parses
   saved real documents.
@@ -61,7 +61,7 @@ URL that is not http(s). E-mail fields are never read.
 |-------|-----|
 | `gps` | `"(lat, lon)"`, parsed with `std::locale::classic()` |
 | `name`, `loc` | name and location |
-| `url` | target; `https` sets `tlsRequired`, which greys the entry |
+| `url` | target; `https` keeps the session on TLS |
 | `bands` | `"lo-hi"` Hz, the served range; a malformed value leaves no range |
 | `snr` | first value as `snrDb` |
 | `users`, `users_max` | occupancy; `users >= users_max` with `users_max > 0` is full |
@@ -74,7 +74,7 @@ provider's entry winning.
 
 ## Test (probe)
 
-`probeKiwiSDR` connects `KiwiSDRClient` to `host:port`, tunes IQ to the
+`probeKiwiSDR` connects `KiwiSDRClient` using the selected scheme and `host:port`, tunes IQ to the
 middle of the served range (14.074 MHz without one), waits up to 5 s for
 the first SND samples, and closes. It reports the refusal reason
 (`too_busy`, `badp`, ...), the time to first samples, the IQ rate and the

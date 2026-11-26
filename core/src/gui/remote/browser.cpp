@@ -121,6 +121,7 @@ namespace remote {
 
     void RemoteBrowser::open(std::optional<RemoteKind> onlyKind) {
         m_onlyKind = onlyKind;
+        m_visibilityDirty = true;
         m_pendingOpen = true;
         m_rowsDirty = true;
     }
@@ -149,6 +150,7 @@ namespace remote {
     }
 
     void RemoteBrowser::saveFilters() {
+        m_visibilityDirty = true;
         auto cfg = m_config->edit();
         const std::string p = m_prefix + "_filter_";
         cfg.set(p + "covers", m_filters.coversFrequency);
@@ -200,6 +202,12 @@ namespace remote {
         for (auto& e : all) { add(std::move(e)); }
         for (auto& e : recent) { add(std::move(e)); }
         m_entries = std::move(merged);
+        m_searchText.clear();
+        m_searchText.reserve(m_entries.size());
+        for (const auto& e : m_entries) {
+            m_searchText.push_back(lower(e.name + " " + e.location + " " + e.target.host + " " + kindName(e.kind)));
+        }
+        m_visibilityDirty = true;
 
         // One marker per host, native protocol first.
         m_groups.clear();
@@ -245,38 +253,50 @@ namespace remote {
     }
 
     bool RemoteBrowser::entryVisible(const RemoteEntry& e) const {
-        const ptrdiff_t i = &e - m_entries.data();
-        if (i >= 0 && i < (ptrdiff_t)m_visible.size()) { return m_visible[(size_t)i] != 0; }
-        return computeVisible(e);
+        return m_visible[&e - m_entries.data()] != 0;
+    }
+
+    bool RemoteBrowser::entryConnectable(const RemoteEntry& e) const {
+        const auto it = m_tlsSupport.find(e.kind);
+        return it != m_tlsSupport.end() && (!e.tlsRequired || it->second);
     }
 
     void RemoteBrowser::updateVisibility() {
+        if (sigpath::remoteRegistry.handlerGeneration() != m_handlerGeneration) {
+            m_tlsSupport = sigpath::remoteRegistry.tlsSupportSnapshot(m_handlerGeneration);
+            m_visibilityDirty = true;
+        }
+        const uint64_t freq = m_filters.coversFrequency ? gui::freqSelect.frequency : 0;
+        if (!m_visibilityDirty && freq == m_filterFrequency) { return; }
+        m_filterFrequency = freq;
+        m_visibilityDirty = false;
+        m_rowsDirty = true;
+        m_visibleCount = 0;
+        const auto needle = lower(m_search);
         m_visible.resize(m_entries.size());
-        for (size_t i = 0; i < m_entries.size(); i++) { m_visible[i] = computeVisible(m_entries[i]) ? 1 : 0; }
+        for (size_t i = 0; i < m_entries.size(); i++) {
+            m_visible[i] = computeVisible(m_entries[i], m_searchText[i], needle);
+            m_visibleCount += m_visible[i];
+        }
     }
 
-    bool RemoteBrowser::computeVisible(const RemoteEntry& e) const {
+    bool RemoteBrowser::computeVisible(const RemoteEntry& e, const std::string& searchText, const std::string& needle) const {
         if (!kindShown(e.kind)) { return false; }
         const auto& f = m_filters;
         if (f.hideFull && e.isFull()) { return false; }
         if (f.freeOnly) {
             if (!e.users || !e.usersMax || *e.users >= *e.usersMax) { return false; }
         }
-        if (f.coversFrequency && !e.ranges.empty() && !e.covers((uint64_t)std::max<double>(0.0, (double)gui::freqSelect.frequency))) {
+        if (f.coversFrequency && !e.ranges.empty() && !e.covers(m_filterFrequency)) {
             return false;
         }
-        if (f.hideUnconnectable && !sigpath::remoteRegistry.unavailableReason(e).empty()) { return false; }
+        if (f.hideUnconnectable && !entryConnectable(e)) { return false; }
         if (f.fullControlOnly && e.kind == RemoteKind::SpyServer && !e.hasFlag("full-control")) { return false; }
         if (f.iqOnly && e.hasFlag("audio-only")) { return false; }
         if (f.waterfallOnly && !e.hasFlag("waterfall")) { return false; }
         if (f.favouritesOnly && !e.favourite) { return false; }
         if (f.extApiOnly && e.kind == RemoteKind::KiwiSDR && !e.hasFlag("ext-api")) { return false; }
-        if (m_search[0]) {
-            const std::string needle = lower(m_search);
-            const std::string hay = lower(e.name + " " + e.location + " " + e.target.host + " " + kindName(e.kind));
-            if (hay.find(needle) == std::string::npos) { return false; }
-        }
-        return true;
+        return needle.empty() || searchText.find(needle) != std::string::npos;
     }
 
     int RemoteBrowser::groupLead(const Group& g) const {
@@ -342,8 +362,6 @@ namespace remote {
             m_recentGeneration = recentGeneration();
             rebuild();
         }
-        // Filters, search, handlers and the frequency can all change between
-        // frames; one pass here serves every check below.
         updateVisibility();
 
         const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
@@ -395,14 +413,10 @@ namespace remote {
         if (ImGui::Button("Refresh")) { DirectoryService::instance().refresh(true); }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(ImMax(ImGui::GetFontSize() * 6.0f, ImGui::GetContentRegionAvail().x * 0.35f));
-        if (ImGui::InputTextWithHint("##remote_search", "Search", m_search, sizeof m_search)) { m_rowsDirty = true; }
+        if (ImGui::InputTextWithHint("##remote_search", "Search", m_search, sizeof m_search)) { m_visibilityDirty = true; }
 
         // Status: visible count and per-provider state.
-        int visible = 0;
-        for (const auto& e : m_entries) {
-            if (entryVisible(e)) { visible++; }
-        }
-        std::string status = std::to_string(visible) + " of " + std::to_string(m_entries.size()) + " receivers";
+        std::string status = std::to_string(m_visibleCount) + " of " + std::to_string(m_entries.size()) + " receivers";
         if (m_onlyKind) { status += std::string(" (") + kindName(*m_onlyKind) + ")"; }
         ImGui::SameLine();
         ImGui::TextUnformatted(status.c_str());
@@ -434,6 +448,7 @@ namespace remote {
             ImGui::SameLine();
             if (ImGui::SmallButton("Show all kinds")) {
                 m_onlyKind.reset();
+                m_visibilityDirty = true;
                 changed = true;
             }
         }
@@ -479,8 +494,8 @@ namespace remote {
     // Map view
 
     ImU32 RemoteBrowser::stateColor(const RemoteEntry& e) const {
-        if (!sigpath::remoteRegistry.unavailableReason(e).empty()) {
-            if (e.tlsRequired && sigpath::remoteRegistry.hasHandler(e.kind)) { return IM_COL32(70, 110, 200, 255); } // needs TLS
+        if (!entryConnectable(e)) {
+            if (e.tlsRequired && m_tlsSupport.count(e.kind)) { return IM_COL32(70, 110, 200, 255); } // needs TLS
             return IM_COL32(90, 90, 90, 255); // not connectable
         }
         if (e.isFull()) { return IM_COL32(205, 0, 0, 255); }
@@ -727,7 +742,7 @@ namespace remote {
                     const RemoteEntry& e = m_entries[ei];
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(COL_NAME);
-                    const bool unavailable = !sigpath::remoteRegistry.unavailableReason(e).empty();
+                    const bool unavailable = !entryConnectable(e);
                     if (unavailable) { ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]); }
                     const std::string label = (e.favourite ? "* " : "") + e.name + "##row" + e.id;
                     if (ImGui::Selectable(label.c_str(), e.id == m_selectedEntryId,
@@ -871,10 +886,15 @@ namespace remote {
 
         ImGui::SameLine();
         // websdr_view adds KiwiSDR receivers itself and needs no handler.
-        const bool pickable = m_pickAction ? (e.kind == RemoteKind::KiwiSDR && !e.tlsRequired) : reason.empty();
+        const std::string blocked = !m_pickAction && handler && handler->connectBlockedReason
+            ? handler->connectBlockedReason() : std::string();
+        const bool pickable = m_pickAction ? (e.kind == RemoteKind::KiwiSDR && !e.tlsRequired) : reason.empty() && blocked.empty();
         ImGui::BeginDisabled(!pickable);
         const bool pick = ImGui::Button((m_pickLabel + "##remote_pick").c_str());
         ImGui::EndDisabled();
+        if (!blocked.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", blocked.c_str());
+        }
 
         ImGui::SameLine();
         const bool fav = e.favourite;
@@ -915,6 +935,7 @@ namespace remote {
         const auto handler = sigpath::remoteRegistry.handler(entry.kind);
         if (!handler || !handler->connect) { return false; }
         if (!sigpath::remoteRegistry.unavailableReason(entry).empty()) { return false; }
+        if (handler->connectBlockedReason && !handler->connectBlockedReason().empty()) { return false; }
         sigpath::remoteRegistry.cancelProbe();
         if (gui::mainWindow.isPlaying()) { gui::mainWindow.setPlayState(false); }
         if (sourcemenu::selectedSourceName() != handler->sourceName) {

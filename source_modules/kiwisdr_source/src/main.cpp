@@ -123,11 +123,12 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         int port = 8073;
         std::string loc;
         std::optional<FrequencyBand> band;
+        bool tls = false;
     };
     std::vector<RecentServer> recentServers; // front = most recent
 
     std::string kiwisdrHostPort() const {
-        return std::string(kiwisdrHost) + ":" + std::to_string(kiwisdrPort);
+        return remote::RemoteTarget{kiwisdrTls ? "https" : "http", kiwisdrHost, kiwisdrPort, ""}.hostPort();
     }
 
     KiwiSDRSourceModule(std::string name, const std::string &root) : kiwiSdrClient() {
@@ -152,6 +153,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
                 kiwisdrHost[sizeof(kiwisdrHost) - 1] = '\0';
             }
             configAccess.tryGet("kiwisdr_port", kiwisdrPort);
+            configAccess.tryGet("kiwisdr_tls", kiwisdrTls);
             configAccess.tryGet("kiwisdr_loc", kiwisdrLoc);
             FrequencyBand b;
             if (configAccess.tryGet("kiwisdr_band_start", b.startHz) &&
@@ -172,14 +174,19 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // builds a string per entry, none of which needs the config mutex.
         if (!recent.is_null()) { loadRecent(recent); }
 
-        kiwiSdrClient.init(kiwisdrHostPort());
+        kiwiSdrClient.init(kiwisdrHostPort(), kiwisdrTls);
         chain.init(&rawStream, &stream);
         appliedRate = kiwiSdrClient.audioRate();
         chain.setSampleRate(appliedRate);
         chain.setPrebufferMsec(bufferMs.load(), false, false);
         kiwiSdrClient.onSamples = [this](const dsp::complex_t* samples, int count) {
-            memcpy(rawStream.writeBuf, samples, count * sizeof(dsp::complex_t));
-            if (rawStream.swap(count)) { sndPushed += (uint64_t)count; }
+            for (int offset = 0; offset < count;) {
+                const int n = std::min(count - offset, rawStream.capacity());
+                memcpy(rawStream.writeBuf, samples + offset, n * sizeof(dsp::complex_t));
+                if (!rawStream.swap(n)) { return; }
+                sndPushed += (uint64_t)n;
+                offset += n;
+            }
         };
         // Before onSamples: the packet's first sample is the next input.
         kiwiSdrClient.onPacket = [this](const KiwiSDRClient::SndPacket& packet) {
@@ -202,16 +209,13 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         handler.uiTickHandler = uiTick;
         handler.stream = &stream;
 
-        kiwiSdrClient.onConnected = [&]() {
-            connected = true;
-            tune(lastTuneFrequency, this);
-        };
+        kiwiSdrClient.onConnected = [&]() { connected = true; };
 
         kiwiSdrClient.onDisconnected = [&]() {
             connected = false;
-            running = false;
-            gui::mainWindow.setPlayState(false);
+            sessionEnded = true;
         };
+        kiwiSdrClient.onError = [&](const std::string&) { sessionEnded = true; };
 
 
 
@@ -222,7 +226,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         remote::RemoteHandler remoteHandler;
         remoteHandler.kind = remote::RemoteKind::KiwiSDR;
         remoteHandler.sourceName = "KiwiSDR";
-        remoteHandler.supportsTls = false; // the SND client speaks plain http
+        remoteHandler.supportsTls = true;
         remoteHandler.probe = probeKiwiSDR;
         remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
         sigpath::remoteRegistry.registerHandler(remoteHandler);
@@ -306,6 +310,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             json j;
             j["host"] = r.host;
             j["port"] = r.port;
+            j["tls"] = r.tls;
             j["loc"] = r.loc;
             if (r.band) {
                 j["band_start"] = r.band->startHz;
@@ -326,6 +331,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             RecentServer r;
             r.host = j["host"];
             r.port = j.value("port", 8073);
+            r.tls = j.value("tls", false);
             r.loc = j.value("loc", std::string());
             if (j.contains("band_start") && j.contains("band_end")) {
                 FrequencyBand b;
@@ -344,17 +350,19 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     // the MRU list, persist everything in one config write, re-derive the
     // tuning limits and re-point the client.
     void commitServer(const std::string& host, int port, const std::string& loc,
-                      const std::optional<FrequencyBand>& band) {
+                      const std::optional<FrequencyBand>& band, bool tls) {
         std::strncpy(kiwisdrHost, host.c_str(), sizeof(kiwisdrHost) - 1);
         kiwisdrHost[sizeof(kiwisdrHost) - 1] = '\0';
         kiwisdrPort = port;
+        kiwisdrTls = tls;
         kiwisdrLoc = loc;
         selectedBand = band;
-        touchRecent(RecentServer{ host, port, loc, band });
+        touchRecent(RecentServer{ host, port, loc, band, tls });
         {
             auto configAccess = config.edit();
             configAccess.set("kiwisdr_host", host);
             configAccess.set("kiwisdr_port", port);
+            configAccess.set("kiwisdr_tls", tls);
             configAccess.set("kiwisdr_loc", loc);
             if (band) {
                 configAccess.set("kiwisdr_band_start", band->startHz);
@@ -367,14 +375,14 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             configAccess.set("kiwisdr_recent", recentToJson());
         }
         applyFreqLimits();
-        kiwiSdrClient.init(kiwisdrHostPort());
+        kiwiSdrClient.init(kiwisdrHostPort(), kiwisdrTls);
     }
 
     // The remote browser's Connect: the browser has selected this source.
     void connectRemote(const remote::RemoteEntry& entry) {
         std::optional<FrequencyBand> band;
         if (!entry.ranges.empty()) { band = FrequencyBand{ entry.ranges.front().first, entry.ranges.front().second }; }
-        commitServer(entry.target.host, entry.target.port, entry.location, band);
+        commitServer(entry.target.host, entry.target.port, entry.location, band, entry.target.scheme == "https");
         gui::mainWindow.setPlayState(true);
     }
 
@@ -385,12 +393,14 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     void applyTypedServer() {
         std::string loc;
         std::optional<FrequencyBand> band;
+        bool tls = false;
         if (const RecentServer* r = findRecent(kiwisdrHost, kiwisdrPort)) {
             loc = r->loc;
             band = r->band;
+            tls = r->tls;
         }
-        commitServer(kiwisdrHost, kiwisdrPort, loc, band);
-        remote::RemoteTarget target{ "http", kiwisdrHost, kiwisdrPort, "" };
+        commitServer(kiwisdrHost, kiwisdrPort, loc, band, tls);
+        remote::RemoteTarget target{ tls ? "https" : "http", kiwisdrHost, kiwisdrPort, "" };
         auto entry = remote::manualEntry(remote::RemoteKind::KiwiSDR, target, loc);
         if (band) { entry.ranges.emplace_back(band->startHz, band->endHz); }
         entry.location = loc;
@@ -400,7 +410,7 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     void applyRecent(int idx) {
         if (idx < 0 || idx >= (int)recentServers.size()) { return; }
         RecentServer r = recentServers[idx]; // copy: commitServer reorders the list
-        commitServer(r.host, r.port, r.loc, r.band);
+        commitServer(r.host, r.port, r.loc, r.band, r.tls);
     }
 
     void removeRecent(int idx) {
@@ -434,6 +444,10 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     // server waterfall's view change here.
     static void uiTick(void* ctx) {
         KiwiSDRSourceModule* _this = (KiwiSDRSourceModule*)ctx;
+        if (_this->sessionEnded.exchange(false) && _this->running.load()) {
+            gui::mainWindow.setPlayState(false);
+            return;
+        }
         const int rate = _this->kiwiSdrClient.audioRate();
         if (rate != _this->appliedRate) {
             flog::info("KiwiSDRSourceModule '{0}': server audio rate {1}", _this->name, rate);
@@ -689,14 +703,9 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
             wfFrame.bins[(size_t)i] = KiwiWaterfallClient::binDbm(setup, frame.bins[i]);
         }
         const double span = KiwiWaterfallClient::zoomSpanHz(setup, frame.zoom) * frame.count / KiwiWaterfallClient::kBins;
-        double start = KiwiWaterfallClient::frameStartHz(setup, frame.xBin)
-                       + (double)kiwiSdrClient.frequencyOffsetHz() + uiTuningOffset.load();
-        if (uiInvertIQ.load()) {
-            std::reverse(wfFrame.bins.begin(), wfFrame.bins.end());
-            start = 2.0 * uiCentre.load() - (start + span);
-        }
-        wfFrame.startHz = start;
         wfFrame.spanHz = span;
+        const double nativeStart = KiwiWaterfallClient::frameStartHz(setup, frame.xBin) + kiwiSdrClient.frequencyOffsetHz();
+        placeSpectrumFrame(wfFrame, nativeStart, uiTuningOffset.load(), uiCentre.load(), uiInvertIQ.load());
         wfFrame.presentAt = presentAt(frame.seq);
         frameZoom.store(frame.zoom);
         framesSinceView.fetch_add(1);
@@ -721,13 +730,16 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         KiwiSDRSourceModule* _this = (KiwiSDRSourceModule*)ctx;
         if (_this->running.load()) { return; }
         if (_this->running.exchange(true)) { return; }
+        _this->sessionEnded = false;
         {
             std::lock_guard lck(_this->bufferModeMtx);
             _this->rawStream.clearWriteStop();
-            _this->applyBufferModeLocked(true);
+            _this->chain.setPrebufferMsec(_this->bufferMs.load(), true, false);
             // A block left unread by the last session would shift this
             // session's input indices (PrebufferedLink::discardUnreadInput).
             _this->chain.discardUnreadInput();
+            _this->sndInputBase = _this->chain.samplesIn();
+            _this->sndPushed = 0;
             _this->chain.start();
         }
         _this->seqClock.clear();
@@ -735,10 +747,6 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         _this->framesSinceView = 0;
         _this->zoomHeaderSeen = false;
         _this->zoomUnsupported = false;
-        // The link has consumed everything pushed so far; this session's
-        // samples continue its input count.
-        _this->sndInputBase = _this->chain.samplesIn();
-        _this->sndPushed = 0;
         {
             std::lock_guard lck(_this->iqTuneMtx);
             _this->sentIqValid = false;
@@ -760,6 +768,8 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         // mutex so a concurrent applyBufferMode can finish its switch.
         _this->rawStream.stopWriter();
         _this->kiwiSdrClient.stop();
+        _this->connected = false;
+        _this->unregisterProvider();
         {
             std::lock_guard lck(_this->bufferModeMtx);
             _this->chain.stop();
@@ -768,11 +778,6 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
         flog::info("KiwiSDRSourceModule '{0}': Stop!", _this->name);
     }
 
-    // Serialized against stop(): the slider applies the mode on the GUI
-    // thread, while stop() can arrive on the client's network thread
-    // (onDisconnected -> setPlayState(false) -> SourceManager::stop). An
-    // unsynchronized interleaving could restart the prebuffer after stop()
-    // already tore it down.
     void applyBufferMode(bool resetBuffer) {
         std::lock_guard lck(bufferModeMtx);
         applyBufferModeLocked(resetBuffer);
@@ -989,6 +994,8 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
 
     std::string name;
     bool enabled = true;
+    bool kiwisdrTls = false;
+    std::atomic<bool> sessionEnded{false};
     std::atomic<bool> running{false};
     std::atomic<bool> connected{false};
     // Shared prebuffer target in milliseconds; applied live while playing.
@@ -997,8 +1004,8 @@ struct KiwiSDRSourceModule : public ModuleManager::Instance {
     double freq;
     bool serverBusy = false;
 
-    dsp::stream<dsp::complex_t> rawStream;
-    dsp::stream<dsp::complex_t> stream;
+    dsp::stream<dsp::complex_t> rawStream{8192};
+    dsp::stream<dsp::complex_t> stream{8192};
     dsp::buffer::PrebufferedLink<dsp::complex_t> chain;
     // Guards the prebuffer/bypass mode switch (the chain's routing and
     // start/stop) between the GUI thread and a stop() arriving on the

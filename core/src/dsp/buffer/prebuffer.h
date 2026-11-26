@@ -19,6 +19,11 @@ namespace dsp::buffer {
         // Total input samples accepted so far.
         uint64_t samplesIn() const { return m_samplesIn.load(std::memory_order_acquire); }
         void addInput(size_t count) { m_samplesIn.fetch_add(count, std::memory_order_acq_rel); }
+        void clearMarkers() {
+            std::lock_guard lck(m_mtx);
+            m_markers.clear();
+            m_pending.store(0, std::memory_order_release);
+        }
 
         // Any thread. cb runs on the output thread before the block that
         // holds input sample `inputIndex` is published, or with the next
@@ -61,12 +66,14 @@ namespace dsp::buffer {
 
     public:
         Prebuffer() = default;
+        explicit Prebuffer(int ownCapacity) : out(ownCapacity) {}
         Prebuffer(stream<T>* in) { init(in); }
 
-        void init(stream<T>* in) {
+        void init(stream<T>* in, stream<T>* destination = nullptr) {
             input = in;
+            output = destination ? destination : &out;
             registerInput(input);
-            registerOutput(&out);
+            registerOutput(output);
             _block_init = true;
         }
 
@@ -155,12 +162,12 @@ namespace dsp::buffer {
                     {
                         std::lock_guard lck(bufferMtx);
                         endIndex = outputIndexLocked();
-                        count = (int)popLocked(out.writeBuf, std::min(bufferedSamples, (size_t)out.capacity()));
+                        count = (int)popLocked(output->writeBuf, std::min(bufferedSamples, (size_t)output->capacity()));
                         endIndex += count;
                     }
                     if (count > 0) {
                         if (position) { position->fireBefore(endIndex); }
-                        if (!out.swap(count)) { return -1; }
+                        if (!output->swap(count)) { return -1; }
                         continue;
                     }
                     if (waitForProducer(std::chrono::milliseconds(TICK_MS)) < 0) { return -1; }
@@ -174,7 +181,7 @@ namespace dsp::buffer {
 
                 auto now = Clock::now();
                 if (now < nextTick) {
-                    if (waitForProducer(std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now)) < 0) { return -1; }
+                    if (waitForProducer(std::chrono::ceil<std::chrono::milliseconds>(nextTick - now)) < 0) { return -1; }
                     continue;
                 }
 
@@ -184,7 +191,7 @@ namespace dsp::buffer {
                 {
                     std::lock_guard lck(bufferMtx);
                     endIndex = outputIndexLocked();
-                    count = (int)popLocked(out.writeBuf, std::min({ bufferedSamples, slice, (size_t)out.capacity() }));
+                    count = (int)popLocked(output->writeBuf, std::min({ bufferedSamples, slice, (size_t)output->capacity() }));
                     endIndex += count;
                     sampleRateSnapshot = sampleRate;
                     if (bufferedSamples < slice) { primed = false; }
@@ -195,7 +202,7 @@ namespace dsp::buffer {
 
                 nextTick += sliceDuration(count, sampleRateSnapshot);
                 if (position) { position->fireBefore(endIndex); }
-                if (!out.swap(count)) { return -1; }
+                if (!output->swap(count)) { return -1; }
             }
 
             return -1;
@@ -353,6 +360,7 @@ namespace dsp::buffer {
         static constexpr int MAX_SLACK_MS = 100;
 
         stream<T>* input = nullptr;
+        stream<T>* output = nullptr;
         StreamPosition* position = nullptr;
         int prebufferMsec = 100;
         double sampleRate = 1000000.0;
@@ -375,35 +383,31 @@ namespace dsp::buffer {
     // and the SDRIAK server client's pushedStateMtx). If `in` has a manual
     // writer that can sit blocked in swap(), the caller is responsible for
     // releasing it around a live mode switch (see the KiwiSDR source).
-    // StreamLink that, while counting, adds what it forwards to a
-    // StreamPosition and fires its markers: the bypass path of a
-    // PrebufferedLink. Not counting, it forwards Prebuffer output, which
-    // has already been counted and marked.
+    // The bypass path counts and marks the samples it forwards.
     template <class T>
     class PositionLink : public routing::StreamLink<T> {
         using base_type = routing::StreamLink<T>;
     public:
         void setPosition(StreamPosition* pos) { m_position = pos; }
-        void setCounting(bool counting) { m_counting.store(counting, std::memory_order_release); }
 
         int run() override {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
-            memcpy(base_type::_out->writeBuf, base_type::_in->readBuf, count * sizeof(T));
-            base_type::_in->flush();
-
-            if (m_position && m_counting.load(std::memory_order_acquire)) {
-                m_position->addInput((size_t)count);
+            for (int offset = 0; offset < count;) {
+                const int n = std::min(count - offset, base_type::_out->capacity());
+                memcpy(base_type::_out->writeBuf, base_type::_in->readBuf + offset, n * sizeof(T));
+                m_position->addInput((size_t)n);
                 m_position->fireBefore(m_position->samplesIn());
+                if (!base_type::_out->swap(n)) { base_type::_in->flush(); return -1; }
+                offset += n;
             }
-            if (!base_type::_out->swap(count)) { return -1; }
+            base_type::_in->flush();
             return count;
         }
 
     private:
         StreamPosition* m_position = nullptr;
-        std::atomic<bool> m_counting{true};
     };
 
     template <class T>
@@ -411,11 +415,10 @@ namespace dsp::buffer {
     public:
         void init(stream<T>* in, stream<T>* out) {
             input = in;
-            prebuffer.init(in);
+            prebuffer.init(in, out);
             prebuffer.setPosition(&position);
             link.init(in, out);
             link.setPosition(&position);
-            link.setCounting(!prebufferActive);
         }
 
         // Total input samples accepted so far, in either mode.
@@ -462,9 +465,7 @@ namespace dsp::buffer {
             prebuffer.setPrebufferMsec(msec);
             if (msec > 0) {
                 if (!prebufferActive) {
-                    // Stop counting first: the prebuffer counts from here.
-                    link.setCounting(false);
-                    link.setInput(&prebuffer.out);
+                    link.stop();
                     prebufferActive = true;
                 }
                 if (resetBuffer) { prebuffer.clear(); }
@@ -473,11 +474,8 @@ namespace dsp::buffer {
             }
             if (prebufferActive) {
                 prebuffer.stop();
-                // The prebuffer is stopped, so nothing reaches the link
-                // until it reads `input` again.
-                link.setCounting(true);
-                link.setInput(input);
                 prebufferActive = false;
+                if (chainLive) { link.start(); }
             }
         }
 
@@ -485,7 +483,7 @@ namespace dsp::buffer {
         // through it). Both are idempotent, like the blocks they wrap.
         void start() {
             if (prebufferActive) { prebuffer.start(); }
-            link.start();
+            else { link.start(); }
         }
 
         void stop() {
@@ -498,12 +496,15 @@ namespace dsp::buffer {
         // would be read and counted after the next start(), shifting the
         // input index of everything a new session pushes by its size. Call
         // before taking samplesIn() as a session's base.
-        void discardUnreadInput() { input->flush(); }
+        void discardUnreadInput() {
+            input->flush();
+            position.clearMarkers();
+        }
 
     private:
         stream<T>* input = nullptr;
         StreamPosition position;
-        Prebuffer<T> prebuffer;
+        Prebuffer<T> prebuffer{1};
         PositionLink<T> link;
         // Read by playoutTime() and bufferedSamples() on the producer's
         // thread while the owner switches modes.

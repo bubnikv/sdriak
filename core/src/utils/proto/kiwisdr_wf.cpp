@@ -150,13 +150,13 @@ void KiwiWaterfallClient::setView(int zoom, double cfKhz) {
     if (!available()) { return; }
     char buf[96];
     std::snprintf(buf, sizeof buf, "SET zoom=%d cf=%.3f", zoom, cfKhz);
-    trySend(buf);
+    m_ws.queueString(buf, "view");
 }
 
 void KiwiWaterfallClient::setSpeed(int speed) {
     m_speed = std::clamp(speed, kMinSpeed, kMaxSpeed);
     if (!available()) { return; }
-    trySend("SET wf_speed=" + std::to_string(m_speed.load()));
+    m_ws.queueString("SET wf_speed=" + std::to_string(m_speed.load()), "speed");
 }
 
 bool KiwiWaterfallClient::trySend(const std::string& cmd) {

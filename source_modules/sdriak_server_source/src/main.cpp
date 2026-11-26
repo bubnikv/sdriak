@@ -86,10 +86,13 @@ public:
             remoteHandler.kind = remote::RemoteKind::SDRIAKServer;
             remoteHandler.sourceName = "SDRIAK Server";
             remoteHandler.supportsTls = false;
-            remoteHandler.probe = [](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
-                return remote::probeTcp(entry, cancel);
+            remoteHandler.probe = [this](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
+                return remote::probeTcp(entry, cancel, 0, config.read().value("viaProxy", false));
             };
             remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+            remoteHandler.connectBlockedReason = [this] {
+                return connector.connecting() ? "Wait for the current connection attempt" : "";
+            };
             sigpath::remoteRegistry.registerHandler(remoteHandler);
         }
     }

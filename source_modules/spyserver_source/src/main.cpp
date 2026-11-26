@@ -94,11 +94,6 @@ public:
         handler.stream = &stream;
         provider.module = this;
 
-        // The client writes rawStream; the link (bypass by default) feeds the
-        // source stream and gives both modes stream-position markers.
-        chain.init(&rawStream, &stream);
-        chain.setPrebufferMsec(0, false, false);
-
         strcpy(hostname, host.c_str());
 
         sigpath::sourceManager.registerSource("SpyServer", &handler);
@@ -109,9 +104,12 @@ public:
             remoteHandler.kind = remote::RemoteKind::SpyServer;
             remoteHandler.sourceName = "SpyServer";
             remoteHandler.probe = [this](const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
-                return probe(entry, cancel, viaProxy);
+                return probe(entry, cancel, config.read().value("viaProxy", false));
             };
             remoteHandler.connect = [this](const remote::RemoteEntry& entry) { connectRemote(entry); };
+            remoteHandler.connectBlockedReason = [this] {
+                return connector.connecting() ? "Wait for the current connection attempt" : "";
+            };
             sigpath::remoteRegistry.registerHandler(remoteHandler);
         }
     }
@@ -163,6 +161,7 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         const auto& info = client->devInfo;
+        result.negotiated.emplace_back("Test", "SpyServer protocol reachable (DEVICE_INFO received)");
         constexpr uint32_t DEVICE_TYPE_COUNT = sizeof(deviceTypesStr) / sizeof(deviceTypesStr[0]);
         result.negotiated.emplace_back("Device", info.DeviceType < DEVICE_TYPE_COUNT ? deviceTypesStr[info.DeviceType] : "unknown");
         result.negotiated.emplace_back("Max sample rate", std::to_string(info.MaximumSampleRate) + " S/s");
@@ -228,13 +227,7 @@ private:
         }
 
         const int stage = _this->iqStage();
-        _this->chain.setSampleRate(_this->sampleRate);
-        // A block left unread by the last session would shift this
-        // session's input indices (PrebufferedLink::discardUnreadInput).
-        _this->chain.discardUnreadInput();
-        _this->chain.start();
-        // The link has consumed everything this client published so far.
-        _this->linkIndexBase = _this->chain.samplesIn() - _this->client->samplesPublished();
+        _this->fellBack = false;
         {
             std::lock_guard lck(_this->iqTuneMtx);
             _this->intendedW = 0.0;
@@ -268,10 +261,9 @@ private:
         SpyServerSourceModule* _this = (SpyServerSourceModule*)ctx;
         if (!_this->running) { return; }
 
-        _this->client->stopStream();
-        _this->chain.stop();
-
         _this->running = false;
+        ++_this->streamGeneration;
+        _this->client->stopStream();
         flog::info("SpyServerSourceModule '{0}': Stop!", _this->name);
     }
 
@@ -447,7 +439,7 @@ private:
         const uint16_t targetPort = port;
         const bool throughProxy = viaProxy;
         connector.begin([this, host, targetPort, throughProxy]() {
-            auto newClient = spyserver::connect(host, targetPort, &rawStream, 3000, throughProxy);
+            auto newClient = spyserver::connect(host, targetPort, &stream, 3000, throughProxy, false);
             if (!newClient) {
                 throw std::runtime_error("Could not connect to SpyServer");
             }
@@ -697,7 +689,9 @@ private:
         const bool movesWindow = sentIqValid && std::fabs(hw - sentHwW) >= 0.5;
         client->setSetting(SPYSERVER_SETTING_IQ_FREQUENCY, (uint32_t)std::llround(target));
         if (movesWindow) {
-            client->ping([this, w](bool answered, uint64_t iqIndex) { commitAt(answered, iqIndex, w); });
+            client->ping([this, w, generation = streamGeneration.load()](bool answered, uint64_t iqIndex) {
+                if (streamGeneration.load() == generation) { commitAt(answered, iqIndex, w, generation); }
+            });
         }
         sentIqFreq = target;
         sentHwW = hw;
@@ -708,16 +702,20 @@ private:
     // Network thread: the PONG of a window move. The IQ switches at its
     // stream position (Phase 0: within about 20 samples), so commit there
     // with a short mute. Without a PONG (rule C) commit now, with 40 ms.
-    void commitAt(bool answered, uint64_t iqIndex, double w) {
+    void commitAt(bool answered, uint64_t iqIndex, double w, uint64_t generation) {
         if (!running) { return; }
         const double sr = sampleRate;
-        const uint64_t index = linkIndexBase + iqIndex;
+        const uint64_t index = iqIndex;
         const uint64_t half = (uint64_t)std::llround((answered ? 0.003 : 0.020) * sr);
         // A marker fires before the whole output block holding its sample.
         const int block = std::max(client ? client->lastMessageSamples() : 0, (int)std::lround(0.010 * sr));
         const int muteSamples = (int)(2 * half) + block;
-        chain.scheduleMarker(index > half ? index - half : 0, [muteSamples] { sigpath::vfoManager.muteAllFor(muteSamples); });
-        chain.scheduleMarker(index, [w] { sigpath::vfoManager.commitIQWindowOffset(w); });
+        client->scheduleMarker(index > half ? index - half : 0, [this, generation, muteSamples] {
+            if (streamGeneration.load() == generation) { sigpath::vfoManager.muteAllFor(muteSamples); }
+        });
+        client->scheduleMarker(index, [this, generation, w] {
+            if (streamGeneration.load() == generation) { sigpath::vfoManager.commitIQWindowOffset(w); }
+        });
     }
 
     // Digital gain ------------------------------------------------------------
@@ -804,6 +802,8 @@ private:
         if (providerRegistered && sigpath::iqFrontEnd.spectrumProvider() != &provider) {
             providerRegistered = false;
             frameSink = false;
+            fellBack = true;
+            intendedW = 0.0;
         }
         if (!(vfoMode() && running && client && client->isOpen())) {
             unregisterProvider();
@@ -811,7 +811,7 @@ private:
         }
         const auto now = Clock::now();
         if (!providerRegistered) {
-            if (sigpath::iqFrontEnd.spectrumProvider() != nullptr) { return; }
+            if (fellBack || sigpath::iqFrontEnd.spectrumProvider() != nullptr) { return; }
             fftSpans.clear();
             for (int i = 0; i <= (int)client->devInfo.DecimationStageCount; i++) { fftSpans.push_back(fftSpan(i)); }
             // start() sent the view: the device's centre at fftZoomId.
@@ -906,16 +906,10 @@ private:
         for (int i = 0; i < f.count; i++) { fftFrame.bins[(size_t)i] = f.bins[i] + cal; }
         // Bin n/2 is centred on the FFT centre: bin 0's lower edge is half a
         // bin below centre - span/2.
-        double start = g.centre - span / 2.0 - span / (2.0 * f.count) + uiTuningOffset.load();
-        if (uiInvertIQ.load()) {
-            std::reverse(fftFrame.bins.begin(), fftFrame.bins.end());
-            start = 2.0 * uiCentre.load() - (start + span);
-        }
-        fftFrame.startHz = start;
         fftFrame.spanHz = span;
-        // No sync key: show it after the IQ now buffered ahead of the DSP.
-        const double delay = sampleRate > 0.0 ? (double)chain.bufferedSamples() / sampleRate : 0.0;
-        fftFrame.presentAt = f.arrival + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(delay));
+        const double nativeStart = g.centre - span / 2.0 - span / (2.0 * f.count);
+        placeSpectrumFrame(fftFrame, nativeStart, uiTuningOffset.load(), uiCentre.load(), uiInvertIQ.load());
+        fftFrame.presentAt = f.arrival;
         sigpath::iqFrontEnd.pushSpectrum(std::move(fftFrame));
     }
 
@@ -935,7 +929,6 @@ private:
         }
         const int id = std::clamp<int>(vfoMode() ? vfoIqRateId : srId, 0, (int)sampleRates.size() - 1);
         sampleRate = sampleRates[id];
-        chain.setSampleRate(sampleRate);
         core::setInputSampleRate(sampleRate);
     }
 
@@ -961,7 +954,9 @@ private:
 
     std::string name;
     bool enabled = true;
-    bool running = false;
+    std::atomic<bool> running{false};
+    std::atomic<uint64_t> streamGeneration{0};
+    bool fellBack = false;
     double sampleRate = 1000000;
     double freq;
 
@@ -1016,8 +1011,6 @@ private:
     double sentIqFreq = 0.0;
     double sentHwW = 0.0;
     Clock::time_point lastIqSend{};
-    // The link's input index of the client's sample 0.
-    std::atomic<uint64_t> linkIndexBase{0};
 
     // Digital gain, UI thread.
     bool digitalGainAuto = true;     // VFO+FFT mode
@@ -1030,9 +1023,7 @@ private:
 
     std::string devRef = "";
 
-    dsp::stream<dsp::complex_t> rawStream;
-    dsp::stream<dsp::complex_t> stream;
-    dsp::buffer::PrebufferedLink<dsp::complex_t> chain;
+    dsp::stream<dsp::complex_t> stream{16384};
     SourceManager::SourceHandler handler;
 
     spyserver::SpyServerClient client;

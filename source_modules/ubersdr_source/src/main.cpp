@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -118,10 +119,10 @@ public:
             onIQ(info, samples, count);
         };
         client.onStatus = [this](const nlohmann::json& j) { onPrimaryStatus(j); };
-        client.onError = [this](const std::string& e) { setStatus("Error: " + e); };
         spectrum.onFrame = [this](const ubersdr::UberSpectrumClient::Frame& f) { onSpectrumFrame(f); };
         spectrum.onConfig = [this](const ubersdr::UberSpectrumClient::Config& c) {
             configBinBandwidth = c.binBandwidth;
+            configBins = c.binCount;
             configSpan = c.binCount * c.binBandwidth;
             if (defaultSpan.load() <= 0.0) { defaultSpan = c.totalBandwidth > 0.0 ? c.totalBandwidth : c.binCount * c.binBandwidth; }
         };
@@ -138,11 +139,12 @@ public:
         };
         client.onDisconnected = [this] {
             connected = false;
-            if (running.load()) {
-                running = false;
-                // As kiwisdr_source does: the play button follows the session.
-                gui::mainWindow.setPlayState(false);
-            }
+            sessionEnded = true;
+        };
+        client.onError = [this](const std::string& error) {
+            setStatus("Error: " + error);
+            sessionError = true;
+            sessionEnded = true;
         };
 
         handler.ctx = this;
@@ -172,6 +174,7 @@ public:
         if (core::args["server"].b()) { return; }
         sigpath::remoteRegistry.unregisterHandler(remote::RemoteKind::UberSDR);
         stop(this);
+        retiringSecondaries.clear();
         sigpath::vfoManager.onVfoDelete.unbindHandler(&vfoDeleteHandler);
         sigpath::sourceManager.unregisterSource("UberSDR");
     }
@@ -182,7 +185,7 @@ public:
     bool isEnabled() { return enabled; }
 
 private:
-    // The remote browser's Test: POST /connection, then the first iq48
+    // The remote browser's Test: POST /connection, then the first decoded IQ
     // packet on /ws, then close. Worker thread.
     static remote::ProbeResult probe(const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
         using Clock = std::chrono::steady_clock;
@@ -206,14 +209,30 @@ private:
         if (admission.maxSessionS > 0) { result.negotiated.emplace_back("Session limit", std::to_string(admission.maxSessionS / 60) + " min"); }
         result.negotiated.emplace_back("VFOs", std::to_string(admission.vfos));
 
+        std::string mode;
+        for (const auto& candidate : kIqModes) {
+            if (std::find(admission.iqModes.begin(), admission.iqModes.end(), candidate.key) != admission.iqModes.end()) {
+                mode = candidate.key;
+                break;
+            }
+        }
+        if (mode.empty()) {
+            result.reason = "no supported IQ mode advertised";
+            return result;
+        }
         std::atomic<int> rate{ 0 };
         std::atomic<bool> closed{ false };
+        std::string error;
         client.onIQ = [&rate](const ubersdr::UberSDRClient::PacketInfo& info, const dsp::complex_t*, int count) {
             if (count > 0 && rate.load() == 0) { rate = info.sampleRate > 0 ? info.sampleRate : 1; }
         };
         client.onDisconnected = [&closed] { closed = true; };
+        client.onError = [&](const std::string& reason) {
+            error = reason;
+            closed = true;
+        };
         const double freq = entry.ranges.empty() ? 14074000.0 : (double)(entry.ranges.front().first + entry.ranges.front().second) / 2.0;
-        client.start(base, "iq48", freq);
+        client.start(base, mode, freq);
         const auto wsStart = Clock::now();
         while (!cancel && rate.load() == 0 && !closed && Clock::now() - wsStart < std::chrono::seconds(5)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -224,6 +243,7 @@ private:
             result.ok = true;
             result.negotiated.emplace_back("IQ rate", std::to_string(rate.load()) + " S/s");
         }
+        else if (!error.empty()) { result.reason = error; }
         else { result.reason = closed ? "admitted, but the IQ stream closed" : "admitted, but no IQ within 5 s"; }
         return result;
     }
@@ -274,6 +294,23 @@ private:
     // stores what the server reported.
     static void uiTick(void* ctx) {
         UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
+        auto& retiring = _this->retiringSecondaries;
+        retiring.erase(std::remove_if(retiring.begin(), retiring.end(), [](auto& closing) {
+            return closing.second.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), retiring.end());
+        if (_this->admissionReady.exchange(false)) { _this->finishAdmission(); }
+        if (_this->sessionEnded.exchange(false) && _this->running.load()) {
+            if (!_this->sessionError.exchange(true)) { _this->setStatus("Disconnected by the server"); }
+            gui::mainWindow.setPlayState(false);
+            return;
+        }
+        if (_this->running && _this->iqOpenedAt != Clock::time_point{} && !_this->headerRate.load()
+            && Clock::now() - _this->iqOpenedAt > std::chrono::seconds(12)) {
+            _this->sessionError = true;
+            _this->setStatus("No decoded IQ received (requires PCM v4)");
+            gui::mainWindow.setPlayState(false);
+            return;
+        }
         const int rate = _this->headerRate.load();
         if (rate > 0 && rate != _this->appliedRate) {
             flog::info("UberSDRSourceModule '{0}': stream rate {1}", _this->name, rate);
@@ -324,9 +361,9 @@ private:
     struct Provider : public SpectrumProvider {
         UberSDRSourceModule* module = nullptr;
         std::string name() const override { return "UberSDR"; }
-        int binCount() const override { return 1024; }
+        int binCount() const override { return 0; } // Use each presented row's actual count.
         std::vector<double> zoomSpans() const override { return module->zoomLadder; }
-        void requestSpan(double spanHz) override { module->wantBinBandwidth = spanHz / 1024.0; }
+        void requestSpan(double spanHz) override { module->wantSpan = spanHz; }
         bool available() const override { return module->spectrumAlive(); }
         std::string unavailableReason() const override { return "no spectrum frames from the server"; }
         // Front-end dBFS.
@@ -349,11 +386,11 @@ private:
         return now - last < kFrameTimeout || now - registeredAt < kFrameTimeout + std::chrono::seconds(2);
     }
 
-    // Spans from the default view down to 1 024 bins of 0.5 Hz, in steps of
+    // Spans from the default view down to the negotiated bins at 0.5 Hz, in steps of
     // sqrt(2); the zoom is continuous on the server.
-    void buildLadder(double widest) {
+    void buildLadder(double widest, int bins) {
         zoomLadder.clear();
-        for (double s = widest; s >= 1024.0 * kMinBinBandwidth * 0.999; s /= std::sqrt(2.0)) { zoomLadder.push_back(s); }
+        for (double s = widest; s >= bins * kMinBinBandwidth * 0.999; s /= std::sqrt(2.0)) { zoomLadder.push_back(s); }
     }
 
     void serverWaterfallTick() {
@@ -374,15 +411,18 @@ private:
             fellBack = true;
             sendPrimaryTune(false);
         }
-        if (!(serverWaterfall && running.load() && connected.load())) {
+        if (!(serverWaterfall && running.load())) {
             unregisterProvider();
             return;
         }
         const auto now = Clock::now();
+        const int bins = configBins.load();
+        if (bins <= 0) { return; }
         if (!providerRegistered) {
-            if (fellBack || !spectrum.connected() || configSpan.load() <= 0.0 || sigpath::iqFrontEnd.spectrumProvider() != nullptr) { return; }
-            buildLadder(defaultSpan.load() > 0.0 ? defaultSpan.load() : configSpan.load());
-            wantBinBandwidth = configBinBandwidth.load();
+            if (fellBack || !connected || !spectrum.connected() || configSpan.load() <= 0.0
+                || sigpath::iqFrontEnd.spectrumProvider() != nullptr) { return; }
+            ladderBins = 0;
+            wantSpan = configSpan.load();
             sentBinBandwidth = configBinBandwidth.load();
             sentCentre = lastTune;
             appliedSpan = -1.0;
@@ -396,6 +436,10 @@ private:
             windowLive = true;
             sigpath::vfoManager.setIQWindow(0.0, placedWidth);
         }
+        if (bins != ladderBins) {
+            buildLadder(defaultSpan.load() > 0.0 ? defaultSpan.load() : configSpan.load(), bins);
+            ladderBins = bins;
+        }
 
         // The span the server confirmed.
         const double span = configSpan.load();
@@ -406,7 +450,7 @@ private:
 
         // View: zoom when the bin width changes, pan when only the centre
         // does; at most 5 per second, and quiet for a while after a 429.
-        const double bw = std::max(kMinBinBandwidth, wantBinBandwidth.load());
+        const double bw = std::max(kMinBinBandwidth, wantSpan / bins);
         const double centre = lastTune;
         const bool zoomChange = std::fabs(bw - sentBinBandwidth) > 1e-6 * bw;
         const bool panChange = std::fabs(centre - sentCentre) >= 1.0;
@@ -486,17 +530,14 @@ private:
     void onSpectrumFrame(const ubersdr::UberSpectrumClient::Frame& f) {
         lastFrameTicks = Clock::now().time_since_epoch().count();
         const double bw = configBinBandwidth.load();
-        if (!frameSink.load() || f.count <= 0 || bw <= 0.0) { return; }
+        if (f.count <= 0 || bw <= 0.0) { return; }
+        if (!frameSink.load()) { return; }
         specFrame.bins.assign(f.binsDb, f.binsDb + f.count);
         const double span = bw * f.count;
         // Bin k is centred at centre + (k - N/2) * bw.
-        double start = f.centreHz - ((double)(f.count / 2) + 0.5) * bw + uiTuningOffset.load();
-        if (uiInvertIQ.load()) {
-            std::reverse(specFrame.bins.begin(), specFrame.bins.end());
-            start = 2.0 * uiCentre.load() - (start + span);
-        }
-        specFrame.startHz = start;
         specFrame.spanHz = span;
+        const double nativeStart = f.centreHz - ((double)(f.count / 2) + 0.5) * bw;
+        placeSpectrumFrame(specFrame, nativeStart, uiTuningOffset.load(), uiCentre.load(), uiInvertIQ.load());
         specFrame.presentAt = playoutAt(f.timestampNanos);
         sigpath::iqFrontEnd.pushSpectrum(std::move(specFrame));
     }
@@ -644,8 +685,8 @@ private:
         int slot = 1;            // vfo=N
         std::string vfo;
         ubersdr::UberSDRClient client;
-        dsp::stream<dsp::complex_t> raw;
-        dsp::stream<dsp::complex_t> out;
+        dsp::stream<dsp::complex_t> raw{4096};
+        dsp::stream<dsp::complex_t> out{4096};
         dsp::buffer::PrebufferedLink<dsp::complex_t> link;
         std::atomic<bool> failed{false};
         std::atomic<bool> invert{false};
@@ -687,6 +728,7 @@ private:
             if (slotRefusals.count(n)) { continue; }
             bool used = false;
             for (const auto& s : secondaries) { used = used || s->slot == n; }
+            for (const auto& closing : retiringSecondaries) { used = used || closing.first == n; }
             if (!used) { return n; }
         }
         return 0;
@@ -703,7 +745,7 @@ private:
         p->invert = sigpath::iqFrontEnd.getInvertIQ();
         p->link.init(&p->raw, &p->out);
         p->link.setSampleRate(kSecondaryRate);
-        p->link.setPrebufferMsec(bufferMs.load(), false, false);
+        p->link.setPrebufferMsec(activeBufferMs, false, false);
         p->client.onIQ = [this, p](const ubersdr::UberSDRClient::PacketInfo& info, const dsp::complex_t* samples, int count) {
             onSecondaryIQ(*p, info, samples, count);
         };
@@ -732,18 +774,21 @@ private:
         secondaries.push_back(std::move(s));
     }
 
-    // UI thread: route the VFO back, then stop the stream.
-    void closeSecondary(Secondary& s) {
-        if (sigpath::vfoManager.vfoExists(s.vfo)) { sigpath::vfoManager.routeVFOInput(s.vfo, nullptr, 0.0); }
-        // Release a network thread blocked in raw.swap() before joining it.
-        s.raw.stopWriter();
-        s.client.stop();
-        s.link.stop();
-        s.raw.clearWriteStop();
+    // Stop publishing before changing the route. The detached connection
+    // owns its buffers until the network thread has exited.
+    void closeSecondary(std::unique_ptr<Secondary> s) {
+        s->raw.stopWriter();
+        s->link.stop();
+        if (sigpath::vfoManager.vfoExists(s->vfo)) { sigpath::vfoManager.routeVFOInput(s->vfo, nullptr, 0.0); }
+        const int slot = s->slot;
+        retiringSecondaries.emplace_back(slot, std::async(std::launch::async, [s = std::move(s)]() mutable {
+            s->client.stop();
+            s.reset();
+        }));
     }
 
     void closeAllSecondaries() {
-        for (auto& s : secondaries) { closeSecondary(*s); }
+        for (auto& s : secondaries) { closeSecondary(std::move(s)); }
         secondaries.clear();
     }
 
@@ -753,7 +798,7 @@ private:
         auto& list = _this->secondaries;
         for (auto it = list.begin(); it != list.end(); ++it) {
             if ((*it)->vfo == vfoName) {
-                _this->closeSecondary(**it);
+                _this->closeSecondary(std::move(*it));
                 list.erase(it);
                 return;
             }
@@ -777,7 +822,7 @@ private:
             }
             flog::warn("UberSDRSourceModule '{0}': secondary {1} for '{2}': {3}", name, s.slot, s.vfo, reason);
             slotRefusals[s.slot] = reason;
-            closeSecondary(s);
+            closeSecondary(std::move(*it));
             it = secondaries.erase(it);
         }
 
@@ -833,7 +878,7 @@ private:
         for (const auto& vfoName : release) {
             for (auto it = secondaries.begin(); it != secondaries.end(); ++it) {
                 if ((*it)->vfo == vfoName) {
-                    closeSecondary(**it);
+                    closeSecondary(std::move(*it));
                     secondaries.erase(it);
                     break;
                 }
@@ -899,6 +944,11 @@ private:
         UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
         if (_this->running.exchange(true)) { return; }
         if (_this->worker.joinable()) { _this->worker.join(); }
+        _this->sessionEnded = false;
+        _this->sessionError = false;
+        _this->admissionReady = false;
+        _this->iqOpenedAt = {};
+        _this->activeBufferMs = _this->bufferMs.load();
         // UI thread. A stop() on a network thread leaves the provider and
         // the secondaries to the UI tick; one may not have run since.
         _this->unregisterProvider();
@@ -908,14 +958,18 @@ private:
         _this->linkSlow = false;
         _this->configSpan = 0.0;
         _this->configBinBandwidth = 0.0;
+        _this->configBins = 0;
         _this->defaultSpan = 0.0;
         {
             std::lock_guard lck(_this->bufferModeMtx);
             _this->rawStream.clearWriteStop();
-            _this->applyBufferModeLocked(true);
+            _this->chain.setSampleRate(_this->appliedRate);
+            _this->chain.setPrebufferMsec(_this->activeBufferMs, true, false);
             // A block left unread by the last session would shift this
             // session's input indices (PrebufferedLink::discardUnreadInput).
             _this->chain.discardUnreadInput();
+            _this->linkIndexBase = _this->chain.samplesIn();
+            _this->samplesPushed = 0;
             _this->chain.start();
         }
         {
@@ -923,9 +977,6 @@ private:
             _this->timeCount = 0;
             _this->timeHead = 0;
         }
-        // The link has consumed everything pushed so far.
-        _this->linkIndexBase = _this->chain.samplesIn();
-        _this->samplesPushed = 0;
         {
             std::lock_guard lck(_this->pendingMtx);
             _this->pendingTunes.clear();
@@ -938,60 +989,62 @@ private:
         _this->baseUrl = normaliseBaseUrl(_this->urlBuf);
         _this->rememberServer(_this->urlBuf);
         const std::string password = _this->passwordBuf;
-        const std::string mode = kIqModes[_this->iqModeId].key;
-        const double freq = _this->lastTune;
         _this->setStatus("Connecting...");
         // Admission is an HTTPS request: off the UI thread.
-        _this->worker = std::thread([_this, password, mode, freq] {
+        _this->worker = std::thread([_this, password] {
             auto a = _this->client.admit(_this->baseUrl, password, [_this] { return !_this->running.load(); });
             {
                 std::lock_guard lck(_this->admissionMtx);
                 _this->admission = a;
                 _this->admittedAt = std::chrono::steady_clock::now();
             }
-            if (!_this->running.load()) { return; }
-            if (!a.allowed) {
-                _this->setStatus("Refused: " + a.reason);
-                _this->running = false;
-                gui::mainWindow.setPlayState(false);
-                return;
-            }
-            // The chosen width when allowed, else the widest allowed below it.
-            std::string useMode = mode;
-            if (!a.iqModes.empty() && std::find(a.iqModes.begin(), a.iqModes.end(), mode) == a.iqModes.end()) {
-                useMode = a.iqModes.front();
-                for (int i = modeIndex(mode); i >= 0; i--) {
-                    if (std::find(a.iqModes.begin(), a.iqModes.end(), kIqModes[i].key) != a.iqModes.end()) {
-                        useMode = kIqModes[i].key;
-                        break;
-                    }
-                }
-            }
-            _this->setActiveMode(useMode);
-            _this->setStatus("Admitted, opening IQ (" + useMode + ")");
-            _this->client.start(_this->baseUrl, useMode, freq, password);
-            if (_this->serverWaterfall) {
-                // The server's default (shared, 30 MHz) view first.
-                _this->spectrum.start(_this->baseUrl, _this->client.sessionId(), 0.0, 0.0, password);
-            }
+            _this->admissionReady = true;
         });
         flog::info("UberSDRSourceModule '{0}': Start!", _this->name);
+    }
+
+    void finishAdmission() {
+        worker.join();
+        if (!running) { return; }
+        const auto& a = admission;
+        if (!a.allowed) {
+            setStatus("Refused: " + a.reason);
+            sessionError = true;
+            sessionEnded = true;
+            return;
+        }
+        std::string mode = kIqModes[iqModeId].key;
+        if (!a.iqModes.empty() && std::find(a.iqModes.begin(), a.iqModes.end(), mode) == a.iqModes.end()) {
+            mode.clear();
+            for (int i = kIqModeCount - 1; i >= 0; --i) {
+                if (std::find(a.iqModes.begin(), a.iqModes.end(), kIqModes[i].key) == a.iqModes.end()) { continue; }
+                mode = kIqModes[i].key;
+                if (i <= iqModeId) { break; }
+            }
+        }
+        if (mode.empty()) {
+            setStatus("Refused: no supported IQ mode advertised");
+            sessionError = true;
+            sessionEnded = true;
+            return;
+        }
+        setActiveMode(mode);
+        setStatus("Admitted, opening IQ (" + mode + ")");
+        iqOpenedAt = Clock::now();
+        client.start(baseUrl, mode, lastTune, passwordBuf);
+        if (serverWaterfall) { spectrum.start(baseUrl, client.sessionId(), 0.0, 0.0, passwordBuf); }
     }
 
     static void stop(void* ctx) {
         UberSDRSourceModule* _this = (UberSDRSourceModule*)ctx;
         const bool wasRunning = _this->running.exchange(false);
         if (!wasRunning && !_this->client.running() && !_this->worker.joinable()) { return; }
-        // May run on the primary's network thread (a server close) or on the
-        // admission worker (a refusal), both through setPlayState(false), so
-        // no GUI work here: the secondaries, routed VFOs and the provider are
-        // UI-thread state, released by unregisterProvider() from the UI tick
-        // (running is false now), from menuDeselected() or from start().
+        _this->unregisterProvider();
         // Release a writer blocked in rawStream.swap() before joining the
         // network thread that is that writer.
         _this->rawStream.stopWriter();
-        // On the worker itself, start() joins it.
-        if (_this->worker.joinable() && _this->worker.get_id() != std::this_thread::get_id()) { _this->worker.join(); }
+        if (_this->worker.joinable()) { _this->worker.join(); }
+        _this->admissionReady = false;
         _this->spectrum.stop();
         _this->client.stop();
         {
@@ -1000,7 +1053,7 @@ private:
             _this->rawStream.clearWriteStop();
         }
         _this->connected = false;
-        _this->setStatus("Stopped");
+        if (!_this->sessionError.load()) { _this->setStatus("Stopped"); }
         flog::info("UberSDRSourceModule '{0}': Stop!", _this->name);
     }
 
@@ -1057,9 +1110,9 @@ private:
     void applyBufferModeLocked(bool resetBuffer) {
         chain.setSampleRate(appliedRate);
         const bool live = running.load();
-        const bool replumb = live && (bufferMs.load() > 0) != chain.prebuffering();
+        const bool replumb = live && (activeBufferMs > 0) != chain.prebuffering();
         if (replumb) { rawStream.stopWriter(); }
-        chain.setPrebufferMsec(bufferMs.load(), resetBuffer, live);
+        chain.setPrebufferMsec(activeBufferMs, resetBuffer, live);
         if (replumb) { rawStream.clearWriteStop(); }
     }
 
@@ -1068,9 +1121,11 @@ private:
         recent.erase(std::remove(recent.begin(), recent.end(), url), recent.end());
         recent.insert(recent.begin(), url);
         if (recent.size() > RECENT_MAX) { recent.resize(RECENT_MAX); }
-        auto configAccess = config.edit();
-        configAccess.set("url", url);
-        configAccess.set("recent", recent);
+        {
+            auto configAccess = config.edit();
+            configAccess.set("url", url);
+            configAccess.set("recent", recent);
+        }
         if (auto target = remote::parseTarget(normaliseBaseUrl(url), "https")) {
             target->path.clear();
             auto entry = remote::manualEntry(remote::RemoteKind::UberSDR, *target);
@@ -1085,6 +1140,27 @@ private:
         iqModeId = id;
         config.edit().set("iqMode", std::string(kIqModes[id].key));
         if (!running.load() || !connected.load()) { return; }
+        rawStream.stopWriter();
+        client.stop();
+        connected = false;
+        sessionEnded = false;
+        sessionError = false;
+        headerRate = 0;
+        chain.stop();
+        chain.discardUnreadInput();
+        appliedRate = kIqModes[id].rate;
+        core::setInputSampleRate(appliedRate);
+        chain.setSampleRate(appliedRate);
+        placedWidth = -1.0;
+        linkIndexBase = chain.samplesIn();
+        samplesPushed = 0;
+        {
+            std::lock_guard lck(timeMtx);
+            timeCount = 0;
+            timeHead = 0;
+        }
+        rawStream.clearWriteStop();
+        chain.start();
         setActiveMode(kIqModes[id].key);
         linkSlow = false;
         slowWindows = 0;
@@ -1102,6 +1178,7 @@ private:
             sentTuneValid = true;
             freq = sentTuneFreq;
         }
+        iqOpenedAt = Clock::now();
         client.start(baseUrl, kIqModes[id].key, freq, passwordBuf);
     }
 
@@ -1170,9 +1247,9 @@ private:
         ImGui::FillWidth();
         if (ImGui::SliderInt(("##_ubersdr_buffer_" + _this->name).c_str(), &ms, BUFFER_MS_MIN, BUFFER_MS_MAX)) {
             _this->bufferMs = ms;
-            _this->applyBufferMode(true);
             config.edit().set("bufferMs", ms);
         }
+        if (playing && ms != _this->activeBufferMs) { ImGui::TextUnformatted("Buffer change applies on the next Play."); }
 
         ImGui::TextWrapped("Status: %s", _this->getStatus().c_str());
         if (playing && _this->connected.load()) {
@@ -1221,6 +1298,11 @@ private:
 
     std::atomic<bool> running{false};
     std::atomic<bool> connected{false};
+    std::atomic<bool> admissionReady{false};
+    std::atomic<bool> sessionEnded{false};
+    std::atomic<bool> sessionError{false};
+    Clock::time_point iqOpenedAt{};
+    int activeBufferMs = 150;
     std::atomic<int> bufferMs{150};
     std::atomic<int> headerRate{0};
     std::atomic<float> basebandPower{-999.0f};
@@ -1241,8 +1323,8 @@ private:
     uint64_t guardSamples = 0;
     int slowWindows = 0;
 
-    dsp::stream<dsp::complex_t> rawStream;
-    dsp::stream<dsp::complex_t> stream;
+    dsp::stream<dsp::complex_t> rawStream{8192};
+    dsp::stream<dsp::complex_t> stream{8192};
     dsp::buffer::PrebufferedLink<dsp::complex_t> chain;
     std::mutex bufferModeMtx;
     SourceManager::SourceHandler handler;
@@ -1259,7 +1341,9 @@ private:
     Clock::time_point lastViewSend{};
     Clock::time_point registeredAt{};
     // Written by one thread, read by another.
-    std::atomic<double> wantBinBandwidth{0.0};
+    double wantSpan = 0.0;
+    int ladderBins = 0;
+    std::atomic<int> configBins{0};
     std::atomic<double> configBinBandwidth{0.0};
     std::atomic<double> configSpan{0.0};
     std::atomic<double> defaultSpan{0.0};
@@ -1297,6 +1381,7 @@ private:
 
     // Secondary VFOs, UI thread.
     std::vector<std::unique_ptr<Secondary>> secondaries;
+    std::vector<std::pair<int, std::future<void>>> retiringSecondaries;
     std::map<int, std::string> slotRefusals;  // vfo=N -> the server's reason
     EventHandler<VFOManager::VFO*> vfoDeleteHandler;
 };

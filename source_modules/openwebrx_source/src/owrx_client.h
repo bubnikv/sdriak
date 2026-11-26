@@ -86,6 +86,7 @@ namespace owrx {
         std::vector<Profile> profiles() const;
         std::vector<std::string> modes() const;
         bool hasIqMode() const;
+        bool hasModeList() const { return m_hasModeList.load(); }
         Details details() const;
         int clients() const { return m_clients.load(); }
 
@@ -106,12 +107,13 @@ namespace owrx {
 
     private:
         bool trySend(const std::string& msg);
-        void sendDsp(const nlohmann::json& params);
+        void sendDsp(const nlohmann::json& params, const char* key = "");
 
         net::websock::WSClient m_ws;
         std::mutex m_lifeMtx;   // start() / stop()
         std::thread m_thread;
         std::atomic<bool> m_running{false};
+        std::atomic<bool> m_hasModeList{false};
         std::atomic<bool> m_connected{false};
         std::atomic<bool> m_handshaken{false};
 

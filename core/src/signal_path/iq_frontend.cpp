@@ -179,17 +179,27 @@ void IQFrontEnd::setInvertIQ(bool enabled) {
 void IQFrontEnd::setSpectrumProvider(SpectrumProvider* provider) {
     if (provider == _spectrumProvider) { return; }
     const bool wasLocal = (_spectrumProvider == nullptr);
-    _spectrumProvider = provider;
-    _spectrumQueue.clear();
     if (provider && wasLocal) {
         split.unbindStream(&fftIn);
+        fftSink.stop();
+        fftIn.flush();
     }
     else if (!provider) {
-        split.bindStream(&fftIn);
-        const int size = _pendingFFTSize;
+        auto* previous = _spectrumProvider;
+        _spectrumProvider = nullptr;
+        try {
+            updateFFTPath(true, _pendingFFTSize);
+            split.bindStream(&fftIn);
+        }
+        catch (...) {
+            _spectrumProvider = previous;
+            throw;
+        }
         _pendingFFTSize = -1;
-        updateFFTPath(true, size);
+        if (_running) { fftSink.start(); }
     }
+    _spectrumProvider = provider;
+    _spectrumQueue.clear();
 }
 
 void IQFrontEnd::setNarrowIQ(bool narrow, double offset, double width) {
@@ -358,6 +368,7 @@ void IQFrontEnd::flushInputBuffer() {
 }
 
 void IQFrontEnd::start() {
+    _running = true;
     // Start input buffer
     inBuf.start();
 
@@ -373,10 +384,11 @@ void IQFrontEnd::start() {
     }
 
     // Start FFT chain
-    fftSink.start();
+    if (!_spectrumProvider) { fftSink.start(); }
 }
 
 void IQFrontEnd::stop() {
+    _running = false;
     // Stop input buffer
     inBuf.stop();
 
@@ -450,10 +462,8 @@ void IQFrontEnd::runFFT() {
     // normalized to unity coherent gain, so no 1/N normalization here.
     if (fftBuf) {
         volk_32fc_s32f_power_spectrum_32f(fftBuf, (lv_32fc_t*)fftOutBuf.get(), 1.0f, _fftSize);
+        _releaseFFTBuffer(_fftCtx);
     }
-
-    // Release buffer
-    _releaseFFTBuffer(_fftCtx);
 }
 
 void IQFrontEnd::genFFTWindow(float* buf, int size) {

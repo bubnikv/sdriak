@@ -151,16 +151,15 @@ KiwiSDRClient::~KiwiSDRClient() {
     stop();
 }
 
-void KiwiSDRClient::init(const std::string& hostport) {
+void KiwiSDRClient::init(const std::string& hostport, bool tls) {
     this->hostPort = hostport;
+    useTls = tls;
     setConnectionStatus("Not connected");
 
     wsClient.onDisconnected = [&]() {
         // The krec attempt ends silently; the session goes on on /kiwi/.
         if (retryOnWebUiPath) { return; }
         connected = false;
-        this->onDisconnected();
-        setConnectionStatus("Disconnected");
     };
 
     // kiwiclient's order: authenticate and identify now; answer audio_rate
@@ -242,10 +241,15 @@ void KiwiSDRClient::handlePacket(const SndPacket& packet) {
     if (haveSeq) {
         // Forward gaps only (mod 2^32); a repeated or older seq is no loss.
         const uint32_t step = packet.seq - lastSeq;
-        if (step > 1 && step < 0x80000000u) { seqGapCount += step - 1; }
+        if (step > 0 && step < 0x80000000u) {
+            seqGapCount += step - 1;
+            lastSeq = packet.seq;
+        }
     }
-    haveSeq = true;
-    lastSeq = packet.seq;
+    else {
+        haveSeq = true;
+        lastSeq = packet.seq;
+    }
     rssi.store(packet.rssiDbm);
     if (packet.adcOverload) {
         lastOverloadTicks.store(Clock::now().time_since_epoch().count());
@@ -353,7 +357,7 @@ void KiwiSDRClient::sendTuneCommand(double freq, Modulation mod) {
     }
     newFreqSinceTune = false;
     tuneSentTicks.store(Clock::now().time_since_epoch().count());
-    trySend(buf);
+    wsClient.queueString(buf, "tune");
 }
 
 void KiwiSDRClient::sendAgcLine() {
@@ -369,7 +373,7 @@ void KiwiSDRClient::sendAgcLine() {
              snap.slopeDb,
              snap.decayMs,
              snap.manualGainDb);
-    trySend(buf);
+    wsClient.queueString(buf, "agc");
 }
 
 void KiwiSDRClient::parseMsgFrame(const std::string& msg) {
@@ -461,12 +465,10 @@ int64_t KiwiSDRClient::parseKhzToHz(const std::string& value) {
 // when the redirect lands somewhere other than /VER, /VER is asked again on
 // that origin. origin stays http://host:port when the probe fails, and the
 // websocket then follows the redirect itself.
-uint64_t KiwiSDRClient::fetchServerTimestamp(const std::string& host, int port, std::string& origin) {
+uint64_t KiwiSDRClient::fetchServerTimestamp(std::string& origin) {
     using namespace std::chrono;
     const uint64_t fallback = static_cast<uint64_t>(
         duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
-    const bool bracket = host.find(':') != std::string::npos && host.front() != '[';
-    origin = "http://" + (bracket ? "[" + host + "]" : host) + ":" + std::to_string(port);
     try {
         net::http::CurlRequestOptions options;
         options.connectTimeoutMs = 5000;
@@ -486,6 +488,8 @@ uint64_t KiwiSDRClient::fetchServerTimestamp(const std::string& host, int port, 
             flog::info("KiwiSDRClient: /VER moved to {}, asking {}/VER", response.effectiveUrl, origin);
             response = net::http::curlGet(origin + "/VER", options);
         }
+        const std::string resolved = net::http::urlOrigin(response.effectiveUrl);
+        if (!resolved.empty()) { origin = resolved; }
         const int status = static_cast<int>(response.status);
         if (status != 200) {
             throw std::runtime_error("KiwiSDRClient: /VER HTTP status " + std::to_string(status));
@@ -536,10 +540,7 @@ void KiwiSDRClient::resetSessionState() {
 }
 
 void KiwiSDRClient::stop() {
-    if (running.load() || looperThread.joinable()) {
-        setConnectionStatus("Disconnecting..");
-    }
-    running = false;
+    const bool wasRunning = running.exchange(false);
     wsClient.stopSocket();
     if (waterfall) { waterfall->stop(); }
     if (looperThread.joinable()) {
@@ -548,7 +549,7 @@ void KiwiSDRClient::stop() {
         }
     }
     connected = false;
-    setConnectionStatus("Disconnected.");
+    if (wasRunning && refusalReason().empty()) { setConnectionStatus("Disconnected"); }
 }
 
 void KiwiSDRClient::start() {
@@ -568,8 +569,11 @@ void KiwiSDRClient::start() {
             if (!parsed) {
                 throw std::runtime_error("KiwiSDRClient: malformed host:port: " + hostPort);
             }
-            std::string origin;
-            const uint64_t ts = fetchServerTimestamp(parsed->host, parsed->port, origin);
+            const bool bracket = parsed->host.find(':') != std::string::npos && parsed->host.front() != '[';
+            const std::string host = bracket ? "[" + parsed->host + "]" : parsed->host;
+            std::string origin = (useTls ? "https://" : "http://") + host + ":" + std::to_string(parsed->port);
+            const uint64_t ts = fetchServerTimestamp(origin);
+            if (!running.load()) { return; }
             const std::string tsPath = std::to_string(ts);
             // Set when the krec W/F got no answer at all: the Kiwi ignores
             // the krec path, so SND goes to the web UI's at once.
@@ -612,16 +616,16 @@ void KiwiSDRClient::start() {
                 if (running.load()) {
                     wsClient.connectAndReceiveLoop(origin + "/kiwi/" + tsPath + "/SND");
                 }
-                else {
-                    wsClient.stopSocket();
-                    this->onDisconnected();
-                }
+                else { wsClient.stopSocket(); }
             }
             if (waterfall) { waterfall->stop(); }
             flog::info("x.connectAndReceiveLoop exited.");
-            setConnectionStatus("Disconnected");
             connected = false;
-            running = false;
+            if (running.exchange(false)) {
+                const std::string refused = refusalReason();
+                setConnectionStatus(refused.empty() ? "Disconnected by the server" : refused.c_str());
+                onDisconnected();
+            }
         }
         catch (const std::exception& e) {
             flog::error("KiwiSDRClient: Exception: {}", e.what());
@@ -630,8 +634,7 @@ void KiwiSDRClient::start() {
             snprintf(status, sizeof status, "Error: %s", e.what());
             setConnectionStatus(status);
             connected = false;
-            running = false;
-            onError(e.what());
+            if (running.exchange(false)) { onError(e.what()); }
         }
         catch (...) {
             // Anything escaping this thread calls std::terminate and kills
@@ -640,8 +643,7 @@ void KiwiSDRClient::start() {
             if (waterfall) { waterfall->stop(); }
             setConnectionStatus("Error: unknown exception");
             connected = false;
-            running = false;
-            onError("unknown exception");
+            if (running.exchange(false)) { onError("unknown exception"); }
         }
     });
 }

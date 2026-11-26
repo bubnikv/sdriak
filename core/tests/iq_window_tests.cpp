@@ -125,6 +125,31 @@ void runLink(int prebufferMsec) {
 void testBypassMarkers() { runLink(0); }
 void testPrebufferMarkers() { runLink(30); }
 
+void testResetSessionMarkers() {
+    dsp::stream<float> in(8), out(8);
+    dsp::buffer::PrebufferedLink<float> link;
+    link.init(&in, &out);
+    std::atomic<bool> oldMarker{false};
+    link.scheduleMarker(0, [&] { oldMarker = true; });
+    in.writeBuf[0] = -1.0f;
+    expect(in.swap(1), "could not queue the previous session's block");
+
+    link.discardUnreadInput();
+    const auto base = link.samplesIn();
+    std::atomic<bool> newMarker{false};
+    link.scheduleMarker(base, [&] { newMarker = true; });
+    link.start();
+    in.writeBuf[0] = 42.0f;
+    const bool sent = in.swap(1);
+    const int count = out.read_for(std::chrono::seconds(1));
+    const float first = count > 0 ? out.readBuf[0] : 0.0f;
+    if (count > 0) { out.flush(); }
+    link.stop();
+
+    expect(sent && count == 1 && first == 42.0f, "previous session's input survived reset");
+    expect(newMarker && !oldMarker, "marks did not start at the new session's sample base");
+}
+
 void testMute() {
     constexpr int kBlock = 1024;
     dsp::channel::RxVFOKernel vfo(48000.0, 48000.0, 48000.0, 0.0, kBlock);
@@ -165,6 +190,7 @@ int main() {
         testStreamPositionOrder();
         testBypassMarkers();
         testPrebufferMarkers();
+        testResetSessionMarkers();
         testMute();
     });
 }

@@ -109,14 +109,15 @@ public:
         };
         client.onIQ = [this](const dsp::complex_t* samples, int count) { onIQ(samples, count); };
         client.onFftRow = [this](const float* bins, int count) { onFftRow(bins, count); };
-        client.onError = [this](const std::string& e) { setError("Error: " + e); };
+        client.onError = [this](const std::string& e) {
+            setError("Error: " + e);
+            sessionEnded = true;
+        };
         client.onDisconnected = [this] {
             connected = false;
             if (running.load()) {
                 setError("Disconnected by the server");
-                running = false;
-                // As kiwisdr_source does: the play button follows the session.
-                gui::mainWindow.setPlayState(false);
+                sessionEnded = true;
             }
         };
         provider.module = this;
@@ -153,8 +154,7 @@ public:
     bool isEnabled() { return enabled; }
 
 private:
-    // The remote browser's Test: the websocket handshake until the first
-    // complete config, then close. Worker thread.
+    // The remote browser's Test: request IQ and wait for decoded samples.
     static remote::ProbeResult probe(const remote::RemoteEntry& entry, const std::atomic<bool>& cancel) {
         using Clock = std::chrono::steady_clock;
         remote::ProbeResult result;
@@ -162,6 +162,8 @@ private:
         std::atomic<bool> handshake{ false };
         std::atomic<bool> configured{ false };
         std::atomic<bool> closed{ false };
+        std::atomic<bool> gotIq{ false };
+        std::atomic<bool> requested{ false };
         std::atomic<int> handshakeMs{ -1 };
         std::mutex errMtx;
         std::string error;
@@ -178,12 +180,25 @@ private:
             if (error.empty()) { error = e; }
         };
         client.onDisconnected = [&] { closed = true; };
+        client.onIQ = [&](const dsp::complex_t*, int count) {
+            if (requested && count > 0) { gotIq = true; }
+        };
         client.start(entry.target.url());
-        while (!cancel && !configured && !closed && Clock::now() - t0 < std::chrono::seconds(6)) {
+        auto configSeenAt = Clock::time_point{};
+        while (!cancel && !closed && !gotIq && Clock::now() - t0 < std::chrono::seconds(6)) {
+            if (configured) {
+                const auto now = Clock::now();
+                if (configSeenAt == Clock::time_point{}) { configSeenAt = now; }
+                if (client.hasModeList() && !client.hasIqMode()) { break; }
+                if (!requested && (client.hasIqMode() || now - configSeenAt >= std::chrono::seconds(1))) {
+                    requested = true;
+                    client.startIq(0);
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         const std::string version = client.serverVersion();
-        const bool iq = client.hasIqMode();
+        const bool excluded = client.hasModeList() && !client.hasIqMode();
         const auto cfg = client.config();
         const size_t profiles = client.profiles().size();
         const int clients = client.clients();
@@ -198,11 +213,13 @@ private:
         if (profiles) { result.negotiated.emplace_back("Profiles", std::to_string(profiles)); }
         if (clients > 0) { result.negotiated.emplace_back("Clients", std::to_string(clients)); }
         if (cancel) { result.reason = "cancelled"; }
-        else if (configured && iq) { result.ok = true; }
-        else if (configured) { result.reason = "no iq mode: needs OpenWebRX+ 1.2.129 or later"; }
+        else if (excluded) { result.reason = "the receiver's mode list does not include IQ"; }
+        else if (gotIq) { result.ok = true; result.negotiated.emplace_back("IQ rate", std::to_string(kRate) + " S/s"); }
         else {
             std::lock_guard lck(errMtx);
-            result.reason = !error.empty() ? error : (handshake ? "handshake, but no config within 6 s" : "could not connect");
+            if (!error.empty()) { result.reason = error; }
+            else if (requested) { result.reason = "no decoded IQ received after requesting IQ"; }
+            else { result.reason = handshake ? "handshake, but no config within 6 s" : "could not connect"; }
         }
         return result;
     }
@@ -217,7 +234,7 @@ private:
 
     void setStatus(const std::string& s) {
         std::lock_guard lck(statusMtx);
-        status = s;
+        if (!statusSticky) { status = s; }
     }
     // A status that stop() keeps.
     void setError(const std::string& s) {
@@ -297,6 +314,8 @@ private:
             sigpath::vfoManager.muteAllFor(kRate / 4);
         }
         lastOffsetSend = Clock::now();
+        if (first) { iqRequestedAt = Clock::now(); }
+        iqRequested = true;
         client.startIq(sentOffsetHw);
         iqStarted = true;
     }
@@ -349,34 +368,40 @@ private:
 
     void tick() {
         uiInvertIQ = sigpath::iqFrontEnd.getInvertIQ();
+        if (sessionEnded.exchange(false) && running.load()) {
+            gui::mainWindow.setPlayState(false);
+            return;
+        }
+        if (running && !configComplete.load() && Clock::now() - openedAt > std::chrono::seconds(15)) {
+            setError("Timed out waiting for the receiver's configuration");
+            gui::mainWindow.setPlayState(false);
+            return;
+        }
         if (!running.load() || !connected.load()) {
             unregisterProvider();
             return;
         }
+        if (client.hasModeList() && !client.hasIqMode()) {
+            setError("Refused: this receiver does not offer the IQ mode");
+            gui::mainWindow.setPlayState(false);
+            return;
+        }
         if (!iqStarted) {
             if (!configComplete.load()) { return; }
-            const std::string version = client.serverVersion();
-            std::string why;
-            if (!Client::versionSupportsIq(version)) {
-                why = "needs OpenWebRX+ 1.2.129 or later (this receiver runs " + (version.empty() ? std::string("an unknown version") : version) + ")";
-            }
-            else if (client.modes().empty()) {
-                // Modes follow the config; give them time. No list at all: a
-                // supported version gets the benefit of the doubt.
-                if (Clock::now() - fromTicks(configAt.load()) < kModesWait) { return; }
-            }
-            else if (!client.hasIqMode()) {
-                why = "this receiver does not offer the IQ mode";
-            }
-            if (!why.empty()) {
-                setError("Refused: " + why);
-                running = false;
-                gui::mainWindow.setPlayState(false);
-                return;
-            }
+            if (!client.hasModeList() && Clock::now() - fromTicks(configAt.load()) < kModesWait) { return; }
             applyProfile(true);
-            const auto c = client.config();
-            setStatus(c.audioCompression == "adpcm" ? "Streaming IQ (4-bit ADPCM)" : "Streaming IQ");
+            setStatus("Waiting for decoded IQ");
+        }
+        if (!gotIq.load()) {
+            if (Clock::now() - iqRequestedAt > std::chrono::seconds(6)) {
+                setError("No decoded IQ received after requesting IQ");
+                gui::mainWindow.setPlayState(false);
+            }
+            return;
+        }
+        if (!iqConfirmed) {
+            iqConfirmed = true;
+            setStatus(profile.audioCompression == "adpcm" ? "Streaming IQ (4-bit ADPCM)" : "Streaming IQ");
         }
         if (profileChanged.exchange(false)) {
             applyProfile(false);
@@ -605,6 +630,10 @@ private:
     static void start(void* ctx) {
         OpenWebRxSourceModule* _this = (OpenWebRxSourceModule*)ctx;
         if (_this->running.exchange(true)) { return; }
+        _this->sessionEnded = false;
+        _this->iqRequested = false;
+        _this->gotIq = false;
+        _this->iqConfirmed = false;
         core::setInputSampleRate(kRate);
         {
             std::lock_guard lck(_this->statusMtx);
@@ -626,21 +655,21 @@ private:
         {
             std::lock_guard lck(_this->bufferModeMtx);
             _this->rawStream.clearWriteStop();
-            _this->applyBufferModeLocked(true);
+            _this->chain.setPrebufferMsec(_this->bufferMs.load(), true, false);
             // A block left unread by the last session would shift this
             // session's input indices (PrebufferedLink::discardUnreadInput).
             _this->chain.discardUnreadInput();
+            _this->linkIndexBase = _this->chain.samplesIn();
+            _this->samplesPushed = 0;
             _this->chain.start();
         }
-        // The link has consumed everything pushed so far.
-        _this->linkIndexBase = _this->chain.samplesIn();
-        _this->samplesPushed = 0;
         {
             std::lock_guard lck(_this->movesMtx);
             _this->moves.clear();
         }
         _this->rememberServer(_this->urlBuf);
         _this->setStatus("Connecting...");
+        _this->openedAt = Clock::now();
         _this->client.start(_this->urlBuf);
         flog::info("OpenWebRxSourceModule '{0}': Start!", _this->name);
     }
@@ -649,15 +678,13 @@ private:
         OpenWebRxSourceModule* _this = (OpenWebRxSourceModule*)ctx;
         const bool wasRunning = _this->running.exchange(false);
         if (!wasRunning && !_this->client.running()) { return; }
-        // May run on the network thread (a server close stops playback), so
-        // no GUI work here: the UI tick and core drop the provider once it
-        // reports unavailable.
         _this->frameSink = false;
         _this->windowLive = false;
         // Release a writer blocked in rawStream.swap() before joining the
         // network thread that is that writer.
         _this->rawStream.stopWriter();
         _this->client.stop();
+        _this->unregisterProvider();
         {
             std::lock_guard lck(_this->bufferModeMtx);
             _this->chain.stop();
@@ -680,6 +707,8 @@ private:
 
     // Network thread: one decoded IQ message into the link.
     void onIQ(const dsp::complex_t* samples, int count) {
+        if (!iqRequested || count <= 0) { return; }
+        gotIq = true;
         const uint64_t first = linkIndexBase.load() + samplesPushed.load();
         moveProgress(Clock::now(), first, count);
         for (int done = 0; done < count;) {
@@ -733,9 +762,11 @@ private:
         recent.erase(std::remove(recent.begin(), recent.end(), url), recent.end());
         recent.insert(recent.begin(), url);
         if (recent.size() > RECENT_MAX) { recent.resize(RECENT_MAX); }
-        auto configAccess = config.edit();
-        configAccess.set("url", url);
-        configAccess.set("recent", recent);
+        {
+            auto configAccess = config.edit();
+            configAccess.set("url", url);
+            configAccess.set("recent", recent);
+        }
         if (auto target = remote::parseTarget(url)) {
             auto entry = remote::manualEntry(remote::RemoteKind::OpenWebRX, *target);
             entry.tlsRequired = target->scheme == "https";
@@ -845,6 +876,12 @@ private:
 
     std::string name;
     bool enabled = true;
+    bool iqConfirmed = false;
+    Clock::time_point iqRequestedAt{};
+    Clock::time_point openedAt{};
+    std::atomic<bool> iqRequested{false};
+    std::atomic<bool> gotIq{false};
+    std::atomic<bool> sessionEnded{false};
     bool selected = false;
 
     Client client;
@@ -887,8 +924,8 @@ private:
     int slowWindows = 0;
     SpectrumFrame specFrame;
 
-    dsp::stream<dsp::complex_t> rawStream;
-    dsp::stream<dsp::complex_t> stream;
+    dsp::stream<dsp::complex_t> rawStream{8192};
+    dsp::stream<dsp::complex_t> stream{8192};
     dsp::buffer::PrebufferedLink<dsp::complex_t> chain;
     std::mutex bufferModeMtx;
     SourceManager::SourceHandler handler;

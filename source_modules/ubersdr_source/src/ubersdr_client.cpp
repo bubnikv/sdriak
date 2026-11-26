@@ -56,7 +56,6 @@ namespace ubersdr {
         };
         m_ws.onDisconnected = [this] {
             m_connected = false;
-            onDisconnected();
         };
     }
 
@@ -127,10 +126,7 @@ namespace ubersdr {
 
     void UberSDRClient::start(const std::string& baseUrl, const std::string& mode, double freqHz,
                               const std::string& password, int vfo) {
-        std::lock_guard<std::mutex> life(m_lifeMtx);
-        m_running = false;
-        m_ws.stopSocket();
-        if (m_thread.joinable() && m_thread.get_id() != std::this_thread::get_id()) { m_thread.join(); }
+        stop();
 
         char freq[32];
         std::snprintf(freq, sizeof freq, "%.0f", freqHz);
@@ -147,21 +143,20 @@ namespace ubersdr {
             }
             catch (const std::exception& e) {
                 flog::warn("UberSDRClient: {}", e.what());
-                onError(e.what());
+                if (m_running.load()) { onError(e.what()); }
             }
             catch (...) {
-                onError("connection failed");
+                if (m_running.load()) { onError("connection failed"); }
             }
             m_connected = false;
-            m_running = false;
+            if (m_running.exchange(false)) { onDisconnected(); }
         });
     }
 
     void UberSDRClient::stop() {
-        std::lock_guard<std::mutex> life(m_lifeMtx);
         m_running = false;
         m_ws.stopSocket();
-        if (m_thread.joinable() && m_thread.get_id() != std::this_thread::get_id()) { m_thread.join(); }
+        if (m_thread.joinable()) { m_thread.join(); }
         m_connected = false;
     }
 
@@ -182,12 +177,12 @@ namespace ubersdr {
         j["type"] = "tune";
         j["frequency"] = (int64_t)std::llround(freqHz);
         j["mode"] = mode;
-        trySend(j.dump());
+        m_ws.queueString(j.dump(), "tune");
     }
 
     void UberSDRClient::requestStatus() {
         if (!m_connected.load()) { return; }
-        trySend("{\"type\":\"get_status\"}");
+        m_ws.queueString("{\"type\":\"get_status\"}", "status");
     }
 
     void UberSDRClient::onText(const std::string& msg) {
@@ -211,7 +206,11 @@ namespace ubersdr {
             m_ws.stopSocket();
             return;
         }
-        if (!PCMv4StreamDecoder::isV4Frame(p, msg.size())) { return; }
+        if (!PCMv4StreamDecoder::isV4Frame(p, msg.size())) {
+            onError("unsupported UberSDR audio wire format (requires PCM v4)");
+            m_ws.stopSocket();
+            return;
+        }
         PCMv4Header h;
         std::string err;
         if (!m_decoder.decode(p, msg.size(), h, err)) {
@@ -221,7 +220,12 @@ namespace ubersdr {
             m_ws.stopSocket();
             return;
         }
-        if (h.channels != 2 || h.sampleCount < 2) { return; }
+        if (h.channels != 2) {
+            onError("the server sent audio instead of two-channel IQ");
+            m_ws.stopSocket();
+            return;
+        }
+        if (h.sampleCount < 2) { return; }
         const int count = h.sampleCount / 2;
         const int16_t* s = m_decoder.samples();
         m_samples.resize((size_t)count);
@@ -277,10 +281,7 @@ namespace ubersdr {
 
     void UberSpectrumClient::start(const std::string& baseUrl, const std::string& sessionId, double freqHz,
                                    double binBandwidth, const std::string& password) {
-        std::lock_guard<std::mutex> life(m_lifeMtx);
-        m_running = false;
-        m_ws.stopSocket();
-        if (m_thread.joinable() && m_thread.get_id() != std::this_thread::get_id()) { m_thread.join(); }
+        stop();
         char buf[64];
         std::string url = baseUrl + "/ws/user-spectrum?user_session_id=" + queryEscape(sessionId) + "&mode=binary8&version=2";
         if (freqHz > 0.0) {
@@ -311,10 +312,9 @@ namespace ubersdr {
     }
 
     void UberSpectrumClient::stop() {
-        std::lock_guard<std::mutex> life(m_lifeMtx);
         m_running = false;
         m_ws.stopSocket();
-        if (m_thread.joinable() && m_thread.get_id() != std::this_thread::get_id()) { m_thread.join(); }
+        if (m_thread.joinable()) { m_thread.join(); }
         m_connected = false;
     }
 
@@ -335,7 +335,7 @@ namespace ubersdr {
         j["type"] = "zoom";
         j["frequency"] = (int64_t)std::llround(freqHz);
         j["binBandwidth"] = binBandwidth;
-        trySend(j.dump());
+        m_ws.queueString(j.dump(), "zoom");
     }
 
     void UberSpectrumClient::pan(double freqHz, double binBandwidth) {
@@ -344,7 +344,7 @@ namespace ubersdr {
         j["type"] = "pan";
         j["frequency"] = (int64_t)std::llround(freqHz);
         j["binBandwidth"] = binBandwidth;
-        trySend(j.dump());
+        m_ws.queueString(j.dump(), "pan");
     }
 
     void UberSpectrumClient::onBinary(const std::string& msg) {

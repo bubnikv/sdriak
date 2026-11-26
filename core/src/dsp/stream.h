@@ -46,19 +46,19 @@ namespace dsp {
     template <class T>
     class stream : public untyped_stream {
     public:
-        stream() {
+        stream(int samples = STREAM_BUFFER_SIZE) {
             // alloc() throws on OOM. Release the first buffer if the second
             // fails, otherwise it leaks: a throwing constructor gets no
             // destructor call, and we are already at the memory ceiling here.
-            writeBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
+            writeBuf = buffer::alloc<T>(samples);
             try {
-                readBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
+                readBuf = buffer::alloc<T>(samples);
             }
             catch (...) {
                 buffer::free(writeBuf);
                 throw;
             }
-            _capacity = STREAM_BUFFER_SIZE;
+            _capacity = samples;
         }
 
         virtual ~stream() {
@@ -166,6 +166,7 @@ namespace dsp {
         }
 
         virtual void clearWriteStop() {
+            std::lock_guard<std::mutex> lck(swapMtx);
             writerStop = false;
         }
 
@@ -178,6 +179,7 @@ namespace dsp {
         }
 
         virtual void clearReadStop() {
+            std::lock_guard<std::mutex> lck(rdyMtx);
             readerStop = false;
         }
 

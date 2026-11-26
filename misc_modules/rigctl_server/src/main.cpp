@@ -539,7 +539,9 @@ private:
 
             // Parse frequency and assign it to the VFO
             long long freq = std::stoll(parts[1]);
-            tuner::tune(tuner::TUNER_MODE_NORMAL, selectedVfo, freq);
+            gui::mainWindow.runOnUiThread([vfo = selectedVfo, freq] {
+                tuner::tune(tuner::TUNER_MODE_NORMAL, vfo, freq);
+            });
             resp = "RPRT 0\n";
             client->write(resp.size(), (uint8_t*)resp.c_str());
         }
